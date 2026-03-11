@@ -1,0 +1,21 @@
+# Data assets (likely large)
+EHRSHOT_ASSETS/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
