@@ -1,5 +1,6 @@
 # Data assets (likely large)
 EHRSHOT_ASSETS/
+data/
 
 # Python
 __pycache__/

@@ -29,6 +29,7 @@ import argparse
 import os
 import multiprocessing as mp
 import pandas as pd
+from jinja2 import Template
 from tqdm import tqdm
 
 
@@ -59,6 +60,21 @@ TASK_2_EXPECTED_STATS = {
 _ehr_by_patient: dict = {}       # patient_id -> DataFrame of that patient's events
 _code_descriptions: dict = {}    # OMOP code -> human-readable name
 _max_events: int = 200
+
+PROMPT_TEMPLATE = Template("""\
+You are a clinical prediction assistant.
+
+The following is a patient's complete medical history up to {{ date }} \
+(end of their hospital discharge day). Each line is one clinical event.
+
+--- PATIENT HISTORY ---
+{{ event_history }}
+--- END OF HISTORY ---
+
+Question: Based on this history, will this patient be diagnosed with \
+{{ disease_name }} for the FIRST TIME within the next 1 to 365 days after {{ date }}?
+
+Answer:""")
 
 
 def parse_args():
@@ -135,17 +151,10 @@ def build_prompt(disease_name: str, prediction_time: pd.Timestamp,
     P("YES" | context) and P("NO" | context) directly from the next-token
     distribution — no need to construct two separate strings.
     """
-    date_str = str(prediction_time)[:10]  # YYYY-MM-DD
-    return (
-        f"You are a clinical prediction assistant.\n\n"
-        f"The following is a patient's complete medical history up to {date_str} "
-        f"(end of their hospital discharge day). Each line is one clinical event.\n\n"
-        f"--- PATIENT HISTORY ---\n"
-        f"{event_history}\n"
-        f"--- END OF HISTORY ---\n\n"
-        f"Question: Based on this history, will this patient be diagnosed with "
-        f"{disease_name} for the FIRST TIME within the next 1 to 365 days after {date_str}?\n\n"
-        f"Answer:"
+    return PROMPT_TEMPLATE.render(
+        date=str(prediction_time)[:10],  # YYYY-MM-DD
+        disease_name=disease_name,
+        event_history=event_history,
     )
 
 
@@ -218,7 +227,7 @@ if __name__ == "__main__":
     print(f"  Loaded {len(_code_descriptions):,} code descriptions.")
 
     print("Loading ehrshot.csv (this may take a moment)...")
-    df_ehr = pd.read_csv(args.path_to_data_csv, low_memory=False, nrows=1_000_000)
+    df_ehr = pd.read_csv(args.path_to_data_csv, low_memory=False)
     df_ehr["start"] = pd.to_datetime(df_ehr["start"])
     print(f"  Loaded {len(df_ehr):,} events for {df_ehr['patient_id'].nunique():,} patients.")
 
