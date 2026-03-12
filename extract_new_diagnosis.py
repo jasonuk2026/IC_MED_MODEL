@@ -94,7 +94,7 @@ def parse_args():
                         default=list(TASK_2_DISEASE_NAME.keys()),
                         choices=list(TASK_2_DISEASE_NAME.keys()),
                         help="Which tasks to extract. Defaults to all 6.")
-    parser.add_argument("--max_events_per_patient", type=int, default=200,
+    parser.add_argument("--max_events_per_patient", type=int, default=None,
                         help="Truncate to most recent N events before prediction_time.")
     parser.add_argument("--prediction_strategy", type=str, default="all",
                         choices=["first", "last", "all"],

@@ -34,6 +34,17 @@ extract_task() {
 }
 
 # ------------------------------------------------------------------ #
+# Summarize n_events_in_history statistics across all tasks
+# Usage: bash run.sh event_stats [first|last|all]
+# ------------------------------------------------------------------ #
+event_stats() {
+    local strategy=${1:-all}
+    python analyze_event_stats.py \
+        --input_dir ./data/llm_inputs/new_diagnosis \
+        --strategy "$strategy"
+}
+
+# ------------------------------------------------------------------ #
 # (Placeholder) Run LLM inference on extracted prompts
 # ------------------------------------------------------------------ #
 # run_inference() {
@@ -43,6 +54,6 @@ extract_task() {
 # ------------------------------------------------------------------ #
 # Dispatch
 # ------------------------------------------------------------------ #
-cmd=${1:?"Available commands: extract_all, extract_task"}
+cmd=${1:?"Available commands: extract_all, extract_task, event_stats"}
 shift
 "$cmd" "$@"
