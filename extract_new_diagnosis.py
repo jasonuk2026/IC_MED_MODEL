@@ -29,7 +29,8 @@ import argparse
 import os
 import multiprocessing as mp
 import pandas as pd
-from jinja2 import Template
+import time
+
 from tqdm import tqdm
 
 
@@ -59,22 +60,7 @@ TASK_2_EXPECTED_STATS = {
 # ------------------------------------------------------------------ #
 _ehr_by_patient: dict = {}       # patient_id -> DataFrame of that patient's events
 _code_descriptions: dict = {}    # OMOP code -> human-readable name
-_max_events: int = 200
-
-PROMPT_TEMPLATE = Template("""\
-You are a clinical prediction assistant.
-
-The following is a patient's complete medical history up to {{ date }} \
-(end of their hospital discharge day). Each line is one clinical event.
-
---- PATIENT HISTORY ---
-{{ event_history }}
---- END OF HISTORY ---
-
-Question: Based on this history, will this patient be diagnosed with \
-{{ disease_name }} for the FIRST TIME within the next 1 to 365 days after {{ date }}?
-
-Answer:""")
+_max_events: int = None
 
 
 def parse_args():
@@ -104,8 +90,10 @@ def parse_args():
                             "  last  — keep only the latest discharge per patient\n"
                             "  all   — keep all discharges (matches original benchmark)"
                         ))
+    parser.add_argument("--max_rows", type=int, default=None,
+                        help="Cap total rows per task (useful for debugging).")
     parser.add_argument("--num_workers", type=int, default=4,
-                        help="Number of parallel worker processes. Defaults to all CPUs.")
+                        help="Number of parallel worker processes. Defaults to 4 CPUs.")
     return parser.parse_args()
 
 
@@ -123,18 +111,19 @@ def load_code_descriptions(path_to_concept_csv: str) -> dict:
 
 
 def format_event_history(df_events: pd.DataFrame) -> str:
-    """Convert event rows (filtered + sorted chronologically) into a plain-text timeline."""
+    """Convert event rows (filtered + sorted chronologically) into a plain-text list.
+    Each line: <label> [| value=... | unit=...]
+    Time and table information are intentionally excluded.
+    """
     lines = []
     for _, row in df_events.iterrows():
-        time_str = str(row["start"])[:16]   # YYYY-MM-DD HH:MM
-        code      = str(row["code"])       if pd.notna(row["code"])       else "UNKNOWN"
-        value     = str(row["value"])      if pd.notna(row["value"])      else ""
-        unit      = str(row["unit"])       if pd.notna(row["unit"])       else ""
-        table     = str(row["omop_table"]) if pd.notna(row["omop_table"]) else ""
+        code  = str(row["code"])  if pd.notna(row["code"])  else "UNKNOWN"
+        value = str(row["value"]) if pd.notna(row["value"]) else ""
+        unit  = str(row["unit"])  if pd.notna(row["unit"])  else ""
 
         description = _code_descriptions.get(code)
         label = f"{description} [{code}]" if description and description != code else code
-        parts = [f"[{time_str}]", label, f"(table={table})"]
+        parts = [label]
         if value:
             parts.append(f"value={value}")
         if unit:
@@ -143,26 +132,11 @@ def format_event_history(df_events: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
-def build_prompt(disease_name: str, prediction_time: pd.Timestamp,
-                 event_history: str) -> str:
-    """Build a prompt for zero-shot scoring via next-token log-probabilities.
-
-    The prompt ends at "Answer:" so that at inference time you can read off
-    P("YES" | context) and P("NO" | context) directly from the next-token
-    distribution — no need to construct two separate strings.
-    """
-    return PROMPT_TEMPLATE.render(
-        date=str(prediction_time)[:10],  # YYYY-MM-DD
-        disease_name=disease_name,
-        event_history=event_history,
-    )
-
-
 def process_row(args: tuple) -> dict:
-    """Worker function: extract history and build prompt for one (patient, prediction_time) row.
+    """Worker function: extract history for one (patient, prediction_time) row.
     Reads from module-level globals inherited via fork — no data is passed through the args tuple.
     """
-    pid, pred_time, label, split, task, disease_name = args
+    pid, pred_time, label, split, task = args
 
     df_patient = _ehr_by_patient.get(pid, pd.DataFrame())
     if not df_patient.empty:
@@ -171,7 +145,6 @@ def process_row(args: tuple) -> dict:
             df_patient = df_patient.tail(_max_events)
 
     history_text = format_event_history(df_patient)
-    prompt       = build_prompt(disease_name, pred_time, history_text)
 
     return {
         "patient_id":          pid,
@@ -181,7 +154,6 @@ def process_row(args: tuple) -> dict:
         "label":               label,
         "n_events_in_history": len(df_patient),
         "event_history":       history_text,
-        "prompt":              prompt,
     }
 
 
@@ -239,6 +211,7 @@ if __name__ == "__main__":
     del df_ehr  # free the full dataframe — workers only need the grouped dict
     print(f"  Grouped {len(_ehr_by_patient):,} patients.\n")
 
+
     _max_events = args.max_events_per_patient
 
     # ------------------------------------------------------------------ #
@@ -273,14 +246,19 @@ if __name__ == "__main__":
         df_rows = df_rows.merge(df_splits, on="patient_id", how="left")
         print(f"  Split breakdown:\n{df_rows['split'].value_counts().to_string()}")
 
-        # 5. Build worker args — only small scalar values are passed per row;
+        # 5. Cap rows for debugging
+        if args.max_rows is not None:
+            df_rows = df_rows.head(args.max_rows)
+            print(f"\n  Capped to {len(df_rows)} rows (--max_rows={args.max_rows}).")
+
+        # 6. Build worker args — only small scalar values are passed per row;
         #    large data (EHR events, code descriptions) is read from globals.
         worker_args = [
-            (row.patient_id, row.prediction_time, row.value, row.split, task, disease_name)
+            (row.patient_id, row.prediction_time, row.value, row.split, task)
             for row in df_rows.itertuples(index=False)
         ]
 
-        # 6. Run in parallel
+        # 7. Run in parallel
         print(f"\n  Extracting histories with {args.num_workers} workers...")
         with mp.Pool(processes=args.num_workers) as pool:
             records = list(tqdm(
@@ -288,10 +266,12 @@ if __name__ == "__main__":
                 total=len(worker_args),
             ))
 
-        # 7. Save per-task output
+        # 8. Save per-task output as parquet
         df_out = pd.DataFrame(records)
-        path_to_output = os.path.join(args.path_to_output_dir, f"{task}_{args.prediction_strategy}.csv")
-        df_out.to_csv(path_to_output, index=False)
+        path_to_output = os.path.join(
+            args.path_to_output_dir, f"{task}_{args.prediction_strategy}.parquet"
+        )
+        df_out.to_parquet(path_to_output, index=False, row_group_size=max(1, len(df_out) // 8))
         print(f"\n  Saved {len(df_out)} rows -> {path_to_output}")
         print(f"  Label distribution:\n{df_out.groupby(['split','label']).size().to_string()}\n")
 
