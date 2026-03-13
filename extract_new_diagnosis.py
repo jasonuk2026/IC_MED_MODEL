@@ -28,10 +28,12 @@ Verification against notebook stats (all patients, not split):
 import argparse
 import os
 import multiprocessing as mp
+import numpy as np
 import pandas as pd
 import time
 
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 
 TASK_2_DISEASE_NAME = {
@@ -60,7 +62,8 @@ TASK_2_EXPECTED_STATS = {
 # ------------------------------------------------------------------ #
 _ehr_by_patient: dict = {}       # patient_id -> DataFrame of that patient's events
 _code_descriptions: dict = {}    # OMOP code -> human-readable name
-_max_events: int = None
+_sample_prob: float = None       # p: per-event inclusion probability
+_sample_target: int = None       # m: stop after this many events are included
 
 
 def parse_args():
@@ -80,8 +83,6 @@ def parse_args():
                         default=list(TASK_2_DISEASE_NAME.keys()),
                         choices=list(TASK_2_DISEASE_NAME.keys()),
                         help="Which tasks to extract. Defaults to all 6.")
-    parser.add_argument("--max_events_per_patient", type=int, default=None,
-                        help="Truncate to most recent N events before prediction_time.")
     parser.add_argument("--prediction_strategy", type=str, default="all",
                         choices=["first", "last", "all"],
                         help=(
@@ -94,6 +95,12 @@ def parse_args():
                         help="Cap total rows per task (useful for debugging).")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of parallel worker processes. Defaults to 4 CPUs.")
+    parser.add_argument("--tokenizer_model", type=str, default="Qwen/Qwen3-4B",
+                        help="HuggingFace tokenizer to use for counting tokens in event_history.")
+    parser.add_argument("--event_sample_prob", type=float, default=0.6,
+                        help="Probability p of including each event. Applied after max_events truncation.")
+    parser.add_argument("--event_sample_target", type=int, default=None,
+                        help="Stop sampling once m events are included (requires --event_sample_prob).")
     return parser.parse_args()
 
 
@@ -118,7 +125,14 @@ def format_event_history(df_events: pd.DataFrame) -> str:
     lines = []
     for _, row in df_events.iterrows():
         code  = str(row["code"])  if pd.notna(row["code"])  else "UNKNOWN"
-        value = str(row["value"]) if pd.notna(row["value"]) else ""
+        raw_val = row["value"]
+        if pd.notna(raw_val):
+            try:
+                value = f"{float(raw_val):.2f}"
+            except (ValueError, TypeError):
+                value = str(raw_val)
+        else:
+            value = ""
         unit  = str(row["unit"])  if pd.notna(row["unit"])  else ""
 
         description = _code_descriptions.get(code)
@@ -132,6 +146,18 @@ def format_event_history(df_events: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+def count_tokens(texts: pd.Series, tokenizer_model: str) -> pd.Series:
+    """Tokenize each string in `texts` and return a Series of token counts."""
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
+    counts = [len(ids) for ids in tokenizer(texts.tolist(), add_special_tokens=False)["input_ids"]]
+    return pd.Series(counts, index=texts.index)
+
+
+def _worker_init():
+    """Seed numpy's RNG uniquely per worker so stochastic sampling is independent."""
+    np.random.seed((os.getpid() * 6364136223846793005 + int(time.time() * 1e6)) % (2 ** 32))
+
+
 def process_row(args: tuple) -> dict:
     """Worker function: extract history for one (patient, prediction_time) row.
     Reads from module-level globals inherited via fork — no data is passed through the args tuple.
@@ -141,8 +167,18 @@ def process_row(args: tuple) -> dict:
     df_patient = _ehr_by_patient.get(pid, pd.DataFrame())
     if not df_patient.empty:
         df_patient = df_patient[df_patient["start"] < pred_time].sort_values("start")
-        if _max_events and len(df_patient) > _max_events:
-            df_patient = df_patient.tail(_max_events)
+
+        if _sample_prob is not None:
+            # Iterate events from most recent to oldest, include each with probability p.
+            # Stop as soon as m events have been collected (if m is set).
+            # Sort selected indices to restore chronological order in the output.
+            selected = []
+            for i in range(len(df_patient) - 1, -1, -1):
+                if np.random.random() < _sample_prob:
+                    selected.append(i)
+                    if _sample_target is not None and len(selected) >= _sample_target:
+                        break
+            df_patient = df_patient.iloc[sorted(selected)]
 
     history_text = format_event_history(df_patient)
 
@@ -212,7 +248,11 @@ if __name__ == "__main__":
     print(f"  Grouped {len(_ehr_by_patient):,} patients.\n")
 
 
-    _max_events = args.max_events_per_patient
+    _sample_prob = args.event_sample_prob
+    _sample_target = args.event_sample_target
+
+    if _sample_prob is not None:
+        print(f"Event sampling: p={_sample_prob}, target m={_sample_target if _sample_target else 'unlimited'}\n")
 
     # ------------------------------------------------------------------ #
     # Process each task
@@ -260,14 +300,19 @@ if __name__ == "__main__":
 
         # 7. Run in parallel
         print(f"\n  Extracting histories with {args.num_workers} workers...")
-        with mp.Pool(processes=args.num_workers) as pool:
+        with mp.Pool(processes=args.num_workers, initializer=_worker_init) as pool:
             records = list(tqdm(
                 pool.imap(process_row, worker_args, chunksize=32),
                 total=len(worker_args),
             ))
 
-        # 8. Save per-task output as parquet
+        # 8. Count tokens and sort by length
         df_out = pd.DataFrame(records)
+        print(f"\n  Counting tokens with '{args.tokenizer_model}'...")
+        df_out["n_tokens"] = count_tokens(df_out["event_history"], args.tokenizer_model)
+        df_out = df_out.sort_values("n_tokens", ascending=True).reset_index(drop=True)
+
+        # 9. Save per-task output as parquet
         path_to_output = os.path.join(
             args.path_to_output_dir, f"{task}_{args.prediction_strategy}.parquet"
         )
