@@ -23,11 +23,12 @@ import torch.distributed as dist
 
 from pathlib import Path
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sklearn.metrics import classification_report, f1_score
 from tqdm import tqdm
 
-from dataset import EHRShotDataset, ContiguousDistributedSampler
+from dataset import EHRShotDataset
 
 
 TASK_2_DISEASE_NAME = {
@@ -117,27 +118,32 @@ class PromptCollator:
         return event_history
 
     def __call__(self, items: list[dict]) -> dict:
-        all_input_ids = []
         labels = []
+
+        # Build all prompts first (string-only), then batch-tokenize once.
+        texts = []
         for item in items:
             history = self._truncate_history(item["event_history"])
             messages = [
                 {"role": "system",  "content": self.system_prompt},
                 {"role": "user",    "content": self.user_template.format(event_history=history)},
             ]
-            input_ids = self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=True,
-                enable_thinking=False, return_dict=False,
+            # tokenize=False returns the formatted string, avoiding double tokenization
+            text = self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False,
+                enable_thinking=False,
             )
-            all_input_ids.append(input_ids)
+            texts.append(text)
             labels.append(int(item["label"]))
 
-        # Pad to the longest sequence in this batch (respects padding_side="left")
-        encoded = self.tokenizer.pad(
-            {"input_ids": all_input_ids},
+        # Single batch tokenization call for all items
+        encoded = self.tokenizer(
+            texts,
             return_tensors="pt",
             padding=True,
+            truncation=False,
         )
+
         encoded["labels"] = torch.tensor(labels, dtype=torch.long)
         return encoded
 
@@ -273,7 +279,7 @@ def main():
         dist.broadcast_object_list(bias_container, src=0)
     prior_bias = bias_container[0]
 
-    sampler  = ContiguousDistributedSampler(dataset) if distributed else None
+    sampler  = DistributedSampler(dataset, shuffle=False) if distributed else None
     loader   = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -282,7 +288,7 @@ def main():
         collate_fn=collator,
         num_workers=args.num_workers,
         pin_memory=True,
-        prefetch_factor=2 if args.num_workers > 0 else None,
+        prefetch_factor=4 if args.num_workers > 0 else None,
         persistent_workers=args.num_workers > 0,
     )
 

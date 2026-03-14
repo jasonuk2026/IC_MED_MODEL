@@ -21,3 +21,5 @@ venv/
 .vscode/
 .idea/
 .claude/
+
+cmd.md

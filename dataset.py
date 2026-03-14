@@ -79,6 +79,9 @@ class EHRShotDataset(Dataset):
         # ParquetFile handle — opened lazily so fork-based workers each get
         # their own handle without sharing file descriptors.
         self._pf: Optional[pq.ParquetFile] = None
+        # Row group cache: avoid re-reading the same row group for consecutive rows.
+        self._cached_rg_idx: int = -1
+        self._cached_rg_data: Optional[dict] = None
 
     # ---------------------------------------------------------------------- #
     # PyTorch Dataset interface
@@ -99,12 +102,14 @@ class EHRShotDataset(Dataset):
     # ---------------------------------------------------------------------- #
 
     def _read_row(self, abs_idx: int) -> dict:
-        """Read a single row from disk by loading its row group."""
+        """Read a single row from disk by loading its row group (cached)."""
         rg_idx, offset = self._locate(abs_idx)
-        if self._pf is None:
-            self._pf = pq.ParquetFile(self.parquet_path)
-        rg_data = self._pf.read_row_group(rg_idx).to_pydict()
-        return {col: rg_data[col][offset] for col in rg_data}
+        if rg_idx != self._cached_rg_idx:
+            if self._pf is None:
+                self._pf = pq.ParquetFile(self.parquet_path)
+            self._cached_rg_data = self._pf.read_row_group(rg_idx).to_pydict()
+            self._cached_rg_idx = rg_idx
+        return {col: self._cached_rg_data[col][offset] for col in self._cached_rg_data}
 
     def _locate(self, abs_idx: int) -> tuple[int, int]:
         """Map an absolute row index to (row_group_index, offset_within_group)."""
