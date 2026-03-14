@@ -51,7 +51,7 @@ def init_distributed() -> tuple[bool, int, int]:
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if local_rank == -1:
         return False, 0, 0
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", device_id=local_rank)
     torch.cuda.set_device(local_rank)
     return True, dist.get_rank(), local_rank
 
@@ -126,7 +126,8 @@ class PromptCollator:
                 {"role": "user",    "content": self.user_template.format(event_history=history)},
             ]
             input_ids = self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=True, enable_thinking=False
+                messages, add_generation_prompt=True, tokenize=True,
+                enable_thinking=False, return_dict=False,
             )
             all_input_ids.append(input_ids)
             labels.append(int(item["label"]))
