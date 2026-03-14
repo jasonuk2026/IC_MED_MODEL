@@ -13,11 +13,16 @@ Usage:
 """
 
 import bisect
-from pathlib import Path
-from typing import Callable, Optional
+import math
 
 import pyarrow.parquet as pq
-from torch.utils.data import Dataset
+import torch.distributed as dist
+
+from pathlib import Path
+from typing import Callable, Optional, Iterator
+
+from torch.utils.data import Dataset, Sampler
+
 
 
 class EHRShotDataset(Dataset):
@@ -106,3 +111,50 @@ class EHRShotDataset(Dataset):
         rg_idx = bisect.bisect_right(self._rg_starts, abs_idx) - 1
         offset = abs_idx - self._rg_starts[rg_idx]
         return rg_idx, offset
+
+class ContiguousDistributedSampler(Sampler[int]):
+    """Splits the dataset into contiguous per-rank chunks.
+
+    Unlike the standard DistributedSampler (which interleaves indices across
+    ranks and destroys sort order), this sampler assigns each rank a single
+    contiguous slice so that token-length ordering is preserved within each rank.
+
+    Args:
+        dataset:      The dataset to sample from.
+        num_replicas: Number of processes (GPUs).  Defaults to dist world size.
+        rank:         Rank of this process.  Defaults to dist rank.
+        drop_last:    Drop tail samples that don't divide evenly across ranks.
+                      Default False (pad the last rank instead).
+    """
+
+    def __init__(
+        self,
+        dataset,
+        num_replicas: int | None = None,
+        rank: int | None = None,
+        drop_last: bool = False,
+    ):
+        if num_replicas is None:
+            num_replicas = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        if rank is None:
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.drop_last = drop_last
+
+        n = len(dataset)
+        if drop_last:
+            n = (n // num_replicas) * num_replicas
+        self._n = n
+
+        self.num_samples = math.ceil(n / num_replicas) # samples per rank (may be uneven if drop_last=False)
+
+    def __iter__(self) -> Iterator[int]:
+        start = self.rank * self.num_samples
+        end = min(start + self.num_samples, self._n)
+        return iter(range(start, end))
+
+    def __len__(self) -> int:
+        return min(self.num_samples, max(0, self._n - self.rank * self.num_samples))
