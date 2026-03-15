@@ -144,7 +144,7 @@ class PromptCollator:
             truncation=False,
         )
 
-        encoded["labels"] = torch.tensor(labels, dtype=torch.long)
+        encoded["labels"] = np.array(labels)
         return encoded
 
 
@@ -178,24 +178,24 @@ def compute_prior_bias(
 def predict_batch(
     batch: dict,
     model: AutoModelForCausalLM,
-    yes_ids: list[int],
-    no_ids: list[int],
+    yes_ids: torch.Tensor,
+    no_ids: torch.Tensor,
     device: str,
     prior_bias: float = 0.0,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[torch.Tensor, np.ndarray]:
     """Run one batch; return (predictions, labels) as numpy arrays."""
-    labels = batch.pop("labels").numpy()
+    labels = batch.pop("labels")
     inputs = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
     outputs = model(**inputs)
     last_logits = outputs.logits[:, -1, :]  # (batch, vocab_size)
 
-    yes_logit = last_logits[:, yes_ids].logsumexp(dim=-1)
-    no_logit  = last_logits[:, no_ids].logsumexp(dim=-1)
+    yes_logit = last_logits.index_select(1, yes_ids).logsumexp(dim=-1)
+    no_logit  = last_logits.index_select(1, no_ids).logsumexp(dim=-1)
 
     # Subtract the content-free bias so the threshold is 0 regardless of the
     # model's unconditional Yes/No preference.
-    preds = ((yes_logit - no_logit) > prior_bias).long().cpu().numpy()
+    preds = (yes_logit - no_logit) > prior_bias
     return preds, labels
 
 
@@ -218,6 +218,8 @@ def parse_args():
                              "Does not include prompt prefix/suffix overhead.")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker processes per rank (default: 4).")
+    parser.add_argument("--output_dir", type=str, default="results",
+                        help="Directory to save prediction outputs (default: results/).")
     return parser.parse_args()
 
 
@@ -263,6 +265,9 @@ def main():
         print(f"No  token IDs : {no_ids}")
     if not yes_ids or not no_ids:
         raise RuntimeError("Could not find single-token yes/no IDs for this tokenizer.")
+    
+    yes_ids = torch.tensor(yes_ids, device=device)
+    no_ids  = torch.tensor(no_ids, device=device)
 
     dataset = EHRShotDataset(args.parquet_path, split=args.split)
     if is_main(rank):
@@ -292,13 +297,18 @@ def main():
         persistent_workers=args.num_workers > 0,
     )
 
+    if distributed:
+        dist.barrier()  # synchronize before starting inference
+
     local_preds, local_labels = [], []
 
-    for batch in tqdm(loader, desc=f"Rank {rank}", disable=not is_main(rank)):
+    for batch in tqdm(loader, desc=f"Rank {rank}", disable=not is_main(rank), dynamic_ncols=True):
         preds, labels = predict_batch(batch, model, yes_ids, no_ids, device, prior_bias)
-        local_preds.extend(preds.tolist())
-        local_labels.extend(labels.tolist())
+        local_preds.append(preds)
+        local_labels.append(labels)
 
+    local_preds = torch.cat(local_preds).cpu().numpy().astype(int).tolist()
+    local_labels = np.concatenate(local_labels).tolist()
     # Gather results from all ranks onto rank 0
     if distributed:
         all_preds_gathered  = [None] * dist.get_world_size()
@@ -315,6 +325,12 @@ def main():
     if is_main(rank):
         all_preds  = np.array(all_preds)
         all_labels = np.array(all_labels)
+
+        out_dir = Path(args.output_dir) / (task or stem)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{args.split}.npz"
+        np.savez(out_path, preds=all_preds, labels=all_labels)
+        print(f"Saved predictions to {out_path}")
 
         f1 = f1_score(all_labels, all_preds, zero_division=0)
         print(f"\n{'='*50}")
