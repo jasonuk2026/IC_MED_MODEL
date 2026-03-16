@@ -3,14 +3,20 @@ Zero-shot disease prediction via next-token logit comparison.
 
 For each patient in an extracted parquet file, builds a prompt containing
 the patient's event history and compares the next-token logits for "Yes" vs
-"No" to produce a binary prediction.  No text is generated; the decision is
-made entirely from logits.  Computes and prints F1 score.
+"No" to produce a raw log-odds score.  No text is generated.
+
+Workflow (two-pass):
+  1. Run on val split → finds the best yes/no log-odds threshold (maximises F1)
+     and saves it to <output_dir>/<task>/threshold.npy.
+  2. Run on test split → loads the val threshold and evaluates on test.
 
 Single-GPU:
-    python predict_logits.py path/to/task.parquet
+    python predict_logits.py path/to/task.parquet --split val
+    python predict_logits.py path/to/task.parquet --split test
 
 Multi-GPU (data-parallel via torchrun):
-    torchrun --nproc_per_node=4 predict_logits.py path/to/task.parquet
+    torchrun --nproc_per_node=4 predict_logits.py path/to/task.parquet --split val
+    torchrun --nproc_per_node=4 predict_logits.py path/to/task.parquet --split test
 """
 
 import os
@@ -153,37 +159,14 @@ class PromptCollator:
 # ---------------------------------------------------------------------------
 
 @torch.inference_mode()
-def compute_prior_bias(
-    model: AutoModelForCausalLM,
-    collator: PromptCollator,
-    yes_ids: list[int],
-    no_ids: list[int],
-    device: str,
-) -> float:
-    """Estimate the model's content-free log-odds bias toward Yes vs No.
-
-    Runs a single forward pass with an empty event history and returns
-    log P(Yes) - log P(No) on that neutral prompt.  Subtracting this from
-    each sample's log-odds calibrates away the model's unconditional preference.
-    (Zhao et al., 2021 — "Calibrate Before Use")
-    """
-    batch = collator([{"event_history": "", "label": 0}])
-    inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
-    last_logits = model(**inputs).logits[0, -1, :]  # (vocab_size,)
-    bias = (last_logits[yes_ids].logsumexp(0) - last_logits[no_ids].logsumexp(0)).item()
-    return bias
-
-
-@torch.inference_mode()
 def predict_batch(
     batch: dict,
     model: AutoModelForCausalLM,
     yes_ids: torch.Tensor,
     no_ids: torch.Tensor,
     device: str,
-    prior_bias: float = 0.0,
 ) -> tuple[torch.Tensor, np.ndarray]:
-    """Run one batch; return (predictions, labels) as numpy arrays."""
+    """Run one batch; return (log-odds scores, labels)."""
     labels = batch.pop("labels")
     inputs = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
@@ -193,10 +176,19 @@ def predict_batch(
     yes_logit = last_logits.index_select(1, yes_ids).logsumexp(dim=-1)
     no_logit  = last_logits.index_select(1, no_ids).logsumexp(dim=-1)
 
-    # Subtract the content-free bias so the threshold is 0 regardless of the
-    # model's unconditional Yes/No preference.
-    preds = (yes_logit - no_logit) > prior_bias
-    return preds, labels
+    scores = yes_logit - no_logit
+    return scores, labels
+
+
+def find_best_threshold(scores: np.ndarray, labels: np.ndarray) -> float:
+    """Sweep unique score values as candidate thresholds; return the one with highest F1."""
+    best_f1, best_thresh = -1.0, 0.0
+    for thresh in np.unique(scores):
+        preds = (scores > thresh).astype(int)
+        f = f1_score(labels, preds, zero_division=0)
+        if f > best_f1:
+            best_f1, best_thresh = f, thresh
+    return float(best_thresh)
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +236,9 @@ def main():
     if is_main(rank):
         print(f"\nLoading tokenizer and model '{args.model}'...")
     if distributed and not is_main(rank):
+        from transformers.utils.logging import disable_progress_bar
+        disable_progress_bar()
+    if distributed and not is_main(rank):
         dist.barrier()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -275,15 +270,6 @@ def main():
 
     collator = PromptCollator(tokenizer, disease, args.max_event_tokens)
 
-    # Only rank 0 computes the bias; broadcast to all other ranks.
-    bias_container = [None]
-    if is_main(rank):
-        bias_container[0] = compute_prior_bias(model, collator, yes_ids, no_ids, device)
-        print(f"Prior bias (Yes - No logit, empty history): {bias_container[0]:+.4f}")
-    if distributed:
-        dist.broadcast_object_list(bias_container, src=0)
-    prior_bias = bias_container[0]
-
     sampler  = DistributedSampler(dataset, shuffle=False) if distributed else None
     loader   = DataLoader(
         dataset,
@@ -300,44 +286,61 @@ def main():
     if distributed:
         dist.barrier()  # synchronize before starting inference
 
-    local_preds, local_labels = [], []
+    local_scores, local_labels = [], []
 
     for batch in tqdm(loader, desc=f"Rank {rank}", disable=not is_main(rank), dynamic_ncols=True):
-        preds, labels = predict_batch(batch, model, yes_ids, no_ids, device, prior_bias)
-        local_preds.append(preds)
+        scores, labels = predict_batch(batch, model, yes_ids, no_ids, device)
+        local_scores.append(scores)
         local_labels.append(labels)
 
-    local_preds = torch.cat(local_preds).cpu().numpy().astype(int).tolist()
+    local_scores = torch.cat(local_scores).float().cpu().numpy().tolist()
     local_labels = np.concatenate(local_labels).tolist()
+
     # Gather results from all ranks onto rank 0
     if distributed:
-        all_preds_gathered  = [None] * dist.get_world_size()
+        all_scores_gathered = [None] * dist.get_world_size()
         all_labels_gathered = [None] * dist.get_world_size()
-        dist.all_gather_object(all_preds_gathered, local_preds)
+        dist.all_gather_object(all_scores_gathered, local_scores)
         dist.all_gather_object(all_labels_gathered, local_labels)
 
         if is_main(rank):
-            all_preds  = [p for shard in all_preds_gathered  for p in shard]
+            all_scores = [s for shard in all_scores_gathered for s in shard]
             all_labels = [l for shard in all_labels_gathered for l in shard]
     else:
-        all_preds, all_labels = local_preds, local_labels
+        all_scores, all_labels = local_scores, local_labels
 
     if is_main(rank):
-        all_preds  = np.array(all_preds)
+        all_scores = np.array(all_scores)
         all_labels = np.array(all_labels)
 
         out_dir = Path(args.output_dir) / (task or stem)
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{args.split}.npz"
-        np.savez(out_path, preds=all_preds, labels=all_labels)
-        print(f"Saved predictions to {out_path}")
+        np.savez(out_path, scores=all_scores, labels=all_labels)
+        print(f"Saved scores to {out_path}")
+
+        thresh_path = out_dir / "threshold.npy"
+        if args.split == "val":
+            threshold = find_best_threshold(all_scores, all_labels)
+            np.save(thresh_path, threshold)
+            print(f"Best threshold (val): {threshold:+.4f}  →  saved to {thresh_path}")
+        else:
+            if not thresh_path.exists():
+                raise FileNotFoundError(
+                    f"No threshold found at {thresh_path}. Run with --split val first."
+                )
+            threshold = float(np.load(thresh_path))
+            print(f"Loaded threshold from {thresh_path}: {threshold:+.4f}")
+
+        all_preds = (all_scores > threshold).astype(int)
 
         f1 = f1_score(all_labels, all_preds, zero_division=0)
         print(f"\n{'='*50}")
-        print(f"Split    : {args.split}")
-        print(f"Task     : {task or stem}")
-        print(f"Model    : {args.model}")
-        print(f"F1 Score : {f1:.4f}")
+        print(f"Split     : {args.split}")
+        print(f"Task      : {task or stem}")
+        print(f"Model     : {args.model}")
+        print(f"Threshold : {threshold:+.4f}")
+        print(f"F1 Score  : {f1:.4f}")
         print(f"\n{classification_report(all_labels, all_preds, target_names=['Negative', 'Positive'], zero_division=0)}")
 
     if distributed:
