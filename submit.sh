@@ -4,8 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=20          # 4 workers/rank × 4 ranks + headroom
-#SBATCH --mem=128G
+#SBATCH --exclusive                 # grab all CPUs and memory on the node
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
