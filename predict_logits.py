@@ -27,6 +27,7 @@ import torch
 torch.set_float32_matmul_precision("high")
 import torch.distributed as dist
 
+from jinja2 import Template
 from pathlib import Path
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -35,6 +36,7 @@ from sklearn.metrics import classification_report, f1_score
 from tqdm import tqdm
 
 from dataset import EHRShotDataset
+from task_priors import TASK_PRIORS
 
 
 TASK_2_DISEASE_NAME = {
@@ -90,16 +92,24 @@ def get_yes_no_ids(tokenizer: AutoTokenizer) -> tuple[list[int], list[int]]:
 # Collator — runs in DataLoader workers, keeps GPU busy
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = (
-    "You are a clinical prediction assistant. Based on the patient's medical "
-    "event history, predict whether this patient will be newly diagnosed with "
-    "{disease} within the next year after the observation period ends. "
-    "Answer with a single word: Yes or No."
-)
-USER_PROMPT = (
-    "Medical history (chronological, oldest first):\n{event_history}\n\n"
-    "Will this patient be newly diagnosed with {disease} within the next year? Answer:"
-)
+SYSTEM_TEMPLATE = Template("""\
+You are a clinical prediction assistant. Based on the patient's medical event history, \
+predict whether this patient will be newly diagnosed with {{ disease }} within the next \
+year after the observation period ends.
+{% if prior_knowledge %}
+--- Clinical background on {{ disease }} ---
+{{ prior_knowledge }}
+--- End of clinical background ---
+{% endif %}
+Answer with a single word: Yes or No.\
+""")
+
+USER_TEMPLATE = Template("""\
+Medical history (chronological, oldest first):
+{{ event_history }}
+
+Will this patient be newly diagnosed with {{ disease }} within the next year? Answer:\
+""")
 
 
 class PromptCollator:
@@ -108,13 +118,25 @@ class PromptCollator:
     Event history is encoded once to check length, truncated to max_event_tokens
     (keeping most recent events), then decoded back to a string for use in the
     chat message dict passed to apply_chat_template.
+
+    If prior_knowledge is provided, it is injected into the system prompt so the
+    model can reason about disease-specific clinical signals.
     """
 
-    def __init__(self, tokenizer: AutoTokenizer, disease: str, max_event_tokens: int):
+    def __init__(
+        self,
+        tokenizer: AutoTokenizer,
+        disease: str,
+        max_event_tokens: int,
+        prior_knowledge: str | None = None,
+    ):
         self.tokenizer = tokenizer
         self.max_event_tokens = max_event_tokens
-        self.system_prompt = SYSTEM_PROMPT.format(disease=disease)
-        self.user_template = USER_PROMPT.format(disease=disease, event_history="{event_history}")
+        self.disease = disease
+        self.system_prompt = SYSTEM_TEMPLATE.render(
+            disease=disease,
+            prior_knowledge=prior_knowledge,
+        )
 
     def _truncate_history(self, event_history: str) -> str:
         ids = self.tokenizer.encode(event_history, add_special_tokens=False)
@@ -132,7 +154,9 @@ class PromptCollator:
             history = self._truncate_history(item["event_history"])
             messages = [
                 {"role": "system",  "content": self.system_prompt},
-                {"role": "user",    "content": self.user_template.format(event_history=history)},
+                {"role": "user",    "content": USER_TEMPLATE.render(
+                    disease=self.disease, event_history=history,
+                )},
             ]
             # tokenize=False returns the formatted string, avoiding double tokenization
             text = self.tokenizer.apply_chat_template(
@@ -268,7 +292,14 @@ def main():
     if is_main(rank):
         print(f"\nLoaded {len(dataset)} rows for split='{args.split}'")
 
-    collator = PromptCollator(tokenizer, disease, args.max_event_tokens)
+    prior_knowledge = TASK_PRIORS.get(task) if task else None
+    if is_main(rank):
+        if prior_knowledge:
+            print(f"Prior knowledge : found for task '{task}' ({len(prior_knowledge)} chars)")
+        else:
+            print(f"Prior knowledge : none (task '{task or stem}' not in TASK_PRIORS)")
+
+    collator = PromptCollator(tokenizer, disease, args.max_event_tokens, prior_knowledge=prior_knowledge)
 
     sampler  = DistributedSampler(dataset, shuffle=False) if distributed else None
     loader   = DataLoader(
