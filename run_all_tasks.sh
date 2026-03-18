@@ -5,11 +5,11 @@ export CUDA_VISIBLE_DEVICES=0,1
 
 TASKS=(
     # new_hypertension
-    new_hyperlipidemia
-    new_pancan
+    # new_hyperlipidemia
+    # new_pancan
     new_celiac
     new_lupus
-    new_acutemi
+    # new_acutemi
 )
 
 for TASK in "${TASKS[@]}"; do

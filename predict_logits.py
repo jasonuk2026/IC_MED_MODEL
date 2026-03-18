@@ -14,9 +14,13 @@ Single-GPU:
     python predict_logits.py path/to/task.parquet --split val
     python predict_logits.py path/to/task.parquet --split test
 
-Multi-GPU (data-parallel via torchrun):
+Multi-GPU (data-parallel via torchrun, one model copy per GPU):
     torchrun --nproc_per_node=4 predict_logits.py path/to/task.parquet --split val
     torchrun --nproc_per_node=4 predict_logits.py path/to/task.parquet --split test
+
+Multi-GPU (tensor-parallel, model sharded across all GPUs, single process):
+    python predict_logits.py path/to/task.parquet --split val  --tensor_parallel
+    python predict_logits.py path/to/task.parquet --split test --tensor_parallel
 """
 
 import os
@@ -197,6 +201,11 @@ def predict_batch(
     outputs = model(**inputs)
     last_logits = outputs.logits[:, -1, :]  # (batch, vocab_size)
 
+    # yes/no id tensors must live on the same device as logits (important for
+    # tensor-parallel mode where the last layer may not be on cuda:0).
+    yes_ids = yes_ids.to(last_logits.device)
+    no_ids  = no_ids.to(last_logits.device)
+
     yes_logit = last_logits.index_select(1, yes_ids).logsumexp(dim=-1)
     no_logit  = last_logits.index_select(1, no_ids).logsumexp(dim=-1)
 
@@ -234,20 +243,34 @@ def parse_args():
                              "Does not include prompt prefix/suffix overhead.")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker processes per rank (default: 4).")
-    parser.add_argument("--output_dir", type=str, default="results",
+    parser.add_argument("--output_dir", type=str, default="results_priors",
                         help="Directory to save prediction outputs (default: results/).")
+    parser.add_argument("--tensor_parallel", action="store_true",
+                        help="Shard the model across all visible GPUs in a single process "
+                             "(uses HuggingFace device_map='auto'). "
+                             "Incompatible with torchrun / data-parallel mode.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    distributed, rank, local_rank = init_distributed()
-    device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 
-    if is_main(rank):
-        mode = f"distributed ({dist.get_world_size()} GPUs)" if distributed else "single GPU"
-        print(f"Mode   : {mode}")
-        print(f"Device : {device}")
+    if args.tensor_parallel:
+        # Single-process tensor-parallel: model is sharded across all visible GPUs
+        # by HuggingFace accelerate via device_map="auto".  No torchrun needed.
+        distributed, rank, local_rank = False, 0, 0
+        n_gpus = torch.cuda.device_count()
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        print(f"Mode   : tensor-parallel ({n_gpus} GPU{'s' if n_gpus != 1 else ''})")
+        print(f"Device : {device} (inputs; model sharded across all GPUs)")
+    else:
+        distributed, rank, local_rank = init_distributed()
+        device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+
+        if is_main(rank):
+            mode = f"distributed ({dist.get_world_size()} GPUs)" if distributed else "single GPU"
+            print(f"Mode   : {mode}")
+            print(f"Device : {device}")
 
     stem = Path(args.parquet_path).stem
     task = next((k for k in TASK_2_DISEASE_NAME if stem.startswith(k)), None)
@@ -271,7 +294,9 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype="auto", device_map={"": device},
+        args.model,
+        torch_dtype="auto",
+        device_map="auto" if args.tensor_parallel else {"": device},
     )
     model.eval()
 
