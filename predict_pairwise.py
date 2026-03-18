@@ -92,15 +92,16 @@ def get_ab_ids(tokenizer) -> tuple[list[int], list[int]]:
 class PairDataset(Dataset):
     """Dataset of (positive, negative) patient pairs.
 
-    For each positive patient, sample `pairs_per_pos` random negative patients.
-    Each positive is equally likely to be placed as Patient A or Patient B.
+    For each negative patient, sample `pairs_per_neg` random positive patients.
+    This guarantees every negative is covered; positives appear ~n_neg*pairs_per_neg/n_pos
+    times each on average.  Each pair randomly assigns positive/negative to slot A or B.
 
     Exposes:
         patient_labels (np.ndarray): ground-truth label for each patient in
             the base dataset, indexed 0..len(base_dataset)-1.
     """
 
-    def __init__(self, base_dataset: EHRShotDataset, pairs_per_pos: int, seed: int = 42):
+    def __init__(self, base_dataset: EHRShotDataset, pairs_per_neg: int, seed: int = 42):
         self._base = base_dataset
         n_patients = len(base_dataset)
 
@@ -121,10 +122,11 @@ class PairDataset(Dataset):
 
         rng = random.Random(seed)
 
-        # For each positive, sample pairs_per_pos negatives (with replacement)
+        # For each negative, sample pairs_per_neg positives (with replacement).
+        # This ensures every negative patient appears in at least pairs_per_neg pairs.
         pairs: list[tuple[int, int]] = []  # (pos_dataset_idx, neg_dataset_idx)
-        for pos_idx in pos_indices:
-            for neg_idx in rng.choices(neg_indices, k=pairs_per_pos):
+        for neg_idx in neg_indices:
+            for pos_idx in rng.choices(pos_indices, k=pairs_per_neg):
                 pairs.append((pos_idx, neg_idx))
 
         # Randomly shuffle which slot (A or B) each positive occupies
@@ -301,8 +303,9 @@ def parse_args():
     parser.add_argument("--model", default="Qwen/Qwen3.5-4B")
     parser.add_argument("--batch_size", type=int, default=2,
                         help="Per-GPU batch size (pairs, not patients).")
-    parser.add_argument("--pairs_per_pos", type=int, default=5,
-                        help="Random negatives paired with each positive (default: 5).")
+    parser.add_argument("--pairs_per_neg", type=int, default=1,
+                        help="Random positives paired with each negative (default: 1). "
+                             "Every negative patient is guaranteed to appear in this many pairs.")
     parser.add_argument("--seed", type=int, default=42,
                         help="RNG seed for pair sampling.")
     parser.add_argument("--max_event_tokens", type=int, default=14000,
@@ -364,7 +367,7 @@ def main():
     # All ranks build the same PairDataset (deterministic seed) so the
     # DistributedSampler gives each rank a disjoint but consistent slice.
     base_dataset = EHRShotDataset(args.parquet_path, split=args.split)
-    pair_dataset = PairDataset(base_dataset, args.pairs_per_pos, seed=args.seed)
+    pair_dataset = PairDataset(base_dataset, args.pairs_per_neg, seed=args.seed)
     n_patients   = len(base_dataset)
 
     if is_main(rank):
@@ -451,7 +454,7 @@ def main():
         print(f"Split      : {args.split}")
         print(f"Task       : {task or stem}")
         print(f"Model      : {args.model}")
-        print(f"Pairs/pos  : {args.pairs_per_pos}")
+        print(f"Pairs/neg  : {args.pairs_per_neg}")
         print(f"Threshold  : {threshold:+.4f}")
         print(f"F1 Score   : {f1:.4f}")
         print(f"\n{classification_report(patient_labels, all_preds, target_names=['Negative', 'Positive'], zero_division=0)}")
