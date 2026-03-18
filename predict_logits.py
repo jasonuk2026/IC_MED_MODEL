@@ -18,9 +18,13 @@ Multi-GPU (data-parallel via torchrun, one model copy per GPU):
     torchrun --nproc_per_node=4 predict_logits.py path/to/task.parquet --split val
     torchrun --nproc_per_node=4 predict_logits.py path/to/task.parquet --split test
 
-Multi-GPU (tensor-parallel, model sharded across all GPUs, single process):
-    python predict_logits.py path/to/task.parquet --split val  --tensor_parallel
-    python predict_logits.py path/to/task.parquet --split test --tensor_parallel
+Multi-GPU (tensor-parallel, model weight-sharded across all GPUs via DTensor):
+    torchrun --nproc_per_node=4 predict_logits.py path/to/task.parquet --split val  --tensor_parallel
+    torchrun --nproc_per_node=4 predict_logits.py path/to/task.parquet --split test --tensor_parallel
+
+    Note: the model must already be cached locally before launching in TP mode, because
+    all ranks call from_pretrained simultaneously and concurrent HF Hub downloads may
+    collide.  Pre-fetch with: huggingface-cli download <model>
 """
 
 import os
@@ -67,6 +71,25 @@ def init_distributed() -> tuple[bool, int, int]:
     dist.init_process_group(backend="nccl", device_id=local_rank)
     torch.cuda.set_device(local_rank)
     return True, dist.get_rank(), local_rank
+
+
+def init_tensor_parallel():
+    """Initialize process group and device mesh for true tensor parallelism.
+
+    All ranks hold a 1/world_size shard of every weight matrix.  Communications
+    (all-reduce) happen inside each transformer layer during the forward pass.
+    All ranks must call this function and from_pretrained simultaneously.
+
+    Returns (rank, local_rank, world_size, device_mesh).
+    """
+    from torch.distributed.device_mesh import init_device_mesh
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    dist.init_process_group(backend="nccl", device_id=local_rank)
+    torch.cuda.set_device(local_rank)
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device_mesh = init_device_mesh("cuda", (world_size,))
+    return rank, local_rank, world_size, device_mesh
 
 
 def is_main(rank: int) -> bool:
@@ -246,9 +269,11 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="results_priors",
                         help="Directory to save prediction outputs (default: results/).")
     parser.add_argument("--tensor_parallel", action="store_true",
-                        help="Shard the model across all visible GPUs in a single process "
-                             "(uses HuggingFace device_map='auto'). "
-                             "Incompatible with torchrun / data-parallel mode.")
+                        help="Use true tensor parallelism (tp_plan='auto', PyTorch DTensor). "
+                             "Each GPU holds a 1/N shard of every layer; all ranks process "
+                             "the same batches. Launch with torchrun --nproc_per_node=N. "
+                             "Requires PyTorch >= 2.4 and transformers >= 4.45. "
+                             "Model must be pre-cached locally before launching.")
     return parser.parse_args()
 
 
@@ -256,14 +281,18 @@ def main():
     args = parse_args()
 
     if args.tensor_parallel:
-        # Single-process tensor-parallel: model is sharded across all visible GPUs
-        # by HuggingFace accelerate via device_map="auto".  No torchrun needed.
-        distributed, rank, local_rank = False, 0, 0
-        n_gpus = torch.cuda.device_count()
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        print(f"Mode   : tensor-parallel ({n_gpus} GPU{'s' if n_gpus != 1 else ''})")
-        print(f"Device : {device} (inputs; model sharded across all GPUs)")
+        # True tensor-parallel: all ranks hold a weight shard of every layer.
+        # All ranks process the SAME batches; all-reduce runs inside each layer.
+        # No DistributedSampler and no gather — all ranks produce identical outputs.
+        rank, local_rank, world_size, device_mesh = init_tensor_parallel()
+        device = f"cuda:{local_rank}"
+        distributed = False  # data loading is NOT sharded across ranks
+
+        if is_main(rank):
+            print(f"Mode   : tensor-parallel ({world_size} GPUs, tp_plan='auto')")
+            print(f"Device : {device} (each rank holds 1/{world_size} of every weight matrix)")
     else:
+        device_mesh = None
         distributed, rank, local_rank = init_distributed()
         device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 
@@ -278,30 +307,47 @@ def main():
     if is_main(rank):
         print(f"Task   : {task or '(unknown)'}  |  Disease: {disease}")
 
-    # Rank 0 downloads the model/tokenizer to the local HF cache first.
-    # Other ranks wait at the barrier, then load from cache — no redundant downloads.
     if is_main(rank):
         print(f"\nLoading tokenizer and model '{args.model}'...")
-    if distributed and not is_main(rank):
-        from transformers.utils.logging import disable_progress_bar
-        disable_progress_bar()
-    if distributed and not is_main(rank):
-        dist.barrier()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    if args.tensor_parallel:
+        # All ranks must call from_pretrained simultaneously — TP sharding uses
+        # distributed ops during weight initialization.  Model must be pre-cached.
+        if not is_main(rank):
+            from transformers.utils.logging import disable_progress_bar
+            disable_progress_bar()
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype="auto",
+            tp_plan="auto",
+            device_mesh=device_mesh,
+        )
+    else:
+        # Rank 0 downloads the model/tokenizer to the local HF cache first.
+        # Other ranks wait at the barrier, then load from cache.
+        if distributed and not is_main(rank):
+            from transformers.utils.logging import disable_progress_bar
+            disable_progress_bar()
+            dist.barrier()
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype="auto",
-        device_map="auto" if args.tensor_parallel else {"": device},
-    )
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype="auto",
+            device_map={"": device},
+        )
+
+        if distributed and is_main(rank):
+            dist.barrier()  # release other ranks once rank 0 has finished caching
+
     model.eval()
-
-    if distributed and is_main(rank):
-        dist.barrier()  # release other ranks once rank 0 has finished caching
 
     yes_ids, no_ids = get_yes_no_ids(tokenizer)
     if is_main(rank):
@@ -309,7 +355,7 @@ def main():
         print(f"No  token IDs : {no_ids}")
     if not yes_ids or not no_ids:
         raise RuntimeError("Could not find single-token yes/no IDs for this tokenizer.")
-    
+
     yes_ids = torch.tensor(yes_ids, device=device)
     no_ids  = torch.tensor(no_ids, device=device)
 
@@ -326,8 +372,10 @@ def main():
 
     collator = PromptCollator(tokenizer, disease, args.max_event_tokens, prior_knowledge=prior_knowledge)
 
-    sampler  = DistributedSampler(dataset, shuffle=False) if distributed else None
-    loader   = DataLoader(
+    # TP: no DistributedSampler — all ranks process every batch identically.
+    # DP: DistributedSampler splits the dataset across ranks.
+    sampler = DistributedSampler(dataset, shuffle=False) if distributed else None
+    loader  = DataLoader(
         dataset,
         batch_size=args.batch_size,
         sampler=sampler,
@@ -339,7 +387,7 @@ def main():
         persistent_workers=args.num_workers > 0,
     )
 
-    if distributed:
+    if distributed or args.tensor_parallel:
         dist.barrier()  # synchronize before starting inference
 
     local_scores, local_labels = [], []
@@ -352,7 +400,8 @@ def main():
     local_scores = torch.cat(local_scores).float().cpu().numpy().tolist()
     local_labels = np.concatenate(local_labels).tolist()
 
-    # Gather results from all ranks onto rank 0
+    # DP: gather sharded results from all ranks onto rank 0.
+    # TP: all ranks produced identical outputs — no gather needed.
     if distributed:
         all_scores_gathered = [None] * dist.get_world_size()
         all_labels_gathered = [None] * dist.get_world_size()
@@ -399,7 +448,7 @@ def main():
         print(f"F1 Score  : {f1:.4f}")
         print(f"\n{classification_report(all_labels, all_preds, target_names=['Negative', 'Positive'], zero_division=0)}")
 
-    if distributed:
+    if distributed or args.tensor_parallel:
         dist.destroy_process_group()
 
 
