@@ -14,6 +14,9 @@ set -e
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate torch
+
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs
 
@@ -40,7 +43,7 @@ MODEL="${MODEL:-Qwen/Qwen3.5-122B-A10B}"    # override with: sbatch --export=MOD
 # (all ranks call from_pretrained simultaneously, so cache must exist first)
 # ---------------------------------------------------------------------------
 echo "Pre-fetching model: $MODEL"
-conda run -n torch python - <<EOF
+python - <<EOF
 from huggingface_hub import snapshot_download
 snapshot_download("$MODEL")
 EOF
@@ -52,7 +55,7 @@ for TASK in "${TASKS[@]}"; do
     PARQUET="data/llm_inputs/new_diagnosis/${TASK}_all.parquet"
 
     echo "========== $TASK  [val — threshold search] =========="
-    conda run -n torch torchrun --nproc_per_node=4 --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
+    torchrun --nproc_per_node=4 --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
         predict_logits.py "$PARQUET" \
         --model "$MODEL" \
         --split val \
@@ -63,7 +66,7 @@ for TASK in "${TASKS[@]}"; do
         --tensor_parallel
 
     echo "========== $TASK  [test — evaluation] =========="
-    conda run -n torch torchrun --nproc_per_node=4 --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
+    torchrun --nproc_per_node=4 --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
         predict_logits.py "$PARQUET" \
         --model "$MODEL" \
         --split test \
