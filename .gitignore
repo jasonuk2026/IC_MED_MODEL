@@ -24,4 +24,4 @@ venv/
 
 cmd.md
 results/
-result*
+*.zip

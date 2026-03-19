@@ -14,11 +14,11 @@ TASKS=(
 
 for TASK in "${TASKS[@]}"; do
     echo "========== $TASK  [val — threshold search] =========="
-    conda run -n torch torchrun --nproc_per_node=4 predict_logits.py \
+    TORCH_DISTRIBUTED_DEBUG=DETAIL conda run -n torch torchrun --nproc_per_node=4 predict_logits.py \
         $PROJECTDIR/zduan/data/ehrshot_extracted/new_diagnosis/${TASK}_all.parquet \
         --split val \
 	--model Qwen/Qwen3.5-122B-A10B \
-        --batch_size 4 \
+        --batch_size 1 \
         --num_workers 4 \
         --max_event_tokens 30000 \
         --output_dir results_tp \
