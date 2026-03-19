@@ -243,16 +243,24 @@ def main():
         prompts.append(builder.build(item))
         labels.append(int(item["label"]))
 
+    # logprobs=N returns the top-N tokens by probability from the full vocabulary.
+    # yes/no tokens are typically rank ~50-500 in the raw distribution, so we
+    # need a large enough N to reliably capture both.  allowed_token_ids only
+    # restricts sampling, not which logprobs are returned — it is not needed here.
     sp = SamplingParams(
         max_tokens=1,
-        logprobs=len(all_ids),
-        allowed_token_ids=all_ids,  # restrict vocab to yes/no tokens only
+        logprobs=200,
     )
 
     print("\nRunning vLLM inference...")
     outputs = llm.generate(prompts, sp)
 
-    scores = np.array([score_output(o, yes_ids, no_ids) for o in outputs])
+    scores_list = [score_output(o, yes_ids, no_ids) for o in outputs]
+    n_missing = sum(1 for s in scores_list if not np.isfinite(s))
+    if n_missing:
+        print(f"WARNING: {n_missing}/{len(scores_list)} samples have non-finite scores "
+              f"(yes/no tokens not in top-200 logprobs). Consider increasing logprobs.")
+    scores = np.array(scores_list)
     labels = np.array(labels)
 
     out_dir = Path(args.output_dir) / (task or stem)
