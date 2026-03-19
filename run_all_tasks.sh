@@ -1,7 +1,6 @@
 #!/bin/bash
 set -e
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate torch
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
