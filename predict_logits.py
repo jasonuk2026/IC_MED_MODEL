@@ -320,15 +320,13 @@ def main():
         tokenizer.padding_side = "left"
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        # k_proj and v_proj are omitted so they stay replicated across ranks.
-        # "auto" shards them colwise, but num_kv_heads=2 < tp_size=4 means each
-        # rank gets a fractional head (2*head_dim/4 < head_dim), causing a reshape
-        # error in the attention forward. Replicating KV projections fixes this.
+        # All attention projections (q/k/v/o_proj, q/k_norm) are omitted so they
+        # stay replicated. Sharding q_proj colwise while replicating k/v_proj causes
+        # a mismatch: GQA expansion uses the full num_attention_heads (not TP-aware),
+        # expanding k to 32 heads while q has only 8 per rank. Replicating all
+        # attention layers avoids this. MoE experts (>90% of 122B params) remain
+        # sharded, so memory savings are still substantial.
         _tp_plan = {
-            "model.layers.*.self_attn.q_proj": "colwise",
-            "model.layers.*.self_attn.o_proj": "rowwise",
-            "model.layers.*.self_attn.q_norm": "replicated_with_grad_allreduce",
-            "model.layers.*.self_attn.k_norm": "replicated_with_grad_allreduce",
             "model.layers.*.mlp.experts.gate_up_proj": "packed_colwise",
             "model.layers.*.mlp.experts.down_proj": "rowwise",
             "model.layers.*.mlp.experts": "moe_tp_experts",

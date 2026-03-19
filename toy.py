@@ -26,11 +26,9 @@ from transformers.distributed.configuration_utils import DistributedConfig
 MODEL = "Qwen/Qwen3.5-122B-A10B"
 
 CUSTOM_TP_PLAN = {
-    "model.layers.*.self_attn.q_proj": "colwise",
-    # k_proj and v_proj omitted → replicated (num_kv_heads=2 < tp_size=4)
-    "model.layers.*.self_attn.o_proj": "rowwise",
-    "model.layers.*.self_attn.q_norm": "replicated_with_grad_allreduce",
-    "model.layers.*.self_attn.k_norm": "replicated_with_grad_allreduce",
+    # Attention projections omitted → all replicated.
+    # Sharding q_proj while replicating k/v causes GQA expansion mismatch (q=8, k=32).
+    # Only MoE FFN is sharded (>90% of 122B params).
     "model.layers.*.mlp.experts.gate_up_proj": "packed_colwise",
     "model.layers.*.mlp.experts.down_proj": "rowwise",
     "model.layers.*.mlp.experts": "moe_tp_experts",
