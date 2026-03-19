@@ -243,12 +243,13 @@ def main():
         prompts.append(builder.build(item))
         labels.append(int(item["label"]))
 
-    # allowed_token_ids constructs a logits processor that masks all other tokens
-    # to -inf before logprob reporting.  With only yes/no tokens remaining,
-    # logprobs=len(all_ids) is sufficient to capture both (vLLM caps logprobs at 20).
+    # vLLM caps logprobs at 20 and reports top-k from the pre-masking distribution.
+    # allowed_token_ids guarantees the sampled token is yes/no (always included in
+    # the logprobs dict per vLLM docs).  logprobs=20 maximises the chance the
+    # non-sampled yes/no token also appears in the top-20 pre-masking distribution.
     sp = SamplingParams(
         max_tokens=1,
-        logprobs=len(all_ids),
+        logprobs=20,
         allowed_token_ids=all_ids,
     )
 
