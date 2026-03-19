@@ -113,7 +113,6 @@ def main():
         language_model_only=True,
         tensor_parallel_size=4,
         max_num_seqs=4,
-        # --reasoning-parser qwen3
         reasoning_parser="qwen3",
     )
 
