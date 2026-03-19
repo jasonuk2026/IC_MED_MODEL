@@ -244,12 +244,11 @@ def main():
         labels.append(int(item["label"]))
 
     # allowed_token_ids constructs a logits processor that masks all other tokens
-    # to -inf.  logprobs=-1 returns the full-vocab log-probability distribution
-    # (after masking), guaranteeing yes/no token entries are always present in
-    # the returned logprobs dict regardless of vLLM version internals.
+    # to -inf before logprob reporting.  With only yes/no tokens remaining,
+    # logprobs=len(all_ids) is sufficient to capture both (vLLM caps logprobs at 20).
     sp = SamplingParams(
         max_tokens=1,
-        logprobs=-1,
+        logprobs=len(all_ids),
         allowed_token_ids=all_ids,
     )
 
