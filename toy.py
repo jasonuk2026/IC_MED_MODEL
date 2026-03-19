@@ -21,6 +21,8 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from transformers.distributed.configuration_utils import DistributedConfig
+
 MODEL = "Qwen/Qwen3.5-122B-A10B"
 
 CUSTOM_TP_PLAN = {
@@ -64,11 +66,13 @@ def main():
 
     if rank == 0:
         print("\nLoading model...")
+    distributed_config = DistributedConfig(enable_expert_parallel=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype="auto",
-        tp_plan=tp_plan,
-        device_mesh=device_mesh,
+        distributed_config=distributed_config,
+        # tp_plan=tp_plan,
+        # device_mesh=device_mesh,
     )
     model.eval()
 
