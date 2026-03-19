@@ -23,5 +23,5 @@ venv/
 .claude/
 
 cmd.md
-results/
+results*/
 *.zip
