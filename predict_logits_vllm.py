@@ -243,13 +243,14 @@ def main():
         prompts.append(builder.build(item))
         labels.append(int(item["label"]))
 
-    # logprobs=N returns the top-N tokens by probability from the full vocabulary.
-    # yes/no tokens are typically rank ~50-500 in the raw distribution, so we
-    # need a large enough N to reliably capture both.  allowed_token_ids only
-    # restricts sampling, not which logprobs are returned — it is not needed here.
+    # allowed_token_ids constructs a logits processor that masks all other tokens
+    # to -inf.  logprobs=-1 returns the full-vocab log-probability distribution
+    # (after masking), guaranteeing yes/no token entries are always present in
+    # the returned logprobs dict regardless of vLLM version internals.
     sp = SamplingParams(
         max_tokens=1,
-        logprobs=200,
+        logprobs=-1,
+        allowed_token_ids=all_ids,
     )
 
     print("\nRunning vLLM inference...")
