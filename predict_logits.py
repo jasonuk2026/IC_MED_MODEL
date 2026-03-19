@@ -320,10 +320,26 @@ def main():
         tokenizer.padding_side = "left"
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        # k_proj and v_proj are omitted so they stay replicated across ranks.
+        # "auto" shards them colwise, but num_kv_heads=2 < tp_size=4 means each
+        # rank gets a fractional head (2*head_dim/4 < head_dim), causing a reshape
+        # error in the attention forward. Replicating KV projections fixes this.
+        _tp_plan = {
+            "model.layers.*.self_attn.q_proj": "colwise",
+            "model.layers.*.self_attn.o_proj": "rowwise",
+            "model.layers.*.self_attn.q_norm": "replicated_with_grad_allreduce",
+            "model.layers.*.self_attn.k_norm": "replicated_with_grad_allreduce",
+            "model.layers.*.mlp.experts.gate_up_proj": "packed_colwise",
+            "model.layers.*.mlp.experts.down_proj": "rowwise",
+            "model.layers.*.mlp.experts": "moe_tp_experts",
+            "model.layers.*.mlp.shared_expert.gate_proj": "colwise",
+            "model.layers.*.mlp.shared_expert.up_proj": "colwise",
+            "model.layers.*.mlp.shared_expert.down_proj": "rowwise",
+        }
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
             torch_dtype="auto",
-            tp_plan="auto",
+            tp_plan=_tp_plan,
             device_mesh=device_mesh,
         )
     else:
