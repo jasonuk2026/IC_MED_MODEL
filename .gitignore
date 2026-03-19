@@ -25,3 +25,6 @@ venv/
 cmd.md
 results*/
 *.zip
+
+core
+logs/

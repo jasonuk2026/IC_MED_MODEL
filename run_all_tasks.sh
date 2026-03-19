@@ -1,22 +1,21 @@
 #!/bin/bash
 set -e
 
-conda activate torch
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 TASKS=(
     # new_hypertension
     # new_hyperlipidemia
-    # new_pancan
-    new_celiac
+    new_pancan
+    # new_celiac
     # new_lupus
-    # new_acutemi
+    new_acutemi
 )
 
 for TASK in "${TASKS[@]}"; do
     echo "========== $TASK  [val — threshold search] =========="
-    TORCH_DISTRIBUTED_DEBUG=DETAIL torchrun --nproc_per_node=4 predict_logits.py \
+    torchrun --nproc_per_node=4 predict_logits.py \
         $PROJECTDIR/zduan/data/ehrshot_extracted/new_diagnosis/${TASK}_all.parquet \
         --split val \
 	--model Qwen/Qwen3.5-122B-A10B \
@@ -31,7 +30,7 @@ for TASK in "${TASKS[@]}"; do
         $PROJECTDIR/zduan/data/ehrshot_extracted/new_diagnosis/${TASK}_all.parquet \
         --split test \
 	--model Qwen/Qwen3.5-122B-A10B \
-        --batch_size 4 \
+        --batch_size 1 \
         --num_workers 4 \
         --max_event_tokens 30000 \
         --output_dir results_tp \
