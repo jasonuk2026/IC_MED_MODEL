@@ -379,7 +379,7 @@ def main():
     if is_main(rank):
         print(f"\nLoaded {len(dataset)} rows for split='{args.split}'")
 
-    prior_knowledge = TASK_PRIORS.get(task) if task else None
+    prior_knowledge = None  # temporarily disabled
     if is_main(rank):
         if prior_knowledge:
             print(f"Prior knowledge : found for task '{task}' ({len(prior_knowledge)} chars)")
