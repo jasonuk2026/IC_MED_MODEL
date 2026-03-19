@@ -38,8 +38,8 @@ def show_top_tokens(llm, prompt: str, top_k: int):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--prompt", default="The capital of France is")
+    parser.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--prompt", default="Answer with Yes or no. Do you think sky is blue? Answer:")
     parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--tensor_parallel_size", type=int, default=4)
     args = parser.parse_args()
