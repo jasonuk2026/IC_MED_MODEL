@@ -14,7 +14,7 @@ set -e
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
-source "$(conda info --base)/etc/profile.d/conda.sh"
+eval "$(~/miniforge3/bin/conda shell.bash hook)"
 conda activate torch
 
 cd "$SLURM_SUBMIT_DIR"
@@ -30,36 +30,27 @@ export MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
 TASKS=(
     # new_hypertension
     # new_hyperlipidemia
-    # new_pancan
-    new_celiac
+    new_pancan
+    # new_celiac
     # new_lupus
-    # new_acutemi
+    new_acutemi
 )
 
 MODEL="${MODEL:-Qwen/Qwen3.5-122B-A10B}"    # override with: sbatch --export=MODEL=... submit.sh
 
-# ---------------------------------------------------------------------------
-# Pre-fetch model weights to HF cache on this node before TP loading
-# (all ranks call from_pretrained simultaneously, so cache must exist first)
-# ---------------------------------------------------------------------------
-echo "Pre-fetching model: $MODEL"
-python - <<EOF
-from huggingface_hub import snapshot_download
-snapshot_download("$MODEL")
-EOF
 
 # ---------------------------------------------------------------------------
 # Inference loop
 # ---------------------------------------------------------------------------
 for TASK in "${TASKS[@]}"; do
-    PARQUET="data/llm_inputs/new_diagnosis/${TASK}_all.parquet"
+    PARQUET="$PROJECTDIR/zduan/data/ehrshot_extracted/new_diagnosis/${TASK}_all.parquet"
 
     echo "========== $TASK  [val — threshold search] =========="
     torchrun --nproc_per_node=4 --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
         predict_logits.py "$PARQUET" \
         --model "$MODEL" \
         --split val \
-        --batch_size 4 \
+        --batch_size 1 \
         --num_workers 4 \
         --max_event_tokens 30000 \
         --output_dir results_tp \
@@ -70,7 +61,7 @@ for TASK in "${TASKS[@]}"; do
         predict_logits.py "$PARQUET" \
         --model "$MODEL" \
         --split test \
-        --batch_size 4 \
+        --batch_size 1 \
         --num_workers 4 \
         --max_event_tokens 30000 \
         --output_dir results_tp \
