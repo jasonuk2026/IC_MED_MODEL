@@ -140,16 +140,20 @@ class PromptBuilder:
 # Scoring
 # ---------------------------------------------------------------------------
 
-def score_output(output, yes_ids: list[int], no_ids: list[int]) -> float:
-    """Extract log-odds score from a single vLLM RequestOutput."""
-    lp = output.outputs[0].logprobs[0]  # dict {token_id: Logprob}
+def extract_logsumexp(outputs, token_ids: list[int]) -> np.ndarray:
+    """Extract logsumexp of given token_ids from sampled-token logprobs.
 
-    yes_logprobs = [lp[tid].logprob for tid in yes_ids if tid in lp]
-    no_logprobs  = [lp[tid].logprob for tid in no_ids  if tid in lp]
-
-    y = torch.tensor(yes_logprobs).logsumexp(0).item() if yes_logprobs else float("-inf")
-    n = torch.tensor(no_logprobs).logsumexp(0).item()  if no_logprobs  else float("-inf")
-    return y - n
+    The sampled token is always present in the logprobs dict (vLLM guarantee),
+    so restricting allowed_token_ids to token_ids ensures every entry is found.
+    """
+    scores = []
+    for output in outputs:
+        lp = output.outputs[0].logprobs[0]
+        lps = [lp[tid].logprob for tid in token_ids if tid in lp]
+        scores.append(
+            torch.tensor(lps).logsumexp(0).item() if lps else float("-inf")
+        )
+    return np.array(scores)
 
 
 def find_best_threshold(scores: np.ndarray, labels: np.ndarray) -> float:
@@ -221,7 +225,6 @@ def main():
     if not yes_ids or not no_ids:
         raise RuntimeError("Could not find single-token yes/no IDs for this tokenizer.")
 
-    all_ids = yes_ids + no_ids
 
     dataset = EHRShotDataset(args.parquet_path, split=args.split)
     print(f"\nLoaded {len(dataset)} rows for split='{args.split}'")
@@ -243,25 +246,20 @@ def main():
         prompts.append(builder.build(item))
         labels.append(int(item["label"]))
 
-    # vLLM caps logprobs at 20 and reports top-k from the pre-masking distribution.
-    # allowed_token_ids guarantees the sampled token is yes/no (always included in
-    # the logprobs dict per vLLM docs).  logprobs=20 maximises the chance the
-    # non-sampled yes/no token also appears in the top-20 pre-masking distribution.
-    sp = SamplingParams(
-        max_tokens=1,
-        logprobs=20,
-        allowed_token_ids=all_ids,
-    )
+    # Two-pass inference: each pass forces sampling to one side (yes or no).
+    # The sampled token is always in the logprobs dict (vLLM guarantee), so
+    # each pass reliably yields the pre-masking logprob for that token set.
+    sp_yes = SamplingParams(max_tokens=1, logprobs=1, allowed_token_ids=yes_ids)
+    sp_no  = SamplingParams(max_tokens=1, logprobs=1, allowed_token_ids=no_ids)
 
-    print("\nRunning vLLM inference...")
-    outputs = llm.generate(prompts, sp)
+    print("\nRunning vLLM inference (pass 1/2: yes) ...")
+    outputs_yes = llm.generate(prompts, sp_yes)
+    print("Running vLLM inference (pass 2/2: no) ...")
+    outputs_no  = llm.generate(prompts, sp_no)
 
-    scores_list = [score_output(o, yes_ids, no_ids) for o in outputs]
-    n_missing = sum(1 for s in scores_list if not np.isfinite(s))
-    if n_missing:
-        print(f"WARNING: {n_missing}/{len(scores_list)} samples have non-finite scores "
-              f"(yes/no tokens not in top-200 logprobs). Consider increasing logprobs.")
-    scores = np.array(scores_list)
+    y_scores = extract_logsumexp(outputs_yes, yes_ids)
+    n_scores = extract_logsumexp(outputs_no,  no_ids)
+    scores   = y_scores - n_scores
     labels = np.array(labels)
 
     out_dir = Path(args.output_dir) / (task or stem)
