@@ -25,15 +25,15 @@ export MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
 # Tasks to run  (uncomment as needed)
 # ---------------------------------------------------------------------------
 TASKS=(
-    new_hypertension
+    # new_hypertension
     # new_hyperlipidemia
     # new_pancan
-    # new_celiac
+    new_celiac
     # new_lupus
     # new_acutemi
 )
 
-MODEL="${MODEL:-Qwen/Qwen3-32B}"    # override with: sbatch --export=MODEL=... submit.sh
+MODEL="${MODEL:-Qwen/Qwen3.5-122B-A10B}"    # override with: sbatch --export=MODEL=... submit.sh
 
 # ---------------------------------------------------------------------------
 # Pre-fetch model weights to HF cache on this node before TP loading
