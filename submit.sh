@@ -28,12 +28,12 @@ export MASTER_PORT=$((29500 + SLURM_JOB_ID % 1000))
 # Tasks to run  (uncomment as needed)
 # ---------------------------------------------------------------------------
 TASKS=(
+    # new_pancan
     # new_hypertension
-    # new_hyperlipidemia
-    new_pancan
+    new_hyperlipidemia
     # new_celiac
     # new_lupus
-    new_acutemi
+    # new_acutemi
 )
 
 MODEL="${MODEL:-Qwen/Qwen3.5-122B-A10B}"    # override with: sbatch --export=MODEL=... submit.sh
@@ -45,27 +45,32 @@ MODEL="${MODEL:-Qwen/Qwen3.5-122B-A10B}"    # override with: sbatch --export=MOD
 for TASK in "${TASKS[@]}"; do
     PARQUET="$PROJECTDIR/zduan/data/ehrshot_extracted/new_diagnosis/${TASK}_all.parquet"
 
-    echo "========== $TASK  [val — threshold search] =========="
-    torchrun --nproc_per_node=4 --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
-        predict_logits.py "$PARQUET" \
-        --model "$MODEL" \
-        --split val \
-        --batch_size 1 \
-        --num_workers 4 \
-        --max_event_tokens 30000 \
-        --output_dir results_tp \
-        --tensor_parallel
+    hf download Qwen/Qwen3.5-122B-A10B
 
+    echo "========== $TASK  [val — threshold search] =========="
+    # torchrun --nproc_per_node=4 --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
+    #     probe_disease_logits_tp.py "$PARQUET" \
+    #     --model "$MODEL" \
+    #     --split val \
+    #     --batch_size 1 \
+    #     --num_workers 4 \
+    #     --max_event_tokens 30000 \
+    #     --output_dir results_tp_beta \
+    #     --tp_plan moe
+
+    hf download Qwen/Qwen3.5-122B-A10B
+    
     echo "========== $TASK  [test — evaluation] =========="
+
     torchrun --nproc_per_node=4 --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
-        predict_logits.py "$PARQUET" \
+        probe_disease_logits_tp.py "$PARQUET" \
         --model "$MODEL" \
         --split test \
         --batch_size 1 \
         --num_workers 4 \
         --max_event_tokens 30000 \
-        --output_dir results_tp \
-        --tensor_parallel
+        --output_dir results_tp_beta \
+        --tp_plan moe
 done
 
 echo "All tasks complete."

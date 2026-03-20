@@ -27,6 +27,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import argparse
 import numpy as np
 import torch
+torch.set_float32_matmul_precision("high")
 import torch.distributed as dist
 
 from jinja2 import Template
