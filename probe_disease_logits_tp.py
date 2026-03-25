@@ -71,11 +71,11 @@ def init_tp() -> tuple[int, int, int]:
 def get_yes_no_ids(tokenizer) -> tuple[list[int], list[int]]:
     """Return token IDs (single tokens only) for yes/no variants."""
     yes_ids, no_ids = set(), set()
-    for token in (" Yes",):
+    for token in ("Yes",):
         ids = tokenizer.encode(token, add_special_tokens=False)
         if len(ids) == 1:
             yes_ids.add(ids[0])
-    for token in (" No",):
+    for token in ("No",):
         ids = tokenizer.encode(token, add_special_tokens=False)
         if len(ids) == 1:
             no_ids.add(ids[0])
@@ -91,7 +91,7 @@ SYSTEM_TEMPLATE = Template("""\
 You are a clinical prediction assistant. Based on the patient's medical event history, \
 predict whether this patient will be newly diagnosed with {{ disease }} within the next \
 year after the observation period ends.
-Answer with a single word: Yes or No.\
+Answer with exactly one word: either Yes or No. No punctuation, no explanation, no leading or trailing spaces. Nothing else.\
 """)
 
 USER_TEMPLATE = Template("""\
