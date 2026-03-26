@@ -374,9 +374,15 @@ def save_checkpoint(model, tokenizer, save_dir: Path):
 def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
+    # Mode
+    p.add_argument("--eval_only",   action="store_true",
+                   help="Skip training; just run evaluation on val_data_paths.")
+    p.add_argument("--checkpoint",  default=None,
+                   help="Path to a saved PEFT checkpoint to load before eval/training.")
+
     # Data
-    p.add_argument("--data_paths", nargs="+", required=True,
-                   help="Train parquet files. Rank r loads paths[r::world_size].")
+    p.add_argument("--data_paths", nargs="+", default=None,
+                   help="Train parquet files. Required unless --eval_only.")
     p.add_argument("--val_data_paths", nargs="+", default=None,
                    help="Val parquet files (evaluated on rank 0 only).")
     p.add_argument("--val_split", default="val", choices=["train", "val", "test"],
@@ -439,25 +445,29 @@ def main():
     if args.qlora and is_ddp:
         raise RuntimeError("QLoRA is not compatible with multi-GPU DDP. Use single GPU.")
 
+    if not args.eval_only and not args.data_paths:
+        raise ValueError("--data_paths is required unless --eval_only is set.")
+
     run_dir = Path(args.output_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
     if rank == 0:
         run_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Run dir: {run_dir}")
         logger.info(f"World size: {world_size}")
 
-    # ── Data: rank r loads paths[r::world_size] ────────────────────────────────
-    my_train_paths = args.data_paths[rank :: world_size]
-    if not my_train_paths:
-        raise ValueError(f"Rank {rank}: no data paths assigned "
-                         f"({len(args.data_paths)} paths, {world_size} ranks).")
-    logger.info(f"Rank {rank} train paths: {my_train_paths}")
-
-    train_df = pd.concat(
-        [pd.read_parquet(p).pipe(lambda df: df[df["split"] == "train"])
-         for p in my_train_paths],
-        ignore_index=True,
-    )
-    logger.info(f"Rank {rank}: {len(train_df)} train rows")
+    # ── Data ───────────────────────────────────────────────────────────────────
+    train_df = None
+    if not args.eval_only:
+        my_train_paths = args.data_paths[rank :: world_size]
+        if not my_train_paths:
+            raise ValueError(f"Rank {rank}: no data paths assigned "
+                             f"({len(args.data_paths)} paths, {world_size} ranks).")
+        logger.info(f"Rank {rank} train paths: {my_train_paths}")
+        train_df = pd.concat(
+            [pd.read_parquet(p).pipe(lambda df: df[df["split"] == "train"])
+             for p in my_train_paths],
+            ignore_index=True,
+        )
+        logger.info(f"Rank {rank}: {len(train_df)} train rows")
 
     val_df = None
     if args.val_data_paths and rank == 0:
@@ -472,6 +482,12 @@ def main():
     logger.info(f"Loading {args.model_name}")
     model, tokenizer = load_model_and_tokenizer(args)
     model = setup_model(model, tokenizer, args)
+
+    if args.checkpoint:
+        from peft import PeftModel
+        logger.info(f"Loading PEFT checkpoint: {args.checkpoint}")
+        model = PeftModel.from_pretrained(model, args.checkpoint)
+
     model = model.to(device)
 
     if is_ddp:
@@ -479,6 +495,17 @@ def main():
         # don't receive gradients and would otherwise cause DDP to hang.
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
                     find_unused_parameters=True)
+
+    # ── Eval-only mode ─────────────────────────────────────────────────────────
+    if args.eval_only:
+        if val_df is None:
+            raise ValueError("--eval_only requires --val_data_paths.")
+        val_dataset = EHRDataset(val_df)
+        val_acc = evaluate(model, tokenizer, val_dataset, device, args)
+        logger.info(f"Eval triplet accuracy: {val_acc:.4f}")
+        if is_ddp:
+            dist.destroy_process_group()
+        return
 
     # ── DataLoader ─────────────────────────────────────────────────────────────
     train_dataset = EHRDataset(train_df)
