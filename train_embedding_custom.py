@@ -545,9 +545,11 @@ def main():
 
     model = model.to(device)
 
-    if is_ddp:
+    if is_ddp and not args.eval_only:
         # find_unused_parameters=True needed because frozen base-model params
         # don't receive gradients and would otherwise cause DDP to hang.
+        # Skipped in eval_only mode: evaluate_ddp uses dist.all_reduce directly
+        # and DDP requires at least one trainable parameter.
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
                     find_unused_parameters=True)
 

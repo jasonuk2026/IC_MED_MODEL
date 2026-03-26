@@ -43,6 +43,8 @@ import os
 import multiprocessing as mp
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import time
 
 from tqdm import tqdm
@@ -420,21 +422,29 @@ if __name__ == "__main__":
             df_rows = df_rows.head(args.max_rows)
             print(f"\n  Capped to {len(df_rows)} rows (--max_rows={args.max_rows}).")
 
-        # 6. Sample events — write each (split, class) chunk to a temp parquet
-        #    immediately to avoid accumulating hundreds of millions of Python dicts
-        #    in RAM before the final DataFrame is built.
-        stem = f"{task}_{args.prediction_strategy}{_sample_suffix}"
+        # 6. Sample events — stream each (split, class) chunk directly into the
+        #    final parquet via ParquetWriter so peak RAM == one chunk at a time.
+        stem     = f"{task}_{args.prediction_strategy}{_sample_suffix}"
         path_out = os.path.join(args.path_to_output_dir, f"{stem}.parquet")
-        tmp_dir  = os.path.join(args.path_to_output_dir, f"_tmp_{stem}")
-        os.makedirs(tmp_dir, exist_ok=True)
 
         global_sample_id = 0
-        tmp_files = []
+        total_rows       = 0
+        pq_writer        = None   # opened lazily on first chunk (to infer schema)
+
+        def _write_chunk(chunk: list, writer_ref: list) -> pq.ParquetWriter:
+            """Convert chunk to Arrow table and append to the parquet file."""
+            df_chunk = pd.DataFrame(chunk)
+            table    = pa.Table.from_pandas(df_chunk, preserve_index=False)
+            if writer_ref[0] is None:
+                writer_ref[0] = pq.ParquetWriter(path_out, table.schema)
+            writer_ref[0].write_table(table)
+            return len(df_chunk)
+
+        writer_ref = [None]   # mutable container so _write_chunk can update it
 
         if _any_target:
-            # Per-split × per-class sampling
             for split in ("train", "val", "test"):
-                tgt = _split_targets[split]
+                tgt      = _split_targets[split]
                 df_split = df_rows[df_rows["split"] == split]
                 df_pos   = df_split[df_split["value"] == True]
                 df_neg   = df_split[df_split["value"] == False]
@@ -451,44 +461,33 @@ if __name__ == "__main__":
                         print(f"  [{split}/{label_name}] single pass...")
                         chunk = run_single_pass(df_class, task, args.num_workers)
 
-                    # Re-number sample_ids to be globally unique
                     for r in chunk:
                         r["sample_id"] = global_sample_id
                         global_sample_id += 1
-                    print(f"  [{split}/{label_name}] {len(chunk):,} samples")
 
-                    # Write chunk immediately and free Python objects
-                    tmp_path = os.path.join(tmp_dir, f"{split}_{label_name}.parquet")
-                    pd.DataFrame(chunk).to_parquet(tmp_path, index=False)
-                    tmp_files.append(tmp_path)
+                    n = _write_chunk(chunk, writer_ref)
+                    total_rows += n
+                    print(f"  [{split}/{label_name}] {n:,} samples written")
                     del chunk
                     gc.collect()
 
         else:
-            # Single pass over all rows (original behaviour, no per-split control)
             print(f"\n  Extracting samples with {args.num_workers} workers (single pass)...")
-            all_rows = run_single_pass(df_rows, task, args.num_workers)
-            tmp_path = os.path.join(tmp_dir, "all.parquet")
-            pd.DataFrame(all_rows).to_parquet(tmp_path, index=False)
-            tmp_files.append(tmp_path)
-            del all_rows
+            chunk = run_single_pass(df_rows, task, args.num_workers)
+            n = _write_chunk(chunk, writer_ref)
+            total_rows += n
+            del chunk
             gc.collect()
 
-        # 7. Merge temp chunks into final parquet, then clean up
-        print(f"\n  Merging {len(tmp_files)} chunks...")
-        df_out = pd.concat([pd.read_parquet(f) for f in tmp_files], ignore_index=True)
-        print(f"  Total samples: {len(df_out):,}")
-        print(f"  Label distribution:\n{df_out.groupby(['split', 'label']).size().to_string()}")
+        if writer_ref[0] is not None:
+            writer_ref[0].close()
 
-        df_out.to_parquet(path_out, index=False, row_group_size=max(1, len(df_out) // 8))
-        print(f"  Saved -> {path_out}")
-
-        # Free merged DataFrame and delete temp files
-        del df_out
-        gc.collect()
-        for f in tmp_files:
-            os.remove(f)
-        os.rmdir(tmp_dir)
-        print()
+        # 7. Print summary (read only metadata / small columns — no full reload)
+        pf = pq.ParquetFile(path_out)
+        df_meta = pf.read(columns=["split", "label"]).to_pandas()
+        print(f"\n  Total samples: {total_rows:,}")
+        print(f"  Label distribution:\n{df_meta.groupby(['split', 'label']).size().to_string()}")
+        del df_meta
+        print(f"  Saved -> {path_out}\n")
 
     print("Done.")
