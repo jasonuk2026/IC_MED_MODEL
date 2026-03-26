@@ -551,7 +551,7 @@ def main():
         # Skipped in eval_only mode: evaluate_ddp uses dist.all_reduce directly
         # and DDP requires at least one trainable parameter.
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
-                    find_unused_parameters=True)
+                    find_unused_parameters=False)
 
     # ── Eval-only mode ─────────────────────────────────────────────────────────
     if args.eval_only:
