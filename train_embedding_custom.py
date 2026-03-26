@@ -332,29 +332,53 @@ def build_eval_triplets(val_df: pd.DataFrame, n_per_task: int, seed: int):
     return anchors, positives, negatives
 
 
-def evaluate(model, tokenizer, val_df: pd.DataFrame, device, args) -> float:
-    """Triplet accuracy: fraction where d(anchor, positive) < d(anchor, negative)."""
+def evaluate_ddp(
+    model, tokenizer, val_df: pd.DataFrame, device, args,
+    rank: int, world_size: int, is_ddp: bool,
+) -> float:
+    """Triplet accuracy distributed across all ranks.
+
+    All ranks build the same triplet list (deterministic seed), then each rank
+    encodes its own slice (round-robin). Local correct/total counts are
+    all-reduced to produce the global accuracy.
+    """
     anchors, positives, negatives = build_eval_triplets(
         val_df, n_per_task=args.n_eval_triplets_per_task, seed=args.seed
     )
     if not anchors:
-        logger.warning("No eval triplets could be built.")
+        if rank == 0:
+            logger.warning("No eval triplets could be built.")
         return 0.0
 
-    amp_dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else None)
-    amp_ctx   = torch.autocast("cuda", dtype=amp_dtype) if amp_dtype else nullcontext()
+    n_total = len(anchors)
+
+    # Each rank handles its slice (round-robin so slices are roughly equal)
+    my_idx       = list(range(rank, n_total, world_size))
+    my_anchors   = [anchors[i]   for i in my_idx]
+    my_positives = [positives[i] for i in my_idx]
+    my_negatives = [negatives[i] for i in my_idx]
 
     raw_model = model.module if isinstance(model, DDP) else model
     raw_model.eval()
 
-    all_texts = anchors + positives + negatives
-    embs = encode_texts(raw_model, tokenizer, all_texts, device,
-                        batch_size=args.eval_batch_size)
-    n     = len(anchors)
-    d_ap  = (embs[:n] - embs[n:2*n]).norm(dim=1)
-    d_an  = (embs[:n] - embs[2*n:]).norm(dim=1)
-    acc   = (d_ap < d_an).float().mean().item()
+    all_texts = my_anchors + my_positives + my_negatives
+    if all_texts:
+        embs = encode_texts(raw_model, tokenizer, all_texts, device,
+                            batch_size=args.eval_batch_size)
+        n_my       = len(my_anchors)
+        d_ap       = (embs[:n_my] - embs[n_my:2*n_my]).norm(dim=1)
+        d_an       = (embs[:n_my] - embs[2*n_my:]).norm(dim=1)
+        local_correct = (d_ap < d_an).sum().to(torch.long).to(device)
+        local_total   = torch.tensor(n_my, dtype=torch.long, device=device)
+    else:
+        local_correct = torch.tensor(0, dtype=torch.long, device=device)
+        local_total   = torch.tensor(0, dtype=torch.long, device=device)
 
+    if is_ddp:
+        dist.all_reduce(local_correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_total,   op=dist.ReduceOp.SUM)
+
+    acc = (local_correct.float() / local_total.float()).item() if local_total.item() > 0 else 0.0
     raw_model.train()
     return acc
 
@@ -384,7 +408,7 @@ def parse_args():
     p.add_argument("--data_paths", nargs="+", default=None,
                    help="Train parquet files. Required unless --eval_only.")
     p.add_argument("--val_data_paths", nargs="+", default=None,
-                   help="Val parquet files (evaluated on rank 0 only).")
+                   help="Val parquet files.")
     p.add_argument("--val_split", default="val", choices=["train", "val", "test"],
                    help="Which split to use for evaluation.")
 
@@ -420,6 +444,14 @@ def parse_args():
     p.add_argument("--n_eval_triplets_per_task", type=int,   default=100)
     p.add_argument("--eval_batch_size",          type=int,   default=4)
 
+    # wandb
+    p.add_argument("--wandb_project",  default=None,
+                   help="wandb project name. wandb logging is disabled if not set.")
+    p.add_argument("--wandb_run_name", default=None,
+                   help="wandb run name. Auto-generated from timestamp if not set.")
+    p.add_argument("--wandb_tags",     nargs="+", default=None,
+                   help="Optional wandb tags.")
+
     return p.parse_args()
 
 
@@ -448,11 +480,29 @@ def main():
     if not args.eval_only and not args.data_paths:
         raise ValueError("--data_paths is required unless --eval_only is set.")
 
-    run_dir = Path(args.output_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = Path(args.output_dir) / timestamp
     if rank == 0:
         run_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Run dir: {run_dir}")
         logger.info(f"World size: {world_size}")
+
+    # ── wandb init (rank 0 only) ───────────────────────────────────────────────
+    use_wandb = (args.wandb_project is not None) and (rank == 0)
+    wandb_run = None
+    if use_wandb:
+        import wandb
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name or timestamp,
+            tags=args.wandb_tags,
+            config=vars(args),
+            dir=str(run_dir),
+            settings=wandb.Settings(console="wrap"),  # capture terminal output
+        )
+        # Save the training script as an artifact so the exact code is reproducible
+        wandb.save(os.path.abspath(__file__), base_path=os.path.dirname(os.path.abspath(__file__)))
+        logger.info(f"wandb run: {wandb_run.url}")
 
     # ── Data ───────────────────────────────────────────────────────────────────
     train_df = None
@@ -469,14 +519,16 @@ def main():
         )
         logger.info(f"Rank {rank}: {len(train_df)} train rows")
 
+    # Val data: ALL ranks load val so DDP eval can distribute the work.
     val_df = None
-    if args.val_data_paths and rank == 0:
+    if args.val_data_paths:
         val_df = pd.concat(
             [pd.read_parquet(p).pipe(lambda df: df[df["split"] == args.val_split])
              for p in args.val_data_paths],
             ignore_index=True,
         )
-        logger.info(f"Val rows: {len(val_df)}")
+        if rank == 0:
+            logger.info(f"Val rows: {len(val_df)}")
 
     # ── Model ──────────────────────────────────────────────────────────────────
     logger.info(f"Loading {args.model_name}")
@@ -503,8 +555,14 @@ def main():
     if args.eval_only:
         if val_df is None:
             raise ValueError("--eval_only requires --val_data_paths.")
-        val_acc = evaluate(model, tokenizer, val_df, device, args)
-        logger.info(f"Eval triplet accuracy: {val_acc:.4f}")
+        val_acc = evaluate_ddp(model, tokenizer, val_df, device, args,
+                               rank, world_size, is_ddp)
+        if rank == 0:
+            logger.info(f"Eval triplet accuracy: {val_acc:.4f}")
+            if use_wandb:
+                wandb.log({"eval/triplet_acc": val_acc})
+        if use_wandb and wandb_run:
+            wandb_run.finish()
         if is_ddp:
             dist.destroy_process_group()
         return
@@ -531,10 +589,10 @@ def main():
         lr=args.lr, weight_decay=args.weight_decay,
     )
 
-    n_batches_per_epoch  = len(train_loader)
+    n_batches_per_epoch   = len(train_loader)
     n_opt_steps_per_epoch = math.ceil(n_batches_per_epoch / args.grad_accum)
-    total_opt_steps      = n_opt_steps_per_epoch * args.epochs
-    warmup_steps         = int(total_opt_steps * args.warmup_ratio)
+    total_opt_steps       = n_opt_steps_per_epoch * args.epochs
+    warmup_steps          = int(total_opt_steps * args.warmup_ratio)
 
     def lr_lambda(opt_step: int) -> float:
         if opt_step < warmup_steps:
@@ -549,7 +607,7 @@ def main():
                 f"{n_batches_per_epoch} batches/epoch, "
                 f"{total_opt_steps} optimizer steps total")
 
-    loss_module  = BatchAllTripletLoss(model=None, margin=args.triplet_margin)
+    loss_module = BatchAllTripletLoss(model=None, margin=args.triplet_margin)
     logger.info(f"BatchAllTripletLoss margin={args.triplet_margin}")
 
     best_val_acc = 0.0
@@ -561,7 +619,7 @@ def main():
         sampler.set_epoch(epoch)
         model.train()
 
-        epoch_loss     = 0.0
+        epoch_loss       = 0.0
         n_opt_this_epoch = 0
         optimizer.zero_grad()
 
@@ -574,7 +632,6 @@ def main():
                 texts, padding=True, truncation=False,
                 return_tensors="pt", add_special_tokens=False
             ).to(device)
-            # enc      = {k: v.to(device) for k, v in enc.items()}
             labels_t = torch.tensor(labels, dtype=torch.long, device=device)
 
             # Skip gradient sync on accumulation steps (saves NCCL overhead)
@@ -589,9 +646,7 @@ def main():
                 emb  = F.normalize(emb, p=2, dim=-1)
                 loss = loss_module.batch_all_triplet_loss(labels_t, emb)
                 loss = loss / args.grad_accum   # scale for accumulation
-
                 loss.backward()
-
 
             if is_update_step:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -599,40 +654,68 @@ def main():
                     args.grad_clip,
                 )
                 optimizer.step()
-
                 scheduler.step()
                 optimizer.zero_grad()
-                opt_step       += 1
+                opt_step         += 1
                 n_opt_this_epoch += 1
 
-            epoch_loss += loss.item() * args.grad_accum
+                if rank == 0:
+                    lr_now    = scheduler.get_last_lr()[0]
+                    loss_now  = loss.item() * args.grad_accum
+                    gnorm_now = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                    pbar.set_postfix(
+                        loss=f"{loss_now:.4f}",
+                        gnorm=f"{gnorm_now:.3f}",
+                        lr=f"{lr_now:.2e}",
+                    )
+                    if use_wandb and opt_step % args.log_steps == 0:
+                        import wandb
+                        wandb.log({
+                            "train/loss":  loss_now,
+                            "train/gnorm": gnorm_now,
+                            "train/lr":    lr_now,
+                            "epoch":       epoch + (batch_idx + 1) / n_batches_per_epoch,
+                        }, step=opt_step)
 
-            if rank == 0 and is_update_step:
-                lr_now = scheduler.get_last_lr()[0]
-                pbar.set_postfix(loss=f"{loss.item()*args.grad_accum:.4f}",
-                                 gnorm=f"{grad_norm:.3f}", lr=f"{lr_now:.2e}")
+            epoch_loss += loss.item() * args.grad_accum
 
         avg_loss = epoch_loss / n_batches_per_epoch
         if rank == 0:
             logger.info(f"Epoch {epoch+1}/{args.epochs}  avg_loss={avg_loss:.4f}")
 
-            # ── Eval (rank 0 only) ────────────────────────────────────────────
-            if val_df is not None:
-                val_acc = evaluate(model, tokenizer, val_df, device, args)
+        # ── DDP evaluation (all ranks participate) ────────────────────────────
+        if val_df is not None:
+            if is_ddp:
+                dist.barrier()   # sync before eval
+            val_acc = evaluate_ddp(model, tokenizer, val_df, device, args,
+                                   rank, world_size, is_ddp)
+            if rank == 0:
                 logger.info(f"  val triplet accuracy: {val_acc:.4f}")
+                if use_wandb:
+                    import wandb
+                    wandb.log({
+                        "val/triplet_acc":  val_acc,
+                        "train/epoch_loss": avg_loss,
+                        "epoch":            epoch + 1,
+                    }, step=opt_step)
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
                     save_checkpoint(model, tokenizer, run_dir / "best")
                     logger.info(f"  ↑ New best: {best_val_acc:.4f}")
 
+        if rank == 0:
             save_checkpoint(model, tokenizer, run_dir / f"epoch_{epoch+1}")
 
         if is_ddp:
-            dist.barrier()   # Wait for rank 0 eval + checkpoint before next epoch
+            dist.barrier()   # wait for rank 0 checkpoint before next epoch
 
     if rank == 0:
         save_checkpoint(model, tokenizer, run_dir / "final")
         logger.info(f"Done. Best val triplet accuracy: {best_val_acc:.4f}")
+        if use_wandb and wandb_run:
+            import wandb
+            wandb.summary["best_val_triplet_acc"] = best_val_acc
+            wandb_run.finish()
 
     if is_ddp:
         dist.destroy_process_group()
