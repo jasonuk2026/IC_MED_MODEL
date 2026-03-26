@@ -1,19 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=ehr-embed
+#SBATCH --job-name=ehrshot_embed
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1          # one torchrun process per node
 #SBATCH --gres=gpu:4                 # GPUs per node
-#SBATCH --cpus-per-task=32           # CPU cores per node (for data loading)
-#SBATCH --mem=256G                   # RAM per node
+#SBATCH --exclusive                                       
+#SBATCH --mem=0
 #SBATCH --time=24:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
-# Uncomment and fill in your partition / account as needed:
-# #SBATCH --partition=gpu
-# #SBATCH --account=your_account
+
 
 # ── Environment ───────────────────────────────────────────────────────────────
-source "$(conda info --base)/etc/profile.d/conda.sh"
+eval "$(~/miniforge3/bin/conda shell.bash hook)"
 conda activate torch
 
 export PYTHONFAULTHANDLER=1
@@ -23,10 +21,12 @@ export NCCL_TIMEOUT=1800
 # Uncomment for debugging NCCL issues:
 # export NCCL_DEBUG=INFO
 
+cd "$SLURM_SUBMIT_DIR"
+
 # ── Paths — edit these ────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DATA_DIR="${SCRIPT_DIR}/data/embedding_inputs/sharded_m500_n16"
-OUTPUT_DIR="${SCRIPT_DIR}/output/medical-embedding-custom"
+# SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="data/embedding_inputs/sharded_m500_ntrain50000_nval2000_ntest50000"
+OUTPUT_DIR="output/ehrshot_embed"
 
 # ── Derived DDP settings ──────────────────────────────────────────────────────
 NNODES="${SLURM_NNODES}"
@@ -60,18 +60,18 @@ TRAIN_ARGS=(
     --flash_attn
 
     # LoRA
-    --lora_r              16
-    --lora_alpha          32
+    --lora_r              8
+    --lora_alpha          16
     --lora_dropout        0.05
     --lora_target_modules q_proj,k_proj,v_proj,o_proj
 
     # Training
     --output_dir   "${OUTPUT_DIR}"
-    --epochs       10
-    --batch_size   8
+    --epochs       1
+    --batch_size   16
     --grad_accum   4
     --lr           2e-4
-    --warmup_ratio 0.1
+    --warmup_ratio 0.02
     --weight_decay 0.01
     --grad_clip    1.0
     --log_steps    10
@@ -79,20 +79,20 @@ TRAIN_ARGS=(
 
     # Loss / eval
     --triplet_margin           0.5
-    --n_eval_triplets_per_task 200
-    --eval_batch_size          8
+    --n_eval_triplets_per_task 640
+    --eval_batch_size          16
 
     # wandb (remove or set project name)
-    # --wandb_project ehr-embedding
-    # --wandb_run_name "qwen3-0.6b-lora-r16-${SLURM_JOB_ID}"
+    --wandb_project ehr-embedding
+    --wandb_run_name "qwen3-0.6b-lora-r8-${SLURM_JOB_ID}"
 )
 
 # ── Launch ────────────────────────────────────────────────────────────────────
-srun torchrun \
+srun --mem=0 torchrun \
     --nnodes="${NNODES}" \
     --nproc_per_node="${GPUS_PER_NODE}" \
     --rdzv_backend=c10d \
     --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
     --rdzv_id="${SLURM_JOB_ID}" \
-    "${SCRIPT_DIR}/train_embedding_custom.py" \
+    "train_embedding_custom.py" \
     "${TRAIN_ARGS[@]}"
