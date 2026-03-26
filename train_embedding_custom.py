@@ -481,12 +481,15 @@ def main():
     # ── Model ──────────────────────────────────────────────────────────────────
     logger.info(f"Loading {args.model_name}")
     model, tokenizer = load_model_and_tokenizer(args)
-    model = setup_model(model, tokenizer, args)
 
     if args.checkpoint:
+        # Load checkpoint directly onto the base model — skip get_peft_model to avoid double-wrapping.
         from peft import PeftModel
         logger.info(f"Loading PEFT checkpoint: {args.checkpoint}")
+        model.config.use_cache = False
         model = PeftModel.from_pretrained(model, args.checkpoint)
+    else:
+        model = setup_model(model, tokenizer, args)
 
     model = model.to(device)
 
@@ -500,8 +503,7 @@ def main():
     if args.eval_only:
         if val_df is None:
             raise ValueError("--eval_only requires --val_data_paths.")
-        val_dataset = EHRDataset(val_df)
-        val_acc = evaluate(model, tokenizer, val_dataset, device, args)
+        val_acc = evaluate(model, tokenizer, val_df, device, args)
         logger.info(f"Eval triplet accuracy: {val_acc:.4f}")
         if is_ddp:
             dist.destroy_process_group()
