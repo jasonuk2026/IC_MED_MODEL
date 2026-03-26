@@ -38,6 +38,7 @@ Prediction logic mirrors FirstDiagnosisTimeHorizonCodeLabeler:
 """
 
 import argparse
+import gc
 import os
 import multiprocessing as mp
 import numpy as np
@@ -419,11 +420,19 @@ if __name__ == "__main__":
             df_rows = df_rows.head(args.max_rows)
             print(f"\n  Capped to {len(df_rows)} rows (--max_rows={args.max_rows}).")
 
-        # 6. Sample events
+        # 6. Sample events — write each (split, class) chunk to a temp parquet
+        #    immediately to avoid accumulating hundreds of millions of Python dicts
+        #    in RAM before the final DataFrame is built.
+        stem = f"{task}_{args.prediction_strategy}{_sample_suffix}"
+        path_out = os.path.join(args.path_to_output_dir, f"{stem}.parquet")
+        tmp_dir  = os.path.join(args.path_to_output_dir, f"_tmp_{stem}")
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        global_sample_id = 0
+        tmp_files = []
+
         if _any_target:
             # Per-split × per-class sampling
-            all_rows = []
-            global_sample_id = 0
             for split in ("train", "val", "test"):
                 tgt = _split_targets[split]
                 df_split = df_rows[df_rows["split"] == split]
@@ -447,22 +456,39 @@ if __name__ == "__main__":
                         r["sample_id"] = global_sample_id
                         global_sample_id += 1
                     print(f"  [{split}/{label_name}] {len(chunk):,} samples")
-                    all_rows.extend(chunk)
+
+                    # Write chunk immediately and free Python objects
+                    tmp_path = os.path.join(tmp_dir, f"{split}_{label_name}.parquet")
+                    pd.DataFrame(chunk).to_parquet(tmp_path, index=False)
+                    tmp_files.append(tmp_path)
+                    del chunk
+                    gc.collect()
 
         else:
             # Single pass over all rows (original behaviour, no per-split control)
             print(f"\n  Extracting samples with {args.num_workers} workers (single pass)...")
             all_rows = run_single_pass(df_rows, task, args.num_workers)
+            tmp_path = os.path.join(tmp_dir, "all.parquet")
+            pd.DataFrame(all_rows).to_parquet(tmp_path, index=False)
+            tmp_files.append(tmp_path)
+            del all_rows
+            gc.collect()
 
-        # 7. Assemble and save as a single parquet file (events nested per row)
-        df_out = pd.DataFrame(all_rows)
-        print(f"\n  Total samples: {len(df_out):,}")
+        # 7. Merge temp chunks into final parquet, then clean up
+        print(f"\n  Merging {len(tmp_files)} chunks...")
+        df_out = pd.concat([pd.read_parquet(f) for f in tmp_files], ignore_index=True)
+        print(f"  Total samples: {len(df_out):,}")
         print(f"  Label distribution:\n{df_out.groupby(['split', 'label']).size().to_string()}")
 
-        stem = f"{task}_{args.prediction_strategy}{_sample_suffix}"
-        path_out = os.path.join(args.path_to_output_dir, f"{stem}.parquet")
-
         df_out.to_parquet(path_out, index=False, row_group_size=max(1, len(df_out) // 8))
-        print(f"  Saved -> {path_out}\n")
+        print(f"  Saved -> {path_out}")
+
+        # Free merged DataFrame and delete temp files
+        del df_out
+        gc.collect()
+        for f in tmp_files:
+            os.remove(f)
+        os.rmdir(tmp_dir)
+        print()
 
     print("Done.")
