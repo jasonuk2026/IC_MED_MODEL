@@ -2,7 +2,9 @@
 """
 visualize_embeddings.py
 
-UMAP visualisation of patient embeddings: base model vs fine-tuned side-by-side.
+Per-disease UMAP: 2 rows (base / fine-tuned) × 6 columns (diseases).
+Each panel shows only that disease's patients, coloured by pos (red) vs neg (blue).
+This directly answers "can the model separate positive from negative for this disease?"
 
 Usage:
     conda run -n torch python visualize_embeddings.py \
@@ -22,6 +24,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel, logging as hf_logging
 from peft import PeftModel
@@ -40,20 +43,6 @@ DISEASES = {
     "new_acutemi":        "Acute MI",
 }
 
-DISEASE_COLORS = {
-    "new_hypertension":   "#2196F3",   # blue
-    "new_hyperlipidemia": "#9C27B0",   # purple
-    "new_pancan":         "#E53935",   # red
-    "new_celiac":         "#00ACC1",   # cyan
-    "new_lupus":          "#43A047",   # green
-    "new_acutemi":        "#FB8C00",   # orange
-}
-
-SEED = 42
-
-
-# ── Text formatting (mirrors train_embedding_custom.py exactly) ───────────────
-
 TASK_2_DISEASE_NAME = {
     "new_hypertension":   "hypertension",
     "new_hyperlipidemia": "hyperlipidemia",
@@ -63,6 +52,14 @@ TASK_2_DISEASE_NAME = {
     "new_acutemi":        "acute myocardial infarction",
 }
 
+POS_COLOR = "#E53935"   # red
+NEG_COLOR = "#1E88E5"   # blue
+
+N_PER_CLASS = 200   # pos + neg samples per disease
+SEED = 42
+
+
+# ── Text formatting (mirrors train_embedding_custom.py exactly) ───────────────
 
 def format_events(events) -> str:
     lines = []
@@ -96,43 +93,44 @@ def build_prompt(disease_name: str, events) -> str:
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-def load_samples(data_dir: str, n_per_class: int, seed: int) -> pd.DataFrame:
-    """Sample n_per_class pos + neg patients per disease from the test split."""
+def load_samples(data_dir: str, n_per_class: int, seed: int) -> dict[str, pd.DataFrame]:
+    """Returns {task: DataFrame} with n_per_class pos + neg from test split."""
     rng = random.Random(seed)
     data_dir = Path(data_dir)
-    chunks = []
+    result = {}
 
     for task in DISEASES:
-        # Prefer m500; fall back to any parquet for this task
         candidates = sorted(data_dir.glob(f"{task}_all_*m500*ntrain50000*.parquet"))
         if not candidates:
             candidates = sorted(data_dir.glob(f"{task}_all_*.parquet"))
         if not candidates:
             raise FileNotFoundError(f"No parquet found for {task} in {data_dir}")
-        path = candidates[0]
-        print(f"  {task}: {path.name}")
 
-        df = pd.read_parquet(path, columns=["task", "split", "label", "events"])
+        df = pd.read_parquet(candidates[0], columns=["task", "split", "label", "events"])
         df = df[df["split"] == "test"].reset_index(drop=True)
 
+        chunks = []
         for label_val in [True, False]:
             sub = df[df["label"] == label_val]
             idx = rng.sample(range(len(sub)), min(n_per_class, len(sub)))
             chunks.append(sub.iloc[idx])
+        result[task] = pd.concat(chunks, ignore_index=True)
 
-    result = pd.concat(chunks, ignore_index=True)
-    print(f"\n  Total: {len(result)} samples")
-    print(result.groupby(["task", "label"]).size().rename("n").to_string())
     return result
 
 
 # ── Encoding ──────────────────────────────────────────────────────────────────
 
 @torch.inference_mode()
-def encode(model, tokenizer, texts: list[str], device, batch_size: int) -> np.ndarray:
+def encode_disease(
+    model, tokenizer, df: pd.DataFrame,
+    disease_name: str, device, batch_size: int,
+) -> np.ndarray:
+    """Encode all patients for one disease → (N, H) float32 L2-normalised."""
     model.eval()
+    texts = [build_prompt(disease_name, row.events) for row in df.itertuples()]
     all_embs = []
-    for i in tqdm(range(0, len(texts), batch_size), leave=False):
+    for i in range(0, len(texts), batch_size):
         chunk = texts[i : i + batch_size]
         enc = tokenizer(
             chunk, padding=True, truncation=True, max_length=512,
@@ -140,7 +138,6 @@ def encode(model, tokenizer, texts: list[str], device, batch_size: int) -> np.nd
         ).to(device)
         out  = model(**enc)
         mask = enc["attention_mask"]
-        # last-token pool (same as training)
         seq_len = mask.sum(dim=1) - 1
         bidx = torch.arange(out.last_hidden_state.size(0), device=device)
         emb  = out.last_hidden_state[bidx, seq_len]
@@ -149,95 +146,89 @@ def encode(model, tokenizer, texts: list[str], device, batch_size: int) -> np.nd
     return np.concatenate(all_embs, axis=0)
 
 
-# ── UMAP ──────────────────────────────────────────────────────────────────────
+# ── UMAP (per-disease) ────────────────────────────────────────────────────────
 
 def run_umap(embs: np.ndarray) -> np.ndarray:
+    np.random.seed(SEED)
     reducer = umap.UMAP(
         n_components=2,
-        n_neighbors=30,
-        min_dist=0.1,
-        metric="cosine",        # embeddings are L2-normalised → cosine makes sense
-        random_state=SEED,
+        n_neighbors=20,
+        min_dist=0.05,
+        metric="cosine",
         verbose=False,
     )
     return reducer.fit_transform(embs)
 
 
-# ── Plot ──────────────────────────────────────────────────────────────────────
+# ── Metric: cosine-sim AUC (pos closer together than neg?) ────────────────────
 
-def draw_panel(ax, xy: np.ndarray, df: pd.DataFrame, title: str, annotate: bool = False):
+def separation_auc(embs: np.ndarray, labels: np.ndarray) -> float:
+    """
+    Score each sample by its mean cosine similarity to same-class neighbours
+    minus mean cosine similarity to opposite-class neighbours.
+    Then compute AUC of pos vs neg scores — 0.5 = random, 1.0 = perfect.
+    """
+    pos_mask = labels == 1
+    neg_mask = labels == 0
+    if pos_mask.sum() < 2 or neg_mask.sum() < 2:
+        return float("nan")
+
+    sim = embs @ embs.T   # (N, N), already L2-normalised → cosine sim
+
+    scores = np.zeros(len(labels))
+    for i in range(len(labels)):
+        same = pos_mask if labels[i] == 1 else neg_mask
+        diff = neg_mask if labels[i] == 1 else pos_mask
+        same_idx = np.where(same)[0]
+        diff_idx  = np.where(diff)[0]
+        same_idx = same_idx[same_idx != i]
+        scores[i] = sim[i, same_idx].mean() - sim[i, diff_idx].mean()
+
+    try:
+        return roc_auc_score(labels, scores)
+    except Exception:
+        return float("nan")
+
+
+# ── Draw one panel ────────────────────────────────────────────────────────────
+
+def draw_panel(ax, xy: np.ndarray, labels: np.ndarray,
+               title: str, auc: float):
     ax.set_facecolor("#F7F8FA")
     ax.grid(True, color="white", linewidth=0.8, zorder=0)
     for spine in ax.spines.values():
         spine.set_visible(False)
 
-    tasks   = df["task"].values
-    labels  = df["label"].values
+    pos = labels == 1
+    neg = labels == 0
 
-    for task in DISEASES:
-        color = DISEASE_COLORS[task]
-        # positives: filled circle
-        mask_pos = (tasks == task) & (labels == True)
-        if mask_pos.any():
-            ax.scatter(xy[mask_pos, 0], xy[mask_pos, 1],
-                       c=color, marker="o", s=40, alpha=0.85,
-                       linewidths=0.3, edgecolors="white", zorder=3)
-        # negatives: hollow triangle
-        mask_neg = (tasks == task) & (labels == False)
-        if mask_neg.any():
-            ax.scatter(xy[mask_neg, 0], xy[mask_neg, 1],
-                       facecolors="none", edgecolors=color,
-                       marker="^", s=28, alpha=0.65,
-                       linewidths=0.8, zorder=2)
+    ax.scatter(xy[neg, 0], xy[neg, 1],
+               c=NEG_COLOR, marker="o", s=22, alpha=0.55,
+               linewidths=0, zorder=2, label="Negative")
+    ax.scatter(xy[pos, 0], xy[pos, 1],
+               c=POS_COLOR, marker="o", s=22, alpha=0.80,
+               linewidths=0, zorder=3, label="Positive")
 
-    if annotate:
-        for task, label in DISEASES.items():
-            mask = tasks == task
-            if not mask.any():
-                continue
-            cx, cy = xy[mask, 0].mean(), xy[mask, 1].mean()
-            ax.annotate(
-                label, xy=(cx, cy),
-                fontsize=8.5, fontweight="bold",
-                color=DISEASE_COLORS[task], ha="center", va="center",
-                bbox=dict(boxstyle="round,pad=0.3", fc="white",
-                          alpha=0.80, ec=DISEASE_COLORS[task], lw=1.2),
-                zorder=5,
-            )
-
-    ax.set_title(title, fontsize=12, fontweight="bold", pad=10, color="#222")
-    ax.set_xlabel("UMAP 1", fontsize=9, color="#666")
-    ax.set_ylabel("UMAP 2", fontsize=9, color="#666")
-    ax.tick_params(colors="#aaa", labelsize=7)
-
-
-def build_legend():
-    handles = []
-    for task, label in DISEASES.items():
-        handles.append(mpatches.Patch(color=DISEASE_COLORS[task], label=label))
-    handles.append(plt.Line2D([0], [0], marker="o", color="w",
-                               markerfacecolor="grey", markersize=8,
-                               label="Positive (new Dx within 1 yr)"))
-    handles.append(plt.Line2D([0], [0], marker="^", color="w",
-                               markerfacecolor="none", markeredgecolor="grey",
-                               markersize=8, label="Negative"))
-    return handles
+    auc_str = f"AUC={auc:.3f}" if not np.isnan(auc) else ""
+    ax.set_title(f"{title}\n{auc_str}", fontsize=8.5, pad=4, color="#222")
+    ax.set_xticks([])
+    ax.set_yticks([])
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--checkpoint",   required=True,
+    p.add_argument("--checkpoint",  required=True,
                    help="Path to fine-tuned PEFT checkpoint directory.")
-    p.add_argument("--model_name",   default="Qwen/Qwen3-Embedding-0.6B")
-    p.add_argument("--data_dir",     default="data/embedding_inputs/new_diagnosis")
-    p.add_argument("--output_png",   default="figures/embedding_umap.png")
-    p.add_argument("--n_samples",    type=int, default=150,
-                   help="Samples per (disease × pos/neg) class.")
-    p.add_argument("--batch_size",   type=int, default=8)
-    p.add_argument("--bf16",         action="store_true")
-    p.add_argument("--device",       default=None)
+    p.add_argument("--model_name",  default="Qwen/Qwen3-Embedding-0.6B")
+    p.add_argument("--data_dir",    default="data/embedding_inputs/new_diagnosis")
+    p.add_argument("--output_png",  default="figures/embedding_umap.png")
+    p.add_argument("--n_samples",   type=int, default=N_PER_CLASS,
+                   help="Samples per pos/neg class per disease.")
+    p.add_argument("--batch_size",  type=int, default=8)
+    p.add_argument("--bf16",        action="store_true")
+    p.add_argument("--device",      default=None)
     return p.parse_args()
 
 
@@ -253,82 +244,116 @@ def main():
     dtype = torch.bfloat16 if args.bf16 else torch.float32
     print(f"Device: {device}  |  dtype: {dtype}\n")
 
-    # ── Load data & build prompts ──────────────────────────────────────────────
+    # ── Load data ──────────────────────────────────────────────────────────────
     print("Loading test samples ...")
-    df = load_samples(args.data_dir, args.n_samples, SEED)
-    texts = [
-        build_prompt(TASK_2_DISEASE_NAME[row.task], row.events)
-        for row in df.itertuples()
-    ]
+    disease_dfs = load_samples(args.data_dir, args.n_samples, SEED)
+    for task, df in disease_dfs.items():
+        n_pos = int(df["label"].sum())
+        print(f"  {task}: {len(df)} samples ({n_pos} pos, {len(df)-n_pos} neg)")
 
-    # ── Base model embeddings ──────────────────────────────────────────────────
-    print(f"\n[1/4] Loading base model ...")
-    tokenizer  = AutoTokenizer.from_pretrained(
+    task_list = list(DISEASES.keys())
+    n_diseases = len(task_list)
+
+    # ── Load tokenizer once ────────────────────────────────────────────────────
+    tokenizer = AutoTokenizer.from_pretrained(
         args.model_name, local_files_only=True, padding_side="right"
     )
-    base_model = AutoModel.from_pretrained(
-        args.model_name, local_files_only=True, torch_dtype=dtype,
-    ).to(device)
 
-    print("[2/4] Encoding with BASE model ...")
-    embs_base = encode(base_model, tokenizer, texts, device, args.batch_size)
-    del base_model
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    # ── Encode with both models ────────────────────────────────────────────────
+    all_embs = {}   # {("base"|"ft", task): np.ndarray}
 
-    # ── Fine-tuned model embeddings ────────────────────────────────────────────
-    print(f"\n[2/4] Loading fine-tuned model from {args.checkpoint} ...")
-    ft_base  = AutoModel.from_pretrained(
-        args.model_name, local_files_only=True, torch_dtype=dtype,
-    )
-    ft_base.config.use_cache = False
-    ft_model = PeftModel.from_pretrained(ft_base, args.checkpoint).to(device)
+    for model_tag, load_fn in [
+        ("base", lambda: AutoModel.from_pretrained(
+            args.model_name, local_files_only=True, torch_dtype=dtype).to(device)),
+        ("ft", lambda: PeftModel.from_pretrained(
+            AutoModel.from_pretrained(
+                args.model_name, local_files_only=True, torch_dtype=dtype
+            ).eval(),
+            args.checkpoint,
+        ).to(device)),
+    ]:
+        print(f"\nEncoding with {model_tag} model ...")
+        model = load_fn()
+        model.config.use_cache = False
 
-    print("[3/4] Encoding with FINE-TUNED model ...")
-    embs_ft = encode(ft_model, tokenizer, texts, device, args.batch_size)
-    del ft_model
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+        for task in tqdm(task_list, desc=f"  [{model_tag}]"):
+            df = disease_dfs[task]
+            disease_name = TASK_2_DISEASE_NAME[task]
+            embs = encode_disease(model, tokenizer, df, disease_name, device, args.batch_size)
+            all_embs[(model_tag, task)] = embs
 
-    # ── UMAP ──────────────────────────────────────────────────────────────────
-    print("\n[4/4] Running UMAP ...")
-    print("  base model ...", end=" ", flush=True)
-    xy_base = run_umap(embs_base)
-    print("done")
-    print("  fine-tuned ...", end=" ", flush=True)
-    xy_ft = run_umap(embs_ft)
-    print("done")
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
-    # ── Plot ──────────────────────────────────────────────────────────────────
+    # ── UMAP + AUC per (model, disease) ───────────────────────────────────────
+    print("\nRunning UMAP ...")
+    xy     = {}
+    aucs   = {}
+    for model_tag in ("base", "ft"):
+        for task in tqdm(task_list, desc=f"  [{model_tag}] UMAP"):
+            embs   = all_embs[(model_tag, task)]
+            labels = disease_dfs[task]["label"].astype(int).values
+            xy[(model_tag, task)]   = run_umap(embs)
+            aucs[(model_tag, task)] = separation_auc(embs, labels)
+
+    # ── Plot: 2 rows × 6 cols ─────────────────────────────────────────────────
+    print("\nPlotting ...")
     Path(args.output_png).parent.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+    fig, axes = plt.subplots(2, n_diseases, figsize=(n_diseases * 3.2, 7))
     fig.patch.set_facecolor("white")
 
-    draw_panel(axes[0], xy_base, df,
-               title="Base Model  (Qwen3-Embedding-0.6B, no fine-tuning)",
-               annotate=False)
-    draw_panel(axes[1], xy_ft, df,
-               title="Fine-tuned  (LoRA + BatchAllTripletLoss)",
-               annotate=True)
+    row_labels = ["Base Model", "Fine-tuned"]
+    for row_idx, model_tag in enumerate(("base", "ft")):
+        for col_idx, task in enumerate(task_list):
+            ax     = axes[row_idx, col_idx]
+            labels = disease_dfs[task]["label"].astype(int).values
+            draw_panel(
+                ax,
+                xy[(model_tag, task)],
+                labels,
+                title=DISEASES[task],
+                auc=aucs[(model_tag, task)],
+            )
+            if col_idx == 0:
+                ax.set_ylabel(row_labels[row_idx], fontsize=10,
+                              fontweight="bold", color="#333", labelpad=6)
 
-    fig.legend(
-        handles=build_legend(),
-        loc="lower center", ncol=6,
-        fontsize=10, frameon=True, framealpha=0.95,
-        edgecolor="#ddd", bbox_to_anchor=(0.5, -0.05),
-    )
+    # Row divider line
+    fig.add_artist(plt.Line2D(
+        [0.02, 0.98], [0.505, 0.505],
+        transform=fig.transFigure,
+        color="#ccc", linewidth=1,
+    ))
 
-    n_pos = int(df["label"].sum())
-    n_neg = len(df) - n_pos
+    # Legend
+    legend_handles = [
+        mpatches.Patch(color=POS_COLOR, label="Positive (new diagnosis within 1 yr)"),
+        mpatches.Patch(color=NEG_COLOR, label="Negative"),
+    ]
+    fig.legend(handles=legend_handles, loc="lower center", ncol=2,
+               fontsize=10, frameon=True, framealpha=0.95,
+               edgecolor="#ddd", bbox_to_anchor=(0.5, -0.04))
+
     fig.suptitle(
-        f"Patient Embedding Space — 4 Diseases, Test Split  "
-        f"(n={len(df)}: {n_pos} positive, {n_neg} negative)",
-        fontsize=13, y=1.01, color="#222",
+        "Per-Disease Patient Embedding Space  —  Base vs Fine-tuned  (Test Split)\n"
+        "AUC: same-class cosine similarity vs cross-class (higher = better separation)",
+        fontsize=11, y=1.02, color="#222",
     )
 
-    plt.tight_layout()
+    plt.tight_layout(h_pad=1.5, w_pad=0.5)
     plt.savefig(args.output_png, dpi=180, bbox_inches="tight")
     print(f"\nSaved → {args.output_png}")
+
+    # ── Print AUC summary ─────────────────────────────────────────────────────
+    print(f"\n{'Disease':<22} {'Base AUC':>10} {'FT AUC':>10} {'Δ':>8}")
+    print("-" * 52)
+    for task in task_list:
+        b = aucs[("base", task)]
+        f = aucs[("ft",   task)]
+        delta = f - b if not (np.isnan(b) or np.isnan(f)) else float("nan")
+        print(f"{DISEASES[task]:<22} {b:>10.3f} {f:>10.3f} {delta:>+8.3f}")
 
 
 if __name__ == "__main__":
