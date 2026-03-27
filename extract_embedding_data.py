@@ -109,7 +109,7 @@ def parse_args():
                         help="Cap total (patient, prediction_time) rows per task (for debugging).")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of parallel worker processes.")
-    parser.add_argument("--event_sample_prob", type=float, default=0.6,
+    parser.add_argument("--event_sample_prob", type=float, default=None,
                         help="Probability p of including each event per pass.")
     parser.add_argument("--event_sample_target", type=int, default=None,
                         help="Per-patient cap: stop sampling after m events per patient per pass.")
