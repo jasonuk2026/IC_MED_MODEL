@@ -52,7 +52,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── Event text formatting (mirrors format_events in train_embedding_custom.py) ─
+# ── Event key / text formatting ───────────────────────────────────────────────
+
+def normalise_event_key(code, value, unit) -> tuple[str, str, str]:
+    """Canonical (code, value, unit) key used to index and look up embeddings.
+
+    Called both during extraction (building the index) and during training
+    (looking up pre-computed embeddings), so any change here applies everywhere.
+    """
+    return (
+        str(code  if code  is not None else "").strip(),
+        str(value if value is not None else "").strip(),
+        str(unit  if unit  is not None else "").strip(),
+    )
+
 
 def format_event_text(code: str, description: str, value: str, unit: str) -> str | None:
     """Format a single EHR event row into a text string.
@@ -148,15 +161,16 @@ def collect_unique_events(
     ):
         total_lines += len(chunk)
         for code, value, unit in zip(chunk["code"], chunk["value"], chunk["unit"]):
-            key = (code, value, unit)
+            key = normalise_event_key(code, value, unit)
             if key in seen:
                 continue
             seen.add(key)
-            desc = code2desc.get(code, "")
-            text = format_event_text(code, desc, value, unit)
+            norm_code, norm_value, norm_unit = key
+            desc = code2desc.get(norm_code, "")
+            text = format_event_text(norm_code, desc, norm_value, norm_unit)
             if text is None:
                 continue
-            rows.append({"code": code, "value": value, "unit": unit, "event_text": text})
+            rows.append({"code": norm_code, "value": norm_value, "unit": norm_unit, "event_text": text})
 
     logger.info(f"[Phase 1] Scanned {total_lines:,} rows → {len(rows):,} unique event texts.")
 
@@ -197,10 +211,11 @@ def encode_slice(
         enc = tokenizer(
             batch,
             padding=True,
-            truncation=True,
-            max_length=max_length,
+            truncation=False,
             return_tensors="pt",
         ).to(device)
+
+        assert enc.input_ids[0].size(0) < max_length, f"Shouldn't exist sequence exceeding {max_length}"
 
         out  = model(**enc)
         embs = mean_pool_no_special(

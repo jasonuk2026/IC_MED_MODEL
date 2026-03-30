@@ -315,8 +315,7 @@ def build_eval_triplets(val_df: pd.DataFrame, n_per_task: int, seed: int):
         pos = groups[(task, True)]
         if len(pos) < 2:
             continue
-        neg = [t for (tsk, pol), texts in groups.items()
-               if not (tsk == task and pol) for t in texts]
+        neg = groups[(task, False)]
         if not neg:
             continue
         n    = min(n_per_task, len(pos))

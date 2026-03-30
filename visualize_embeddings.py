@@ -104,8 +104,8 @@ def load_samples(data_dir: str, n_per_class: int, seed: int) -> dict[str, pd.Dat
             candidates = sorted(data_dir.glob(f"{task}_all_*.parquet"))
         if not candidates:
             raise FileNotFoundError(f"No parquet for {task} in {data_dir}")
-        df = pd.read_parquet(candidates[0], columns=["task", "split", "label", "events"])
-        df = df[df["split"] == "test"].reset_index(drop=True)
+        df = pd.read_parquet(candidates[0], columns=["task", "split", "label", "events"],
+                             filters=[("split", "==", "test")]).reset_index(drop=True)
         chunks = []
         for label_val in [True, False]:
             sub = df[df["label"] == label_val]
@@ -122,9 +122,11 @@ def encode_disease(model, tokenizer, df, disease_name, device, batch_size):
     model.eval()
     texts = [build_prompt(disease_name, row.events) for row in df.itertuples()]
     all_embs = []
-    for i in range(0, len(texts), batch_size):
+    n_batches = (len(texts) + batch_size - 1) // batch_size
+    for i in tqdm(range(0, len(texts), batch_size), total=n_batches,
+                  desc=f"  {disease_name}", leave=False):
         chunk = texts[i : i + batch_size]
-        enc = tokenizer(chunk, padding=True, truncation=True, max_length=512,
+        enc = tokenizer(chunk, padding=True, truncation=False,
                         add_special_tokens=False, return_tensors="pt").to(device)
         out = model(**enc)
         mask = enc["attention_mask"]
@@ -230,7 +232,7 @@ def main():
         print(f"Encoding with {model_tag} model ...")
         model = load_fn()
         model.config.use_cache = False
-        for task in tqdm(task_list, desc=f"  [{model_tag}]"):
+        for task in task_list:
             df = disease_dfs[task]
             all_embs[(model_tag, task)] = encode_disease(
                 model, tokenizer, df,
