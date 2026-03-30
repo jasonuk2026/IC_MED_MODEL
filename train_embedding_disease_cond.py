@@ -92,6 +92,9 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 
+from utils.h2d import CudaPrefetcher
+from utils.async_dataloader import AsyncDataLoader
+
 import pandas as pd
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig, logging as hf_logging
 from extract_biolinkbert_embeddings import mean_pool_no_special, normalise_event_key
@@ -127,12 +130,6 @@ EOS_TOKEN_ID = 151643  # Qwen3 <|endoftext|> — pooling anchor token
 #   "Please predict disease <DISEASE> based on the following events.\nStart of medical events: <EVENTS>"
 PROMPT_PREFIX = "Please predict disease "
 PROMPT_MIDDLE = " based on the following events.\nStart of medical events:"
-
-
-
-
-
-
 
 # ── BioLinkBERT event embedding lookup ────────────────────────────────────────
 
@@ -231,12 +228,10 @@ class EHREmbeddingDataset(Dataset):
     self.tasks   : list[str]  — task name per sample (for per-disease sampling/eval)
     """
 
-    def __init__(self, df: pd.DataFrame, lookup: EventLookup, max_events: int):
+    def __init__(self, df: pd.DataFrame, lookup: EventLookup):
         self.samples: list[dict] = []
         self.labels:  list[int]  = []
         self.tasks:   list[str]  = []
-        skipped = 0
-
         for task, events, label in zip(df["task"], df["events"], df["label"]):
             emb_list = []
             for e in events:
@@ -244,8 +239,6 @@ class EHREmbeddingDataset(Dataset):
                 if emb is None:
                     raise ValueError("Shouldn't happen")
                 emb_list.append(emb)
-                if len(emb_list) >= max_events:
-                    break
 
             if not emb_list:
                 raise ValueError("Shouldn't happen")
@@ -258,8 +251,6 @@ class EHREmbeddingDataset(Dataset):
             })
             self.labels.append(int(bool(label)))   # 0 = negative, 1 = positive
             self.tasks.append(task)
-        if skipped:
-            logger.warning(f"  Skipped {skipped} samples with no valid events.")
         task_counts = Counter(self.tasks)
         pos_counts  = Counter(t for t, l in zip(self.tasks, self.labels) if l == 1)
         logger.info(f"  {len(self.samples)} samples across {len(task_counts)} tasks")
@@ -595,11 +586,6 @@ def setup_lora(model, args):
         target_modules=target_modules,
     ))
 
-    if args.bf16:
-        for name, param in model.named_parameters():
-            if param.dtype == torch.float32 and "lora" not in name:
-                param.data = param.data.to(torch.bfloat16)
-
     if args.gradient_checkpointing:
         model.enable_input_require_grads()
         model.gradient_checkpointing_enable(
@@ -709,12 +695,26 @@ def evaluate_ddp(
 
     collate = make_collate_fn(disease_emb_dict)
 
+    class _EvalDataset(Dataset):
+        def __init__(self, samples): self.samples = samples
+        def __len__(self): return len(self.samples)
+        def __getitem__(self, i): return self.samples[i]
+
+    eval_dl = DataLoader(
+        _EvalDataset(my_samples),
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        collate_fn=lambda batch: collate([(s, 0) for s in batch]),
+        num_workers=4,
+        pin_memory=True,
+    )
+    eval_prefetcher = CudaPrefetcher(
+        AsyncDataLoader(eval_dl, buffer_size=2),
+        device=device, cuda_keys=[],
+    )
+
     all_embs = []
-    for i in range(0, len(my_samples), args.eval_batch_size):
-        chunk = my_samples[i : i + args.eval_batch_size]
-        batch = collate([(s, 0) for s in chunk])
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                 for k, v in batch.items()}
+    for batch in eval_prefetcher:
         emb = raw_encoder(
             batch["event_embs"],
             batch["event_mask"],
@@ -772,8 +772,6 @@ def parse_args():
                    help="event_index.parquet produced by extract_biolinkbert_embeddings.py.")
     p.add_argument("--bert_embeddings", required=True,
                    help="embeddings.npy produced by extract_biolinkbert_embeddings.py.")
-    p.add_argument("--max_events",      type=int, default=512,
-                   help="Maximum number of events to use per patient history.")
 
     # Qwen model
     p.add_argument("--model_name",   default="Qwen/Qwen3-Embedding-0.6B")
@@ -933,7 +931,7 @@ def main():
     if args.eval_only:
         if val_df is None:
             raise ValueError("--eval_only requires --val_data_paths.")
-        val_dataset = EHREmbeddingDataset(val_df, lookup, args.max_events)
+        val_dataset = EHREmbeddingDataset(val_df, lookup)
         val_acc = evaluate_ddp(
             encoder, val_dataset, tokenizer, disease_emb_dict,
             device, compute_dtype, args, rank, world_size, is_ddp,
@@ -949,7 +947,7 @@ def main():
         return
 
     # ── Datasets & DataLoaders ─────────────────────────────────────────────────
-    train_dataset = EHREmbeddingDataset(train_df, lookup, args.max_events)
+    train_dataset = EHREmbeddingDataset(train_df, lookup)
     sampler = SingleDiseaseGroupSampler(
         tasks=train_dataset.tasks,
         labels=train_dataset.labels,
@@ -967,7 +965,7 @@ def main():
 
     val_dataset = None
     if val_df is not None:
-        val_dataset = EHREmbeddingDataset(val_df, lookup, args.max_events)
+        val_dataset = EHREmbeddingDataset(val_df, lookup)
 
     # ── Optimizer + LR scheduler ───────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -1008,12 +1006,14 @@ def main():
         epoch_loss       = 0.0
         optimizer.zero_grad()
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}",
-                    disable=(rank != 0), dynamic_ncols=True)
+        prefetcher = CudaPrefetcher(
+            AsyncDataLoader(train_loader, buffer_size=4),
+            device=device, cuda_keys=[],
+        )
+        pbar = tqdm(prefetcher, desc=f"Epoch {epoch+1}/{args.epochs}",
+                    disable=(rank != 0), dynamic_ncols=True, total=n_batches_per_epoch)
 
         for batch_idx, batch in enumerate(pbar):
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                     for k, v in batch.items()}
             labels_t = batch["labels"]
 
             is_update_step = (
@@ -1024,8 +1024,9 @@ def main():
                        else encoder.no_sync()
 
             with sync_ctx:
-                raw_enc = encoder.module if isinstance(encoder, DDP) else encoder
-                emb = raw_enc(
+                # Call through the DDP wrapper (not encoder.module) so that
+                # reducer.prepare_for_backward() fires and no_sync() is honoured.
+                emb = encoder(
                     batch["event_embs"],
                     batch["event_mask"],
                     batch["disease_embs"],
