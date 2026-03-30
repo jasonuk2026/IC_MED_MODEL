@@ -242,14 +242,13 @@ class EHREmbeddingDataset(Dataset):
             for e in events:
                 emb = lookup.get(e)
                 if emb is None:
-                    continue
+                    raise ValueError("Shouldn't happen")
                 emb_list.append(emb)
                 if len(emb_list) >= max_events:
                     break
 
             if not emb_list:
-                skipped += 1
-                continue
+                raise ValueError("Shouldn't happen")
 
             disease_name = TASK_2_DISEASE_NAME.get(task, task)
             self.samples.append({

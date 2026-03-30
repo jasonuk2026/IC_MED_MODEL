@@ -141,8 +141,9 @@ def collect_unique_events(
     ).fillna("")
     # Construct the OMOP-style key used in ehrshot.csv: "vocab_id/concept_code"
     concept_df["code"] = concept_df["vocabulary_id"] + "/" + concept_df["concept_code"]
+    filtered = concept_df[concept_df["code"] != concept_df["concept_name"]]
     code2desc: dict[str, str] = dict(
-        zip(concept_df["code"], concept_df["concept_name"])
+        zip(filtered["code"], filtered["concept_name"])
     )
     logger.info(f"[Phase 1] Loaded {len(code2desc):,} code→description mappings.")
 
@@ -151,6 +152,7 @@ def collect_unique_events(
     seen:  set[tuple]    = set()
     rows:  list[dict]    = []
     total_lines          = 0
+    no_desc_count        = 0
 
     for chunk in pd.read_csv(
         ehrshot_csv,
@@ -167,12 +169,16 @@ def collect_unique_events(
             seen.add(key)
             norm_code, norm_value, norm_unit = key
             desc = code2desc.get(norm_code, "")
+            if not desc:
+                no_desc_count += 1
             text = format_event_text(norm_code, desc, norm_value, norm_unit)
             if text is None:
                 continue
             rows.append({"code": norm_code, "value": norm_value, "unit": norm_unit, "event_text": text})
 
-    logger.info(f"[Phase 1] Scanned {total_lines:,} rows → {len(rows):,} unique event texts.")
+    n_unique = len(seen)
+    logger.info(f"[Phase 1] Scanned {total_lines:,} rows → {n_unique:,} unique events → {len(rows):,} encodable.")
+    logger.info(f"[Phase 1] No-description events: {no_desc_count:,} / {n_unique:,} ({100*no_desc_count/max(n_unique,1):.1f}%)")
 
     event_df = pd.DataFrame(rows).reset_index(drop=True)
     event_df.index.name = "event_id"
