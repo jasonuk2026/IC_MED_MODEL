@@ -222,35 +222,47 @@ def encode_disease_names(
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
 class EHREmbeddingDataset(Dataset):
-    """Each sample holds pre-fetched BioLinkBERT event embeddings + metadata.
+    """Lazy dataset: stores event-id index lists instead of materialised embeddings.
+
+    Accepts a list of parquet file paths and processes them one at a time so that
+    the raw events column (Python dicts) is never kept in memory across files.
+    Embeddings are read from the memory-mapped EventLookup.embeddings array in
+    __getitem__, so only one batch worth of float data is ever resident in RAM.
 
     self.labels  : list[int]  — binary: 0 = negative, 1 = positive
     self.tasks   : list[str]  — task name per sample (for per-disease sampling/eval)
     """
 
-    def __init__(self, df: pd.DataFrame, lookup: EventLookup):
+    def __init__(self, paths: list[str], lookup: EventLookup, split: str | None = None):
+        self.lookup  = lookup
         self.samples: list[dict] = []
         self.labels:  list[int]  = []
         self.tasks:   list[str]  = []
-        for task, events, label in zip(df["task"], df["events"], df["label"]):
-            emb_list = []
-            for e in events:
-                emb = lookup.get(e)
-                if emb is None:
+        for path in paths:
+            df = pd.read_parquet(path)
+            if split is not None:
+                df = df[df["split"] == split]
+            for task, events, label in zip(df["task"], df["events"], df["label"]):
+                idx_list = []
+                for e in events:
+                    key = normalise_event_key(e.get("code"), e.get("value"), e.get("unit"))
+                    eid = lookup.key2idx.get(key)
+                    if eid is None:
+                        raise KeyError(f"Missing key: {key}")
+                    idx_list.append(eid)
+
+                if not idx_list:
                     raise ValueError("Shouldn't happen")
-                emb_list.append(emb)
 
-            if not emb_list:
-                raise ValueError("Shouldn't happen")
-
-            disease_name = TASK_2_DISEASE_NAME.get(task, task)
-            self.samples.append({
-                "event_embs":   np.stack(emb_list).astype(np.float32),  # (n, 768)
-                "disease_name": disease_name,
-                "task":         task,
-            })
-            self.labels.append(int(bool(label)))   # 0 = negative, 1 = positive
-            self.tasks.append(task)
+                disease_name = TASK_2_DISEASE_NAME.get(task, task)
+                self.samples.append({
+                    "event_ids":    idx_list,   # list[int], resolved lazily in __getitem__
+                    "disease_name": disease_name,
+                    "task":         task,
+                })
+                self.labels.append(int(bool(label)))
+                self.tasks.append(task)
+            del df  # explicitly release raw events dicts before loading next shard
         task_counts = Counter(self.tasks)
         pos_counts  = Counter(t for t, l in zip(self.tasks, self.labels) if l == 1)
         logger.info(f"  {len(self.samples)} samples across {len(task_counts)} tasks")
@@ -262,7 +274,10 @@ class EHREmbeddingDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.samples[idx], self.labels[idx]
+        s = self.samples[idx]
+        embs = np.stack([self.lookup.embeddings[i] for i in s["event_ids"]]).astype(np.float32)
+        sample = {"event_embs": embs, "disease_name": s["disease_name"], "task": s["task"]}
+        return sample, self.labels[idx]
 
 
 # ── Batch sampler ─────────────────────────────────────────────────────────────
@@ -694,17 +709,17 @@ def evaluate_ddp(
     my_samples  = [all_samples[i] for i in my_idx]
 
     collate = make_collate_fn(disease_emb_dict)
+    _embs   = val_dataset.lookup.embeddings  # mmap array, shared across workers
 
-    class _EvalDataset(Dataset):
-        def __init__(self, samples): self.samples = samples
-        def __len__(self): return len(self.samples)
-        def __getitem__(self, i): return self.samples[i]
+    def _resolve(s):
+        event_embs = np.stack([_embs[i] for i in s["event_ids"]]).astype(np.float32)
+        return {"event_embs": event_embs, "disease_name": s["disease_name"], "task": s["task"]}
 
     eval_dl = DataLoader(
-        _EvalDataset(my_samples),
+        my_samples,
         batch_size=args.eval_batch_size,
         shuffle=False,
-        collate_fn=lambda batch: collate([(s, 0) for s in batch]),
+        collate_fn=lambda batch: collate([(_resolve(s), 0) for s in batch]),
         num_workers=4,
         pin_memory=True,
     )
@@ -881,28 +896,12 @@ def main():
         disease_emb_dict   = {n: disease_emb_tensor[i] for i, n in enumerate(disease_names)}
 
     # ── Data loading ───────────────────────────────────────────────────────────
-    train_df = None
+    my_train_paths = []
     if not args.eval_only:
         my_train_paths = args.data_paths[rank :: world_size]
         if not my_train_paths:
             raise ValueError(f"Rank {rank}: no data paths assigned.")
         logger.info(f"Rank {rank} train paths: {my_train_paths}")
-        train_df = pd.concat(
-            [pd.read_parquet(p).pipe(lambda df: df[df["split"] == "train"])
-             for p in my_train_paths],
-            ignore_index=True,
-        )
-        logger.info(f"Rank {rank}: {len(train_df)} train rows")
-
-    val_df = None
-    if args.val_data_paths:
-        val_df = pd.concat(
-            [pd.read_parquet(p).pipe(lambda df: df[df["split"] == args.val_split])
-             for p in args.val_data_paths],
-            ignore_index=True,
-        )
-        if rank == 0:
-            logger.info(f"Val rows: {len(val_df)}")
 
     # ── Build Qwen model + tokenizer ───────────────────────────────────────────
     if rank == 0:
@@ -929,9 +928,9 @@ def main():
 
     # ── Eval-only mode ─────────────────────────────────────────────────────────
     if args.eval_only:
-        if val_df is None:
+        if not args.val_data_paths:
             raise ValueError("--eval_only requires --val_data_paths.")
-        val_dataset = EHREmbeddingDataset(val_df, lookup)
+        val_dataset = EHREmbeddingDataset(args.val_data_paths, lookup, split=args.val_split)
         val_acc = evaluate_ddp(
             encoder, val_dataset, tokenizer, disease_emb_dict,
             device, compute_dtype, args, rank, world_size, is_ddp,
@@ -947,7 +946,7 @@ def main():
         return
 
     # ── Datasets & DataLoaders ─────────────────────────────────────────────────
-    train_dataset = EHREmbeddingDataset(train_df, lookup)
+    train_dataset = EHREmbeddingDataset(my_train_paths, lookup, split="train")
     sampler = SingleDiseaseGroupSampler(
         tasks=train_dataset.tasks,
         labels=train_dataset.labels,
@@ -959,13 +958,14 @@ def main():
         train_dataset,
         batch_sampler=sampler,
         collate_fn=collate,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
+        prefetch_factor=1
     )
 
     val_dataset = None
-    if val_df is not None:
-        val_dataset = EHREmbeddingDataset(val_df, lookup)
+    if args.val_data_paths:
+        val_dataset = EHREmbeddingDataset(args.val_data_paths, lookup, split=args.val_split)
 
     # ── Optimizer + LR scheduler ───────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -1007,7 +1007,7 @@ def main():
         optimizer.zero_grad()
 
         prefetcher = CudaPrefetcher(
-            AsyncDataLoader(train_loader, buffer_size=4),
+            AsyncDataLoader(train_loader, buffer_size=1),
             device=device, cuda_keys=[],
         )
         pbar = tqdm(prefetcher, desc=f"Epoch {epoch+1}/{args.epochs}",

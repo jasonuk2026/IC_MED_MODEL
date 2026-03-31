@@ -23,7 +23,7 @@ sbatch \
     --ntasks=1 \
     --gres=gpu:1 \
     --cpus-per-gpu=72 \
-    --mem-per-gpu=120G \
+    --mem-per-gpu=100G \
     --time=24:00:00 \
     --output=logs/%x_%j.out \
     --error=logs/%x_%j.err \
