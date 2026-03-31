@@ -156,8 +156,8 @@ class EventLookup:
         }
         logger.info(f"  {len(self.key2idx):,} unique (code, value, unit) keys indexed.")
 
-        logger.info(f"Loading embeddings into RAM from {embeddings_path} …")
-        self.embeddings = np.load(embeddings_path)
+        logger.info(f"Loading embeddings (mmap) from {embeddings_path} …")
+        self.embeddings = np.load(embeddings_path, mmap_mode="r")
         logger.info(f"  Embeddings shape: {self.embeddings.shape}  dtype: {self.embeddings.dtype}")
 
     def get(self, e: dict, warn_missing: bool = True) -> np.ndarray | None:
@@ -247,10 +247,6 @@ class LazyDataIndex:
         self.lookup     = lookup
         # row-group offset cache: file_idx -> [cumulative row count at start of each rg]
         self._rg_offsets: dict[int, list[int]] = {}
-        # open ParquetFile handle cache: file_idx -> ParquetFile
-        # Populated lazily in read_rows(); each DataLoader worker process has its own
-        # copy (fork isolation), so no locking is needed.
-        self._pf_cache: dict[int, _pq.ParquetFile] = {}
 
         pos: dict[str, list[tuple[int, int]]] = defaultdict(list)
         neg: dict[str, list[tuple[int, int]]] = defaultdict(list)
@@ -286,9 +282,7 @@ class LazyDataIndex:
     def _get_rg_offsets(self, file_idx: int) -> list[int]:
         """Cumulative row-count offsets at the start of each row-group (cached)."""
         if file_idx not in self._rg_offsets:
-            if file_idx not in self._pf_cache:
-                self._pf_cache[file_idx] = _pq.ParquetFile(self.file_paths[file_idx])
-            meta   = self._pf_cache[file_idx].metadata
+            meta   = _pq.ParquetFile(self.file_paths[file_idx]).metadata
             offs   = []
             cumul  = 0
             for i in range(meta.num_row_groups):
@@ -316,9 +310,7 @@ class LazyDataIndex:
 
         results: list[dict | None] = [None] * len(entries)
         for (file_idx, rg_idx), items in groups.items():
-            if file_idx not in self._pf_cache:
-                self._pf_cache[file_idx] = _pq.ParquetFile(self.file_paths[file_idx])
-            pf    = self._pf_cache[file_idx]
+            pf    = _pq.ParquetFile(self.file_paths[file_idx])
             table = pf.read_row_group(rg_idx, columns=["events", "task"])
             for batch_pos, row_in_rg in items:
                 task   = table["task"][row_in_rg].as_py()
@@ -951,6 +943,8 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4,
                    help="DataLoader workers per rank. Reduce (e.g. 1-2) when running "
                         "multi-GPU on a shared filesystem to avoid IO contention.")
+    p.add_argument("--prefetch_factor", type=int, default=4,
+                   help="DataLoader prefetch_factor per worker.")
 
     # Optimisation / compilation
     p.add_argument("--compile", action="store_true",
@@ -1058,6 +1052,11 @@ def main():
     encoder = encoder.to(device)
 
     if args.compile:
+        # Fix graph breaks and recompilation when combining torch.compile with flash attention:
+        # 1. .item() calls in _get_unpad_data (flash attn varlen path) cause graph breaks
+        # 2. layer_idx integer attribute causes recompilation per layer
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
         encoder = torch.compile(encoder)
 
     if is_ddp and not args.eval_only:
@@ -1134,7 +1133,7 @@ def main():
         collate_fn=lambda b: b[0],  # each item is already a full batch dict
         num_workers=args.num_workers,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=args.prefetch_factor,
     )
 
     # ── Training loop ──────────────────────────────────────────────────────────
@@ -1151,7 +1150,7 @@ def main():
         optimizer.zero_grad()
 
         prefetcher = CudaPrefetcher(
-            AsyncDataLoader(train_loader, buffer_size=4),
+            train_loader,
             device=device, cuda_keys=[],
         )
         pbar = tqdm(prefetcher, desc=f"Epoch {epoch+1}/{args.epochs}",
