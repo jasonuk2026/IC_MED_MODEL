@@ -705,58 +705,64 @@ def build_encoder(qwen_model, tokenizer, args) -> DiseaseAwareEHREncoder:
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
-class _EvalDataset(Dataset):
-    """Single-sample Dataset over a flat list of (file_idx, abs_row) entries.
+class EvalBatchDataset(Dataset):
+    """Batch-level Dataset for evaluation — mirrors EpochShuffledDataset.__getitem__.
 
-    Each __getitem__ does a lazy parquet row-group read for one entry and
-    resolves events → mmap embeddings, returning (embs_np, disease_tensor).
-    Designed to be wrapped by DataLoader with num_workers > 0 so that parquet
-    IO in worker processes overlaps with GPU inference in the main process.
+    Each __getitem__(j) reads all samples for batch j in one grouped read_rows()
+    call (row-group-aware) and returns a collated dict of CPU tensors, without labels.
+    Use with DataLoader(batch_size=1, collate_fn=lambda b: b[0], num_workers=N).
     """
 
     def __init__(
         self,
         entries:          list[tuple[int, int]],
-        index:            "LazyDataIndex",
+        index:            LazyDataIndex,
         disease_emb_dict: dict[str, torch.Tensor],
+        batch_size:       int,
     ):
-        self.entries          = entries
         self.index            = index
         self.disease_emb_dict = disease_emb_dict
+        self._batches: list[list[tuple[int, int]]] = [
+            entries[i : i + batch_size]
+            for i in range(0, len(entries), batch_size)
+        ]
 
-    def __len__(self):
-        return len(self.entries)
+    def __len__(self) -> int:
+        return len(self._batches)
 
-    def __getitem__(self, idx) -> tuple[np.ndarray, torch.Tensor]:
-        row    = self.index.read_rows([self.entries[idx]])[0]
+    def __getitem__(self, j: int) -> dict[str, torch.Tensor]:
+        rows   = self.index.read_rows(self._batches[j])
         lookup = self.index.lookup
-        eids: list[int] = []
-        for e in row["events"]:
-            key = normalise_event_key(e.get("code"), e.get("value"), e.get("unit"))
-            eid = lookup.key2idx.get(key)
-            if eid is not None:
-                eids.append(eid)
-        embs = np.stack([lookup.embeddings[eid] for eid in eids]).astype(np.float32)
-        return embs, self.disease_emb_dict[row["disease_name"]]
 
+        embs_list:    list[np.ndarray]   = []
+        disease_list: list[torch.Tensor] = []
+        for row in rows:
+            eids: list[int] = []
+            for e in row["events"]:
+                key = normalise_event_key(e.get("code"), e.get("value"), e.get("unit"))
+                eid = lookup.key2idx.get(key)
+                if eid is not None:
+                    eids.append(eid)
+            embs_list.append(
+                np.stack([lookup.embeddings[eid] for eid in eids]).astype(np.float32)
+            )
+            disease_list.append(self.disease_emb_dict[row["disease_name"]])
 
-def _eval_collate(batch: list[tuple[np.ndarray, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    """Pad variable-length event sequences and stack disease embeddings."""
-    embs_list, disease_list = zip(*batch)
-    B        = len(embs_list)
-    max_e    = max(e.shape[0] for e in embs_list)
-    bert_dim = embs_list[0].shape[1]
-    padded   = np.zeros((B, max_e, bert_dim), dtype=np.float32)
-    mask     = np.zeros((B, max_e),            dtype=np.int64)
-    for i, embs in enumerate(embs_list):
-        n = embs.shape[0]
-        padded[i, :n] = embs
-        mask[i, :n]   = 1
-    return {
-        "event_embs":   torch.from_numpy(padded),
-        "event_mask":   torch.from_numpy(mask),
-        "disease_embs": torch.stack(disease_list),
-    }
+        B        = len(embs_list)
+        max_e    = max(e.shape[0] for e in embs_list)
+        bert_dim = embs_list[0].shape[1]
+        padded   = np.zeros((B, max_e, bert_dim), dtype=np.float32)
+        mask     = np.zeros((B, max_e),            dtype=np.int64)
+        for i, embs in enumerate(embs_list):
+            n = embs.shape[0]
+            padded[i, :n] = embs
+            mask[i, :n]   = 1
+
+        return {
+            "event_embs":   torch.from_numpy(padded),
+            "event_mask":   torch.from_numpy(mask),
+            "disease_embs": torch.stack(disease_list),
+        }
 
 
 @torch.inference_mode()
@@ -818,19 +824,20 @@ def evaluate_ddp(
         [negatives_e[t] for t in my_triple_idx]
     )
 
-    # Wrap my_entries in a Dataset → DataLoader → AsyncDataLoader → CudaPrefetcher
-    # so that parquet IO (in DataLoader workers) overlaps with GPU inference.
-    eval_ds = _EvalDataset(my_entries, val_index, disease_emb_dict)
+    # Wrap my_entries in a batch-level Dataset → DataLoader → AsyncDataLoader →
+    # CudaPrefetcher so that parquet IO (in DataLoader workers) overlaps with
+    # GPU inference, matching the training data loading pattern.
+    eval_ds = EvalBatchDataset(my_entries, val_index, disease_emb_dict, args.eval_batch_size)
     eval_dl = DataLoader(
         eval_ds,
-        batch_size=args.eval_batch_size,
+        batch_size=1,
         shuffle=False,
-        collate_fn=_eval_collate,
-        num_workers=2,
+        collate_fn=lambda b: b[0],
+        num_workers=4,
         pin_memory=True,
     )
     eval_prefetcher = CudaPrefetcher(
-        AsyncDataLoader(eval_dl, buffer_size=2),
+        AsyncDataLoader(eval_dl, buffer_size=4),
         device=device, cuda_keys=[],
     )
 
