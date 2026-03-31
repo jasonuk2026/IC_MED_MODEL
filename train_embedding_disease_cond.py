@@ -73,6 +73,7 @@ Single GPU
 NOTE: QLoRA (--qlora) is incompatible with multi-GPU DDP.
 """
 
+import bisect
 import os
 import math
 import random
@@ -83,6 +84,8 @@ from contextlib import nullcontext
 from collections import defaultdict, Counter, deque
 from datetime import datetime
 from pathlib import Path
+
+import pyarrow.parquet as _pq
 
 import numpy as np
 import torch
@@ -219,145 +222,183 @@ def encode_disease_names(
     return result
 
 
-# ── Dataset ───────────────────────────────────────────────────────────────────
+# ── Lazy data index ───────────────────────────────────────────────────────────
 
-class EHREmbeddingDataset(Dataset):
-    """Lazy dataset: stores event-id index lists instead of materialised embeddings.
+class LazyDataIndex:
+    """Lightweight per-split index built by reading only the split/label/task columns.
 
-    Accepts a list of parquet file paths and processes them one at a time so that
-    the raw events column (Python dicts) is never kept in memory across files.
-    Embeddings are read from the memory-mapped EventLookup.embeddings array in
-    __getitem__, so only one batch worth of float data is ever resident in RAM.
+    No event data is loaded at construction time.  Each sample is represented as
+    a (file_idx, abs_row_in_file) pair — three integers versus a full list of
+    event embedding indices, so RAM usage is O(n_samples) rather than
+    O(n_samples × avg_events).
 
-    self.labels  : list[int]  — binary: 0 = negative, 1 = positive
-    self.tasks   : list[str]  — task name per sample (for per-disease sampling/eval)
+    Actual event data is fetched on demand via read_rows(), which groups reads by
+    parquet row-group to minimise IO: only the row-groups that contain the
+    requested rows are read, and only the 'events' + 'task' columns are loaded.
+
+    Attributes
+    ----------
+    pos : dict[task -> list[(file_idx, abs_row)]]  — positive samples per task
+    neg : dict[task -> list[(file_idx, abs_row)]]  — negative samples per task
     """
 
-    def __init__(self, paths: list[str], lookup: EventLookup, split: str | None = None):
-        self.lookup  = lookup
-        self.samples: list[dict] = []
-        self.labels:  list[int]  = []
-        self.tasks:   list[str]  = []
-        for path in paths:
-            df = pd.read_parquet(path)
-            if split is not None:
-                df = df[df["split"] == split]
-            for task, events, label in zip(df["task"], df["events"], df["label"]):
-                idx_list = []
-                for e in events:
-                    key = normalise_event_key(e.get("code"), e.get("value"), e.get("unit"))
-                    eid = lookup.key2idx.get(key)
-                    if eid is None:
-                        raise KeyError(f"Missing key: {key}")
-                    idx_list.append(eid)
+    def __init__(self, paths: list[str], split: str | None, lookup: EventLookup):
+        self.file_paths = list(paths)
+        self.lookup     = lookup
+        # row-group offset cache: file_idx -> [cumulative row count at start of each rg]
+        self._rg_offsets: dict[int, list[int]] = {}
 
-                if not idx_list:
-                    raise ValueError("Shouldn't happen")
+        pos: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        neg: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        task_counts: Counter = Counter()
+        pos_counts:  Counter = Counter()
 
-                disease_name = TASK_2_DISEASE_NAME.get(task, task)
-                self.samples.append({
-                    "event_ids":    idx_list,   # list[int], resolved lazily in __getitem__
-                    "disease_name": disease_name,
-                    "task":         task,
-                })
-                self.labels.append(int(bool(label)))
-                self.tasks.append(task)
-            del df  # explicitly release raw events dicts before loading next shard
-        task_counts = Counter(self.tasks)
-        pos_counts  = Counter(t for t, l in zip(self.tasks, self.labels) if l == 1)
-        logger.info(f"  {len(self.samples)} samples across {len(task_counts)} tasks")
+        for file_idx, path in enumerate(self.file_paths):
+            logger.info(f"Indexing {path} …")
+            df_meta = pd.read_parquet(path, columns=["split", "label", "task"])
+            for abs_row, (split_val, task, label) in enumerate(
+                zip(df_meta["split"], df_meta["task"], df_meta["label"])
+            ):
+                if split is not None and split_val != split:
+                    continue
+                lbl = int(bool(label))
+                (pos if lbl else neg)[task].append((file_idx, abs_row))
+                task_counts[task] += 1
+                if lbl:
+                    pos_counts[task] += 1
+            del df_meta
+
+        self.pos: dict[str, list[tuple[int, int]]] = dict(pos)
+        self.neg: dict[str, list[tuple[int, int]]] = dict(neg)
+
+        logger.info(f"  {sum(task_counts.values())} samples "
+                    f"(split={split!r}) across {len(task_counts)} tasks")
         for task in sorted(task_counts):
             logger.info(f"    {task}: {pos_counts[task]} pos / "
                         f"{task_counts[task] - pos_counts[task]} neg")
 
-    def __len__(self):
-        return len(self.samples)
+    # ── Row-group metadata (cached) ───────────────────────────────────────────
 
-    def __getitem__(self, idx):
-        s = self.samples[idx]
-        embs = np.stack([self.lookup.embeddings[i] for i in s["event_ids"]]).astype(np.float32)
-        sample = {"event_embs": embs, "disease_name": s["disease_name"], "task": s["task"]}
-        return sample, self.labels[idx]
+    def _get_rg_offsets(self, file_idx: int) -> list[int]:
+        """Cumulative row-count offsets at the start of each row-group (cached)."""
+        if file_idx not in self._rg_offsets:
+            meta   = _pq.ParquetFile(self.file_paths[file_idx]).metadata
+            offs   = []
+            cumul  = 0
+            for i in range(meta.num_row_groups):
+                offs.append(cumul)
+                cumul += meta.row_group(i).num_rows
+            self._rg_offsets[file_idx] = offs
+        return self._rg_offsets[file_idx]
+
+    # ── Lazy row read ─────────────────────────────────────────────────────────
+
+    def read_rows(self, entries: list[tuple[int, int]]) -> list[dict]:
+        """Read events and task for a list of (file_idx, abs_row) entries.
+
+        Groups reads by (file_idx, row_group_idx) so each row-group is opened
+        at most once per call.  Returns a list of dicts in the same order as
+        entries, each with keys: 'events' (list[dict]), 'task' (str),
+        'disease_name' (str).
+        """
+        # Map each entry to its (file_idx, rg_idx, row_within_rg)
+        groups: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+        for batch_pos, (file_idx, abs_row) in enumerate(entries):
+            offs   = self._get_rg_offsets(file_idx)
+            rg_idx = bisect.bisect_right(offs, abs_row) - 1
+            groups[(file_idx, rg_idx)].append((batch_pos, abs_row - offs[rg_idx]))
+
+        results: list[dict | None] = [None] * len(entries)
+        for (file_idx, rg_idx), items in groups.items():
+            pf    = _pq.ParquetFile(self.file_paths[file_idx])
+            table = pf.read_row_group(rg_idx, columns=["events", "task"])
+            for batch_pos, row_in_rg in items:
+                task   = table["task"][row_in_rg].as_py()
+                events = table["events"][row_in_rg].as_py()
+                results[batch_pos] = {
+                    "events":       events,
+                    "task":         task,
+                    "disease_name": TASK_2_DISEASE_NAME.get(task, task),
+                }
+        return results  # type: ignore[return-value]
 
 
-# ── Batch sampler ─────────────────────────────────────────────────────────────
+# ── Epoch batch iterator ───────────────────────────────────────────────────────
 
-class SingleDiseaseGroupSampler:
-    """Each batch contains samples from exactly ONE disease task.
+class EpochBatchIterator:
+    """Pre-shuffles the batch schedule once per epoch; lazily reads events per batch.
 
-    Within each batch, both positives (label=1) and negatives (label=0) are
-    included in equal proportion so BatchAllTripletLoss can build valid triplets.
-    Batches from different diseases are never mixed.
-
-    This matches the evaluation setup where triplets are always within a single
-    disease cohort, and avoids the model learning trivial cross-disease separation.
+    Each batch contains samples from exactly ONE disease task with equal pos/neg
+    split, matching BatchAllTripletLoss.  No event data is ever loaded at
+    construction time — only (file_idx, abs_row) index pairs are shuffled.
 
     Algorithm per epoch:
-      1. For each task, shuffle its positives and negatives independently and
-         pre-build a queue of batches.
-      2. Interleave batches across tasks in round-robin order (task order
-         re-shuffled each round) until all task queues are exhausted.
-         This prevents the model from seeing a long run of one disease at a time.
+      1. Shuffle pos/neg (file_idx, abs_row) pairs per task with a deterministic
+         Generator seeded by (seed + epoch) — each DDP rank holds its own data
+         shard so their schedules are independently valid.
+      2. Pre-build a deque of (file_idx, abs_row) batch lists per task.
+      3. Interleave tasks in round-robin with a freshly shuffled order per round.
+      4. _collate() calls LazyDataIndex.read_rows() for that batch's entries,
+         resolves event dicts → mmap embedding indices inline, pads, and returns
+         a dict of CPU tensors for AsyncDataLoader → CudaPrefetcher.
     """
 
     def __init__(
         self,
-        tasks:      list[str],
-        labels:     list[int],   # 0 = negative, 1 = positive
-        batch_size: int,
-        seed:       int  = 42,
+        index:            LazyDataIndex,
+        disease_emb_dict: dict[str, torch.Tensor],
+        batch_size:       int,
+        seed:             int = 42,
     ):
         if batch_size < 4 or batch_size % 2 != 0:
             raise ValueError(f"batch_size must be even and ≥4, got {batch_size}")
-        self.batch_size = batch_size
-        self.seed       = seed
-        self.epoch      = 0
+        self.index            = index
+        self.disease_emb_dict = disease_emb_dict
+        self.batch_size       = batch_size
+        self.half             = batch_size // 2
+        self.seed             = seed
+        self.epoch            = 0
 
-        pos: dict[str, list[int]] = defaultdict(list)
-        neg: dict[str, list[int]] = defaultdict(list)
-        for idx, (task, lbl) in enumerate(zip(tasks, labels)):
-            (pos if lbl == 1 else neg)[task].append(idx)
-
-        # Only keep tasks that have enough data for at least one full batch
-        half = batch_size // 2
+        half = self.half
         self.valid_tasks = sorted(
-            t for t in pos
-            if len(pos[t]) >= half and len(neg.get(t, [])) >= half
+            t for t in index.pos
+            if len(index.pos[t]) >= half and len(index.neg.get(t, [])) >= half
         )
         if not self.valid_tasks:
             raise ValueError(
                 f"No disease task has ≥{half} positives and ≥{half} negatives. "
                 f"Reduce --batch_size or provide more data."
             )
-        self.pos = {t: pos[t] for t in self.valid_tasks}
-        self.neg = {t: neg[t] for t in self.valid_tasks}
-
-        skipped = set(pos) - set(self.valid_tasks)
+        skipped = set(index.pos) - set(self.valid_tasks)
         if skipped:
-            logger.warning(f"  SingleDiseaseGroupSampler: skipped tasks with insufficient "
+            logger.warning(f"  EpochBatchIterator: skipped tasks with insufficient "
                            f"data (need ≥{half} per class): {sorted(skipped)}")
-
-        # Approximate total batches across all tasks per epoch
         self._n_batches = sum(
-            min(len(self.pos[t]), len(self.neg[t])) // half
+            min(len(index.pos[t]), len(index.neg[t])) // half
             for t in self.valid_tasks
         )
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
 
-    def __iter__(self):
-        g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
-        half = self.batch_size // 2
+    def __len__(self):
+        return self._n_batches
 
-        # 1. Pre-build per-task batch queues (shuffle samples within each task)
+    def __iter__(self):
+        g    = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        half = self.half
+
+        # 1. Pre-build per-task batch queues: shuffle (file_idx, abs_row) pairs,
+        #    no actual data loaded yet.
         task_queues: dict[str, deque] = {}
         for task in self.valid_tasks:
-            pos_perm = torch.randperm(len(self.pos[task]), generator=g).tolist()
-            neg_perm = torch.randperm(len(self.neg[task]), generator=g).tolist()
-            pos_q = deque(self.pos[task][i] for i in pos_perm)
-            neg_q = deque(self.neg[task][i] for i in neg_perm)
+            pos_list = self.index.pos[task]
+            neg_list = self.index.neg[task]
+            pos_perm = torch.randperm(len(pos_list), generator=g).tolist()
+            neg_perm = torch.randperm(len(neg_list), generator=g).tolist()
+            pos_q    = deque(pos_list[i] for i in pos_perm)
+            neg_q    = deque(neg_list[i] for i in neg_perm)
             batches: deque = deque()
             while len(pos_q) >= half and len(neg_q) >= half:
                 batches.append(
@@ -366,8 +407,8 @@ class SingleDiseaseGroupSampler:
                 )
             task_queues[task] = batches
 
-        # 2. Interleave: each round, yield one batch from each active task in
-        #    a freshly shuffled order, then drop exhausted tasks.
+        # 2. Interleave: one batch per active task per round, task order reshuffled
+        #    each round; drop exhausted tasks.
         active = list(self.valid_tasks)
         while active:
             order = [active[i]
@@ -375,56 +416,63 @@ class SingleDiseaseGroupSampler:
             next_active = []
             for task in order:
                 if task_queues[task]:
-                    yield task_queues[task].popleft()
+                    yield self._collate(task_queues[task].popleft())
                 if task_queues[task]:
                     next_active.append(task)
             active = next_active
 
-    def __len__(self):
-        return self._n_batches
+    def _collate(self, idx_batch: list[tuple[int, int]]) -> dict[str, torch.Tensor]:
+        """Lazy parquet read + mmap lookup + collation for one batch.
 
+        idx_batch layout: first half are positives, second half are negatives —
+        labels are reconstructed from position so no label metadata needs storing.
 
-# ── Collate ───────────────────────────────────────────────────────────────────
+        Steps:
+          1. read_rows() fetches events dicts from parquet (row-group granularity).
+          2. Resolve each event dict → mmap embedding index via EventLookup.
+          3. Stack, pad, and return CPU tensors.
+        """
+        half        = len(idx_batch) // 2
+        labels_list = [1] * half + [0] * half
 
-def make_collate_fn(disease_emb_dict: dict[str, torch.Tensor]):
-    """Pad event embedding sequences and look up disease embeddings.
+        rows = self.index.read_rows(idx_batch)  # list of {events, task, disease_name}
 
-    Prompt text embeddings are pre-computed once in DiseaseAwareEHREncoder.__init__
-    as registered buffers, so collate no longer needs a tokenizer.
+        lookup       = self.index.lookup
+        embs_list:    list[np.ndarray]   = []
+        disease_list: list[torch.Tensor] = []
 
-    disease_emb_dict: {disease_name: tensor(768,)} on CPU.
-    """
+        for row in rows:
+            eids: list[int] = []
+            for e in row["events"]:
+                key = normalise_event_key(e.get("code"), e.get("value"), e.get("unit"))
+                eid = lookup.key2idx.get(key)
+                if eid is None:
+                    raise KeyError(
+                        f"Event key not found in BioLinkBERT index: {key!r} "
+                        f"(task={row['task']})"
+                    )
+                eids.append(eid)
+            embs = np.stack([lookup.embeddings[eid] for eid in eids]).astype(np.float32)
+            embs_list.append(embs)
+            disease_list.append(self.disease_emb_dict[row["disease_name"]])
 
-    def collate_fn(batch):
-        samples = [b[0] for b in batch]
-        labels  = [b[1] for b in batch]
+        B        = len(embs_list)
+        max_e    = max(e.shape[0] for e in embs_list)
+        bert_dim = embs_list[0].shape[1]
 
-        # ── Pad event embedding sequences ─────────────────────────────────
-        event_embs_list = [s["event_embs"] for s in samples]   # list of (n_i, 768)
-        max_e    = max(e.shape[0] for e in event_embs_list)
-        bert_dim = event_embs_list[0].shape[1]
-
-        padded_event_embs = torch.zeros(len(samples), max_e, bert_dim, dtype=torch.float32)
-        event_attn_mask   = torch.zeros(len(samples), max_e, dtype=torch.long)
-        for i, embs in enumerate(event_embs_list):
+        padded = np.zeros((B, max_e, bert_dim), dtype=np.float32)
+        mask   = np.zeros((B, max_e),            dtype=np.int64)
+        for i, embs in enumerate(embs_list):
             n = embs.shape[0]
-            padded_event_embs[i, :n] = torch.from_numpy(embs)
-            event_attn_mask[i, :n]   = 1
-
-        # ── Look up BioLinkBERT disease embeddings ────────────────────────
-        disease_embs = torch.stack([
-            disease_emb_dict[s["disease_name"]] for s in samples
-        ])  # (B, 768)
+            padded[i, :n] = embs
+            mask[i, :n]   = 1
 
         return {
-            "event_embs":   padded_event_embs,    # (B, max_e, 768) float
-            "event_mask":   event_attn_mask,       # (B, max_e)      long
-            "disease_embs": disease_embs,          # (B, 768)        float
-            "labels":       torch.tensor(labels, dtype=torch.long),
+            "event_embs":   torch.from_numpy(padded),
+            "event_mask":   torch.from_numpy(mask),
+            "disease_embs": torch.stack(disease_list),
+            "labels":       torch.tensor(labels_list, dtype=torch.long),
         }
-
-    return collate_fn
-
 
 
 
@@ -655,11 +703,64 @@ def build_encoder(qwen_model, tokenizer, args) -> DiseaseAwareEHREncoder:
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
+class _EvalDataset(Dataset):
+    """Single-sample Dataset over a flat list of (file_idx, abs_row) entries.
+
+    Each __getitem__ does a lazy parquet row-group read for one entry and
+    resolves events → mmap embeddings, returning (embs_np, disease_tensor).
+    Designed to be wrapped by DataLoader with num_workers > 0 so that parquet
+    IO in worker processes overlaps with GPU inference in the main process.
+    """
+
+    def __init__(
+        self,
+        entries:          list[tuple[int, int]],
+        index:            "LazyDataIndex",
+        disease_emb_dict: dict[str, torch.Tensor],
+    ):
+        self.entries          = entries
+        self.index            = index
+        self.disease_emb_dict = disease_emb_dict
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __getitem__(self, idx) -> tuple[np.ndarray, torch.Tensor]:
+        row    = self.index.read_rows([self.entries[idx]])[0]
+        lookup = self.index.lookup
+        eids: list[int] = []
+        for e in row["events"]:
+            key = normalise_event_key(e.get("code"), e.get("value"), e.get("unit"))
+            eid = lookup.key2idx.get(key)
+            if eid is not None:
+                eids.append(eid)
+        embs = np.stack([lookup.embeddings[eid] for eid in eids]).astype(np.float32)
+        return embs, self.disease_emb_dict[row["disease_name"]]
+
+
+def _eval_collate(batch: list[tuple[np.ndarray, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    """Pad variable-length event sequences and stack disease embeddings."""
+    embs_list, disease_list = zip(*batch)
+    B        = len(embs_list)
+    max_e    = max(e.shape[0] for e in embs_list)
+    bert_dim = embs_list[0].shape[1]
+    padded   = np.zeros((B, max_e, bert_dim), dtype=np.float32)
+    mask     = np.zeros((B, max_e),            dtype=np.int64)
+    for i, embs in enumerate(embs_list):
+        n = embs.shape[0]
+        padded[i, :n] = embs
+        mask[i, :n]   = 1
+    return {
+        "event_embs":   torch.from_numpy(padded),
+        "event_mask":   torch.from_numpy(mask),
+        "disease_embs": torch.stack(disease_list),
+    }
+
+
 @torch.inference_mode()
 def evaluate_ddp(
     encoder:          DiseaseAwareEHREncoder,
-    val_dataset:      EHREmbeddingDataset,
-    tokenizer,
+    val_index:        LazyDataIndex,
     disease_emb_dict: dict[str, torch.Tensor],
     device:           torch.device,
     compute_dtype:    torch.dtype,
@@ -670,57 +771,60 @@ def evaluate_ddp(
 ) -> float:
     """Triplet accuracy distributed across all ranks.
 
-    All ranks build the same triplet list (deterministic seed), then each rank
-    encodes its own slice. Local correct/total counts are all_reduced.
+    All ranks build the same triplet list of (file_idx, abs_row) entries
+    (deterministic seed), then each rank lazily reads and encodes its own slice
+    via LazyDataIndex.read_rows().  Local correct/total counts are all_reduced.
     """
     raw_encoder = encoder.module if isinstance(encoder, DDP) else encoder
     raw_encoder.eval()
 
-    # Build within-disease triplets: positives and negatives from the same task only.
-    rng    = random.Random(args.seed)
-    pos_by_task: dict[str, list] = defaultdict(list)
-    neg_by_task: dict[str, list] = defaultdict(list)
-    for sample, task, label in zip(val_dataset.samples, val_dataset.tasks, val_dataset.labels):
-        (pos_by_task if label == 1 else neg_by_task)[task].append(sample)
+    # Build within-disease triplets from the val index.
+    rng = random.Random(args.seed)
 
-    anchors_s, positives_s, negatives_s = [], [], []
-    for task in sorted(pos_by_task):
-        pos_samples = pos_by_task[task]
-        neg_samples = neg_by_task.get(task, [])
-        if len(pos_samples) < 2 or not neg_samples:
+    anchors_e:   list[tuple[int, int]] = []
+    positives_e: list[tuple[int, int]] = []
+    negatives_e: list[tuple[int, int]] = []
+
+    for task in sorted(val_index.pos):
+        pos_entries = val_index.pos[task]
+        neg_entries = val_index.neg.get(task, [])
+        if len(pos_entries) < 2 or not neg_entries:
             continue
-        pool = list(range(len(pos_samples)))
+        pool = list(range(len(pos_entries)))
         rng.shuffle(pool)
-        for i in range(min(args.n_eval_triplets_per_task, len(pos_samples))):
-            ai = pool[i % len(pos_samples)]
+        for i in range(min(args.n_eval_triplets_per_task, len(pos_entries))):
+            ai = pool[i % len(pos_entries)]
             pi = rng.choice([j for j in pool if j != ai])
-            ni = rng.randint(0, len(neg_samples) - 1)
-            anchors_s.append(pos_samples[ai])
-            positives_s.append(pos_samples[pi])
-            negatives_s.append(neg_samples[ni])
+            ni = rng.randint(0, len(neg_entries) - 1)
+            anchors_e.append(pos_entries[ai])
+            positives_e.append(pos_entries[pi])
+            negatives_e.append(neg_entries[ni])
 
-    if not anchors_s:
+    if not anchors_e:
         if rank == 0:
             logger.warning("No eval triplets could be built.")
         return 0.0
 
-    all_samples = anchors_s + positives_s + negatives_s
-    my_idx      = list(range(rank, len(all_samples), world_size))
-    my_samples  = [all_samples[i] for i in my_idx]
+    # Distribute triplet entries across ranks (each entry is anchor/pos/neg triple).
+    all_entries = anchors_e + positives_e + negatives_e
+    n_triplets  = len(anchors_e)
+    my_triple_idx = list(range(rank, n_triplets, world_size))
+    # For each triplet index t, gather anchor[t], pos[t], neg[t]
+    my_entries: list[tuple[int, int]] = (
+        [anchors_e[t]   for t in my_triple_idx] +
+        [positives_e[t] for t in my_triple_idx] +
+        [negatives_e[t] for t in my_triple_idx]
+    )
 
-    collate = make_collate_fn(disease_emb_dict)
-    _embs   = val_dataset.lookup.embeddings  # mmap array, shared across workers
-
-    def _resolve(s):
-        event_embs = np.stack([_embs[i] for i in s["event_ids"]]).astype(np.float32)
-        return {"event_embs": event_embs, "disease_name": s["disease_name"], "task": s["task"]}
-
+    # Wrap my_entries in a Dataset → DataLoader → AsyncDataLoader → CudaPrefetcher
+    # so that parquet IO (in DataLoader workers) overlaps with GPU inference.
+    eval_ds = _EvalDataset(my_entries, val_index, disease_emb_dict)
     eval_dl = DataLoader(
-        my_samples,
+        eval_ds,
         batch_size=args.eval_batch_size,
         shuffle=False,
-        collate_fn=lambda batch: collate([(_resolve(s), 0) for s in batch]),
-        num_workers=4,
+        collate_fn=_eval_collate,
+        num_workers=2,
         pin_memory=True,
     )
     eval_prefetcher = CudaPrefetcher(
@@ -728,21 +832,21 @@ def evaluate_ddp(
         device=device, cuda_keys=[],
     )
 
-    all_embs = []
+    all_emb_chunks = []
     for batch in eval_prefetcher:
-        emb = raw_encoder(
-            batch["event_embs"],
-            batch["event_mask"],
-            batch["disease_embs"],
-            compute_dtype=compute_dtype,
+        all_emb_chunks.append(
+            raw_encoder(
+                batch["event_embs"],
+                batch["event_mask"],
+                batch["disease_embs"],
+                compute_dtype=compute_dtype,
+            ).cpu()
         )
-        all_embs.append(emb.cpu())
-
-    n_my = len(my_idx) // 3
-    if all_embs and n_my > 0:
-        embs     = torch.cat(all_embs, dim=0)    # (3 * n_my, D)
-        d_ap     = (embs[:n_my] - embs[n_my:2*n_my]).norm(dim=1)
-        d_an     = (embs[:n_my] - embs[2*n_my:3*n_my]).norm(dim=1)
+    n_my = len(my_triple_idx)
+    if all_emb_chunks and n_my > 0:
+        embs  = torch.cat(all_emb_chunks, dim=0)   # (3 * n_my, D)
+        d_ap  = (embs[:n_my] - embs[n_my:2*n_my]).norm(dim=1)
+        d_an  = (embs[:n_my] - embs[2*n_my:]).norm(dim=1)
         local_correct = (d_ap < d_an).sum().to(torch.long).to(device)
         local_total   = torch.tensor(n_my, dtype=torch.long, device=device)
     else:
@@ -930,9 +1034,9 @@ def main():
     if args.eval_only:
         if not args.val_data_paths:
             raise ValueError("--eval_only requires --val_data_paths.")
-        val_dataset = EHREmbeddingDataset(args.val_data_paths, lookup, split=args.val_split)
+        val_index = LazyDataIndex(args.val_data_paths, args.val_split, lookup)
         val_acc = evaluate_ddp(
-            encoder, val_dataset, tokenizer, disease_emb_dict,
+            encoder, val_index, disease_emb_dict,
             device, compute_dtype, args, rank, world_size, is_ddp,
         )
         if rank == 0:
@@ -945,27 +1049,18 @@ def main():
             dist.destroy_process_group()
         return
 
-    # ── Datasets & DataLoaders ─────────────────────────────────────────────────
-    train_dataset = EHREmbeddingDataset(my_train_paths, lookup, split="train")
-    sampler = SingleDiseaseGroupSampler(
-        tasks=train_dataset.tasks,
-        labels=train_dataset.labels,
+    # ── Lazy data indices & batch iterator ────────────────────────────────────
+    train_index = LazyDataIndex(my_train_paths, "train", lookup)
+    batch_iter  = EpochBatchIterator(
+        index=train_index,
+        disease_emb_dict=disease_emb_dict,
         batch_size=args.batch_size,
         seed=args.seed,
     )
-    collate = make_collate_fn(disease_emb_dict)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_sampler=sampler,
-        collate_fn=collate,
-        num_workers=2,
-        pin_memory=True,
-        prefetch_factor=1
-    )
 
-    val_dataset = None
+    val_index = None
     if args.val_data_paths:
-        val_dataset = EHREmbeddingDataset(args.val_data_paths, lookup, split=args.val_split)
+        val_index = LazyDataIndex(args.val_data_paths, args.val_split, lookup)
 
     # ── Optimizer + LR scheduler ───────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -973,7 +1068,7 @@ def main():
         lr=args.lr, weight_decay=args.weight_decay,
     )
 
-    n_batches_per_epoch   = len(train_loader)
+    n_batches_per_epoch   = len(batch_iter)
     n_opt_steps_per_epoch = math.ceil(n_batches_per_epoch / args.grad_accum)
     total_opt_steps       = n_opt_steps_per_epoch * args.epochs
     warmup_steps          = int(total_opt_steps * args.warmup_ratio)
@@ -1000,14 +1095,14 @@ def main():
     for epoch in range(args.epochs):
         if is_ddp:
             dist.barrier()
-        sampler.set_epoch(epoch)
+        batch_iter.set_epoch(epoch)
         encoder.train()
 
         epoch_loss       = 0.0
         optimizer.zero_grad()
 
         prefetcher = CudaPrefetcher(
-            AsyncDataLoader(train_loader, buffer_size=1),
+            AsyncDataLoader(batch_iter, buffer_size=2),
             device=device, cuda_keys=[],
         )
         pbar = tqdm(prefetcher, desc=f"Epoch {epoch+1}/{args.epochs}",
@@ -1072,15 +1167,15 @@ def main():
             logger.info(f"Epoch {epoch+1}/{args.epochs}  avg_loss={avg_loss:.4f}")
 
         # ── Distributed evaluation ─────────────────────────────────────────
-        if val_dataset is not None:
+        if val_index is not None:
             if is_ddp:
                 dist.barrier()
             val_acc = evaluate_ddp(
-                encoder, val_dataset, tokenizer, disease_emb_dict,
+                encoder, val_index, disease_emb_dict,
                 device, compute_dtype, args, rank, world_size, is_ddp,
             )
             if rank == 0:
-                logger.info(f"  val triplet accuracy: {val_acc:.4f}")
+                logger.info(f"  val triplet accuracy: {val_acc:.4f}")  # noqa: F821
                 if use_wandb:
                     import wandb
                     wandb.log({
