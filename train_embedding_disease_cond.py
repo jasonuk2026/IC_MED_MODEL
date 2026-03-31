@@ -81,7 +81,7 @@ import logging
 import argparse
 from tqdm import tqdm
 from contextlib import nullcontext
-from collections import defaultdict, Counter, deque
+from collections import defaultdict, Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -326,21 +326,22 @@ class LazyDataIndex:
 # ── Epoch batch iterator ───────────────────────────────────────────────────────
 
 class EpochBatchIterator:
-    """Pre-shuffles the batch schedule once per epoch; lazily reads events per batch.
+    """Simplified epoch iterator that exploits equal sample counts across tasks.
 
-    Each batch contains samples from exactly ONE disease task with equal pos/neg
-    split, matching BatchAllTripletLoss.  No event data is ever loaded at
-    construction time — only (file_idx, abs_row) index pairs are shuffled.
+    Since every task has the same number of pos and neg samples, the full epoch
+    schedule is just a flat list of (task, batch_within_task) pairs that is
+    globally shuffled once.  DDP distribution is trivial: all ranks generate the
+    same shuffled list from the same Generator seed, then each rank takes every
+    world_size-th entry starting at its own rank index.  No per-task queues,
+    deques, or round-robin logic needed.
 
     Algorithm per epoch:
-      1. Shuffle pos/neg (file_idx, abs_row) pairs per task with a deterministic
-         Generator seeded by (seed + epoch) — each DDP rank holds its own data
-         shard so their schedules are independently valid.
-      2. Pre-build a deque of (file_idx, abs_row) batch lists per task.
-      3. Interleave tasks in round-robin with a freshly shuffled order per round.
-      4. _collate() calls LazyDataIndex.read_rows() for that batch's entries,
-         resolves event dicts → mmap embedding indices inline, pads, and returns
-         a dict of CPU tensors for AsyncDataLoader → CudaPrefetcher.
+      1. For each task, independently permute pos and neg index lists.
+      2. Build flat list of all (task, b) pairs (n_tasks × n_batches_per_task)
+         and globally shuffle it — identical on every rank.
+      3. This rank takes flat[rank :: world_size].
+      4. For each (task, b), slice the permuted pos/neg lists to get batch
+         entries and call _collate() for lazy parquet read + mmap lookup.
     """
 
     def __init__(
@@ -348,6 +349,8 @@ class EpochBatchIterator:
         index:            LazyDataIndex,
         disease_emb_dict: dict[str, torch.Tensor],
         batch_size:       int,
+        rank:             int = 0,
+        world_size:       int = 1,
         seed:             int = 42,
     ):
         if batch_size < 4 or batch_size % 2 != 0:
@@ -356,6 +359,8 @@ class EpochBatchIterator:
         self.disease_emb_dict = disease_emb_dict
         self.batch_size       = batch_size
         self.half             = batch_size // 2
+        self.rank             = rank
+        self.world_size       = world_size
         self.seed             = seed
         self.epoch            = 0
 
@@ -373,10 +378,14 @@ class EpochBatchIterator:
         if skipped:
             logger.warning(f"  EpochBatchIterator: skipped tasks with insufficient "
                            f"data (need ≥{half} per class): {sorted(skipped)}")
-        self._n_batches = sum(
+
+        # All tasks are assumed to have equal counts; use the minimum for safety.
+        self._n_batches_per_task = min(
             min(len(index.pos[t]), len(index.neg[t])) // half
             for t in self.valid_tasks
         )
+        total_batches    = len(self.valid_tasks) * self._n_batches_per_task
+        self._n_batches  = len(range(rank, total_batches, world_size))
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
@@ -388,38 +397,29 @@ class EpochBatchIterator:
         g    = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
         half = self.half
+        n    = self._n_batches_per_task
 
-        # 1. Pre-build per-task batch queues: shuffle (file_idx, abs_row) pairs,
-        #    no actual data loaded yet.
-        task_queues: dict[str, deque] = {}
-        for task in self.valid_tasks:
-            pos_list = self.index.pos[task]
-            neg_list = self.index.neg[task]
-            pos_perm = torch.randperm(len(pos_list), generator=g).tolist()
-            neg_perm = torch.randperm(len(neg_list), generator=g).tolist()
-            pos_q    = deque(pos_list[i] for i in pos_perm)
-            neg_q    = deque(neg_list[i] for i in neg_perm)
-            batches: deque = deque()
-            while len(pos_q) >= half and len(neg_q) >= half:
-                batches.append(
-                    [pos_q.popleft() for _ in range(half)] +
-                    [neg_q.popleft() for _ in range(half)]
-                )
-            task_queues[task] = batches
+        # 1. Per-task shuffled permutations — generated identically on all ranks.
+        task_pos_perm = {
+            t: torch.randperm(len(self.index.pos[t]), generator=g).tolist()
+            for t in self.valid_tasks
+        }
+        task_neg_perm = {
+            t: torch.randperm(len(self.index.neg[t]), generator=g).tolist()
+            for t in self.valid_tasks
+        }
 
-        # 2. Interleave: one batch per active task per round, task order reshuffled
-        #    each round; drop exhausted tasks.
-        active = list(self.valid_tasks)
-        while active:
-            order = [active[i]
-                     for i in torch.randperm(len(active), generator=g).tolist()]
-            next_active = []
-            for task in order:
-                if task_queues[task]:
-                    yield self._collate(task_queues[task].popleft())
-                if task_queues[task]:
-                    next_active.append(task)
-            active = next_active
+        # 2. Flat list of all (task, batch_within_task) pairs, globally shuffled.
+        flat = [(t, b) for t in self.valid_tasks for b in range(n)]
+        flat = [flat[i] for i in torch.randperm(len(flat), generator=g).tolist()]
+
+        # 3. This rank takes every world_size-th entry.
+        for task, b in flat[self.rank :: self.world_size]:
+            pos_list    = self.index.pos[task]
+            neg_list    = self.index.neg[task]
+            pos_entries = [pos_list[task_pos_perm[task][b * half + i]] for i in range(half)]
+            neg_entries = [neg_list[task_neg_perm[task][b * half + i]] for i in range(half)]
+            yield self._collate(pos_entries + neg_entries)
 
     def _collate(self, idx_batch: list[tuple[int, int]]) -> dict[str, torch.Tensor]:
         """Lazy parquet read + mmap lookup + collation for one batch.
@@ -1000,12 +1000,8 @@ def main():
         disease_emb_dict   = {n: disease_emb_tensor[i] for i, n in enumerate(disease_names)}
 
     # ── Data loading ───────────────────────────────────────────────────────────
-    my_train_paths = []
-    if not args.eval_only:
-        my_train_paths = args.data_paths[rank :: world_size]
-        if not my_train_paths:
-            raise ValueError(f"Rank {rank}: no data paths assigned.")
-        logger.info(f"Rank {rank} train paths: {my_train_paths}")
+    # All ranks index all files; DDP distribution is handled inside
+    # EpochBatchIterator via the global shuffled flat list sliced by rank.
 
     # ── Build Qwen model + tokenizer ───────────────────────────────────────────
     if rank == 0:
@@ -1050,11 +1046,13 @@ def main():
         return
 
     # ── Lazy data indices & batch iterator ────────────────────────────────────
-    train_index = LazyDataIndex(my_train_paths, "train", lookup)
+    train_index = LazyDataIndex(args.data_paths, "train", lookup)
     batch_iter  = EpochBatchIterator(
         index=train_index,
         disease_emb_dict=disease_emb_dict,
         batch_size=args.batch_size,
+        rank=rank,
+        world_size=world_size,
         seed=args.seed,
     )
 
