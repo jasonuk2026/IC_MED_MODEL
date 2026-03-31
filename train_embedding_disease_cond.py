@@ -156,8 +156,8 @@ class EventLookup:
         }
         logger.info(f"  {len(self.key2idx):,} unique (code, value, unit) keys indexed.")
 
-        logger.info(f"Loading embeddings (mmap) from {embeddings_path} …")
-        self.embeddings = np.load(embeddings_path, mmap_mode="r")
+        logger.info(f"Loading embeddings into RAM from {embeddings_path} …")
+        self.embeddings = np.load(embeddings_path)
         logger.info(f"  Embeddings shape: {self.embeddings.shape}  dtype: {self.embeddings.dtype}")
 
     def get(self, e: dict, warn_missing: bool = True) -> np.ndarray | None:
@@ -247,6 +247,10 @@ class LazyDataIndex:
         self.lookup     = lookup
         # row-group offset cache: file_idx -> [cumulative row count at start of each rg]
         self._rg_offsets: dict[int, list[int]] = {}
+        # open ParquetFile handle cache: file_idx -> ParquetFile
+        # Populated lazily in read_rows(); each DataLoader worker process has its own
+        # copy (fork isolation), so no locking is needed.
+        self._pf_cache: dict[int, _pq.ParquetFile] = {}
 
         pos: dict[str, list[tuple[int, int]]] = defaultdict(list)
         neg: dict[str, list[tuple[int, int]]] = defaultdict(list)
@@ -282,7 +286,9 @@ class LazyDataIndex:
     def _get_rg_offsets(self, file_idx: int) -> list[int]:
         """Cumulative row-count offsets at the start of each row-group (cached)."""
         if file_idx not in self._rg_offsets:
-            meta   = _pq.ParquetFile(self.file_paths[file_idx]).metadata
+            if file_idx not in self._pf_cache:
+                self._pf_cache[file_idx] = _pq.ParquetFile(self.file_paths[file_idx])
+            meta   = self._pf_cache[file_idx].metadata
             offs   = []
             cumul  = 0
             for i in range(meta.num_row_groups):
@@ -310,7 +316,9 @@ class LazyDataIndex:
 
         results: list[dict | None] = [None] * len(entries)
         for (file_idx, rg_idx), items in groups.items():
-            pf    = _pq.ParquetFile(self.file_paths[file_idx])
+            if file_idx not in self._pf_cache:
+                self._pf_cache[file_idx] = _pq.ParquetFile(self.file_paths[file_idx])
+            pf    = self._pf_cache[file_idx]
             table = pf.read_row_group(rg_idx, columns=["events", "task"])
             for batch_pos, row_in_rg in items:
                 task   = table["task"][row_in_rg].as_py()
@@ -345,20 +353,22 @@ class EpochShuffledDataset(Dataset):
         self,
         index:            LazyDataIndex,
         disease_emb_dict: dict[str, torch.Tensor],
-        batch_size:       int,
-        rank:             int = 0,
-        world_size:       int = 1,
-        seed:             int = 42,
+        batch_size:          int,
+        rank:                int = 0,
+        world_size:          int = 1,
+        seed:                int = 42,
+        pad_to_num_events:   int | None = None,
     ):
         if batch_size < 4 or batch_size % 2 != 0:
             raise ValueError(f"batch_size must be even and ≥4, got {batch_size}")
-        self.index            = index
-        self.disease_emb_dict = disease_emb_dict
-        self.batch_size       = batch_size
-        self.half             = batch_size // 2
-        self.rank             = rank
-        self.world_size       = world_size
-        self.seed             = seed
+        self.index              = index
+        self.disease_emb_dict   = disease_emb_dict
+        self.batch_size         = batch_size
+        self.half               = batch_size // 2
+        self.rank               = rank
+        self.world_size         = world_size
+        self.seed               = seed
+        self.pad_to_num_events  = pad_to_num_events
 
         half = self.half
         self.valid_tasks = sorted(
@@ -454,13 +464,16 @@ class EpochShuffledDataset(Dataset):
                         f"(task={row['task']})"
                     )
                 eids.append(eid)
+            if self.pad_to_num_events is not None:
+                eids = eids[:self.pad_to_num_events]
             embs_list.append(
                 np.stack([lookup.embeddings[eid] for eid in eids]).astype(np.float32)
             )
             disease_list.append(self.disease_emb_dict[row["disease_name"]])
 
         B        = len(embs_list)
-        max_e    = max(e.shape[0] for e in embs_list)
+        max_e    = self.pad_to_num_events if self.pad_to_num_events is not None \
+                   else max(e.shape[0] for e in embs_list)
         bert_dim = embs_list[0].shape[1]
         padded   = np.zeros((B, max_e, bert_dim), dtype=np.float32)
         mask     = np.zeros((B, max_e),            dtype=np.int64)
@@ -503,8 +516,7 @@ class DiseaseAwareEHREncoder(nn.Module):
     attended to disease most at each layer.
 
     Trainable modules beyond Qwen LoRA:
-        event_proj    Linear(bert_dim → qwen_dim)   no bias
-        disease_proj  Linear(bert_dim → qwen_dim)   no bias
+        bert_proj     Linear(bert_dim → qwen_dim)   no bias  (shared by events and disease)
     """
 
     def __init__(
@@ -516,12 +528,10 @@ class DiseaseAwareEHREncoder(nn.Module):
         middle_ids: torch.Tensor,   # (1, P2)  token ids for PROMPT_MIDDLE
     ):
         super().__init__()
-        self.qwen         = qwen_model
-        self.event_proj   = nn.Linear(bert_dim, qwen_dim, bias=False)
-        self.disease_proj = nn.Linear(bert_dim, qwen_dim, bias=False)
+        self.qwen      = qwen_model
+        self.bert_proj = nn.Linear(bert_dim, qwen_dim, bias=False)
 
-        nn.init.xavier_uniform_(self.event_proj.weight)
-        nn.init.xavier_uniform_(self.disease_proj.weight)
+        nn.init.xavier_uniform_(self.bert_proj.weight)
 
         # Pre-compute frozen text embeddings once; store as buffers so they
         # move to the right device automatically and never appear in the forward graph.
@@ -543,10 +553,10 @@ class DiseaseAwareEHREncoder(nn.Module):
         device = event_embs.device
 
         # 1. Project event embeddings to Qwen hidden size
-        ev_proj   = self.event_proj(event_embs.to(compute_dtype))                    # (B, N, D)
+        ev_proj   = self.bert_proj(event_embs.to(compute_dtype))                     # (B, N, D)
 
         # 2. Project disease embedding → virtual token (B, 1, D)
-        dis_token = self.disease_proj(disease_embs.to(compute_dtype)).unsqueeze(1)
+        dis_token = self.bert_proj(disease_embs.to(compute_dtype)).unsqueeze(1)
 
         # 3. Retrieve pre-computed text embeddings (registered buffers, frozen).
         #    Sequence layout matches the prompt template:
@@ -582,10 +592,7 @@ class DiseaseAwareEHREncoder(nn.Module):
         raw_qwen = self.qwen.module if isinstance(self.qwen, DDP) else self.qwen
         raw_qwen.save_pretrained(str(save_dir / "lora"))
         torch.save(
-            {
-                "event_proj":   self.event_proj.state_dict(),
-                "disease_proj": self.disease_proj.state_dict(),
-            },
+            {"bert_proj": self.bert_proj.state_dict()},
             save_dir / "extra_modules.pt",
         )
         logger.info(f"  Saved checkpoint → {save_dir}")
@@ -603,8 +610,7 @@ class DiseaseAwareEHREncoder(nn.Module):
         qwen_lora = PeftModel.from_pretrained(qwen_base, str(save_dir / "lora"))
         encoder   = cls(qwen_lora, bert_dim, qwen_dim, prefix_ids, middle_ids)
         extra     = torch.load(save_dir / "extra_modules.pt", map_location="cpu")
-        encoder.event_proj.load_state_dict(extra["event_proj"])
-        encoder.disease_proj.load_state_dict(extra["disease_proj"])
+        encoder.bert_proj.load_state_dict(extra["bert_proj"])
         return encoder
 
 
@@ -685,7 +691,7 @@ def build_encoder(qwen_model, tokenizer, args) -> DiseaseAwareEHREncoder:
     logger.info(
         f"  Prompt template: {repr(PROMPT_PREFIX)} <DISEASE> {repr(PROMPT_MIDDLE)} <EVENTS>"
     )
-    logger.info(f"  disease_proj Linear({BERT_DIM}→{qwen_dim}), event_proj Linear({BERT_DIM}→{qwen_dim})")
+    logger.info(f"  bert_proj Linear({BERT_DIM}→{qwen_dim}) shared by events and disease")
 
     compute_dtype = (
         torch.bfloat16 if args.bf16 else
@@ -693,8 +699,7 @@ def build_encoder(qwen_model, tokenizer, args) -> DiseaseAwareEHREncoder:
         torch.float32
     )
     if compute_dtype != torch.float32:
-        encoder.event_proj.to(compute_dtype)
-        encoder.disease_proj.to(compute_dtype)
+        encoder.bert_proj.to(compute_dtype)
 
     total     = sum(p.numel() for p in encoder.parameters())
     trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
@@ -715,13 +720,15 @@ class EvalBatchDataset(Dataset):
 
     def __init__(
         self,
-        entries:          list[tuple[int, int]],
-        index:            LazyDataIndex,
-        disease_emb_dict: dict[str, torch.Tensor],
-        batch_size:       int,
+        entries:           list[tuple[int, int]],
+        index:             LazyDataIndex,
+        disease_emb_dict:  dict[str, torch.Tensor],
+        batch_size:        int,
+        pad_to_num_events: int | None = None,
     ):
-        self.index            = index
-        self.disease_emb_dict = disease_emb_dict
+        self.index             = index
+        self.disease_emb_dict  = disease_emb_dict
+        self.pad_to_num_events = pad_to_num_events
         self._batches: list[list[tuple[int, int]]] = [
             entries[i : i + batch_size]
             for i in range(0, len(entries), batch_size)
@@ -743,13 +750,16 @@ class EvalBatchDataset(Dataset):
                 eid = lookup.key2idx.get(key)
                 if eid is not None:
                     eids.append(eid)
+            if self.pad_to_num_events is not None:
+                eids = eids[:self.pad_to_num_events]
             embs_list.append(
                 np.stack([lookup.embeddings[eid] for eid in eids]).astype(np.float32)
             )
             disease_list.append(self.disease_emb_dict[row["disease_name"]])
 
         B        = len(embs_list)
-        max_e    = max(e.shape[0] for e in embs_list)
+        max_e    = self.pad_to_num_events if self.pad_to_num_events is not None \
+                   else max(e.shape[0] for e in embs_list)
         bert_dim = embs_list[0].shape[1]
         padded   = np.zeros((B, max_e, bert_dim), dtype=np.float32)
         mask     = np.zeros((B, max_e),            dtype=np.int64)
@@ -827,13 +837,14 @@ def evaluate_ddp(
     # Wrap my_entries in a batch-level Dataset → DataLoader → AsyncDataLoader →
     # CudaPrefetcher so that parquet IO (in DataLoader workers) overlaps with
     # GPU inference, matching the training data loading pattern.
-    eval_ds = EvalBatchDataset(my_entries, val_index, disease_emb_dict, args.eval_batch_size)
+    eval_ds = EvalBatchDataset(my_entries, val_index, disease_emb_dict,
+                               args.eval_batch_size, args.pad_to_num_events)
     eval_dl = DataLoader(
         eval_ds,
         batch_size=1,
         shuffle=False,
         collate_fn=lambda b: b[0],
-        num_workers=4,
+        num_workers=args.num_workers,
         pin_memory=True,
     )
     eval_prefetcher = CudaPrefetcher(
@@ -842,7 +853,8 @@ def evaluate_ddp(
     )
 
     all_emb_chunks = []
-    for batch in eval_prefetcher:
+    for batch in tqdm(eval_prefetcher, desc="Evaluating", disable=(rank != 0),
+                      dynamic_ncols=True, total=len(eval_ds)):
         all_emb_chunks.append(
             raw_encoder(
                 batch["event_embs"],
@@ -932,6 +944,18 @@ def parse_args():
     p.add_argument("--triplet_margin",           type=float, default=0.5)
     p.add_argument("--n_eval_triplets_per_task", type=int,   default=100)
     p.add_argument("--eval_batch_size",          type=int,   default=32)
+    p.add_argument("--pad_to_num_events",        type=int,   default=None,
+                   help="Pad/truncate event sequences to this fixed length. "
+                        "Required for torch.compile (static shapes).")
+
+    p.add_argument("--num_workers", type=int, default=4,
+                   help="DataLoader workers per rank. Reduce (e.g. 1-2) when running "
+                        "multi-GPU on a shared filesystem to avoid IO contention.")
+
+    # Optimisation / compilation
+    p.add_argument("--compile", action="store_true",
+                   help="Wrap encoder with torch.compile for kernel fusion. "
+                        "Requires --pad_to_num_events for static shapes.")
 
     # wandb
     p.add_argument("--wandb_project",  default=None)
@@ -956,6 +980,9 @@ def main():
     if is_ddp:
         torch.cuda.set_device(device)
         dist.init_process_group(backend="nccl", device_id=device)
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32       = True
 
     if rank != 0:
         logging.getLogger().setLevel(logging.WARNING)
@@ -1023,17 +1050,19 @@ def main():
         qwen_lora = PeftModel.from_pretrained(qwen_model, str(Path(args.checkpoint) / "lora"))
         encoder, compute_dtype = build_encoder(qwen_lora, tokenizer, args)
         extra = torch.load(Path(args.checkpoint) / "extra_modules.pt", map_location="cpu")
-        encoder.event_proj.load_state_dict(extra["event_proj"])
-        encoder.disease_proj.load_state_dict(extra["disease_proj"])
+        encoder.bert_proj.load_state_dict(extra["bert_proj"])
     else:
         qwen_lora = setup_lora(qwen_model, args)
         encoder, compute_dtype = build_encoder(qwen_lora, tokenizer, args)
 
     encoder = encoder.to(device)
 
+    if args.compile:
+        encoder = torch.compile(encoder)
+
     if is_ddp and not args.eval_only:
         encoder = DDP(encoder, device_ids=[local_rank], output_device=local_rank,
-                      find_unused_parameters=False)
+                      find_unused_parameters=False, static_graph=True)
 
     # ── Eval-only mode ─────────────────────────────────────────────────────────
     if args.eval_only:
@@ -1063,6 +1092,7 @@ def main():
         rank=rank,
         world_size=world_size,
         seed=args.seed,
+        pad_to_num_events=args.pad_to_num_events,
     )
 
     val_index = None
@@ -1073,6 +1103,7 @@ def main():
     optimizer = torch.optim.AdamW(
         [p for p in encoder.parameters() if p.requires_grad],
         lr=args.lr, weight_decay=args.weight_decay,
+        fused=True,
     )
 
     n_batches_per_epoch   = train_ds.n_batches
@@ -1095,6 +1126,17 @@ def main():
                     f"{total_opt_steps} optimizer steps total")
         logger.info(f"BatchAllTripletLoss margin={args.triplet_margin}")
 
+    # ── Training DataLoader (created once; workers persist across epochs) ─────
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=lambda b: b[0],  # each item is already a full batch dict
+        num_workers=args.num_workers,
+        pin_memory=True,
+        prefetch_factor=4,
+    )
+
     # ── Training loop ──────────────────────────────────────────────────────────
     best_val_acc = 0.0
     opt_step     = 0
@@ -1108,14 +1150,6 @@ def main():
         epoch_loss       = 0.0
         optimizer.zero_grad()
 
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=1,
-            shuffle=False,
-            collate_fn=lambda b: b[0],  # each item is already a full batch dict
-            num_workers=4,
-            pin_memory=True,
-        )
         prefetcher = CudaPrefetcher(
             AsyncDataLoader(train_loader, buffer_size=4),
             device=device, cuda_keys=[],
