@@ -323,63 +323,22 @@ class LazyDataIndex:
         return results  # type: ignore[return-value]
 
 
-# ── Training dataset + sampler ────────────────────────────────────────────────
-
-def _train_collate(
-    batch: list[tuple[np.ndarray, torch.Tensor, int]],
-) -> dict[str, torch.Tensor]:
-    """Pad variable-length event sequences, stack disease embeddings, collect labels."""
-    embs_list, disease_list, labels_list = zip(*batch)
-    B        = len(embs_list)
-    max_e    = max(e.shape[0] for e in embs_list)
-    bert_dim = embs_list[0].shape[1]
-    padded   = np.zeros((B, max_e, bert_dim), dtype=np.float32)
-    mask     = np.zeros((B, max_e),            dtype=np.int64)
-    for i, embs in enumerate(embs_list):
-        n = embs.shape[0]
-        padded[i, :n] = embs
-        mask[i, :n]   = 1
-    return {
-        "event_embs":   torch.from_numpy(padded),
-        "event_mask":   torch.from_numpy(mask),
-        "disease_embs": torch.stack(disease_list),
-        "labels":       torch.tensor(labels_list, dtype=torch.long),
-    }
-
-
-class EpochBatchSampler:
-    """Yields pre-computed groups of sample indices, one group per batch.
-
-    Each group is a contiguous slice of the epoch schedule (half positives
-    followed by half negatives, all from the same task), so DataLoader workers
-    can fetch individual samples in parallel while the group structure is
-    preserved for BatchAllTripletLoss.
-    """
-
-    def __init__(self, batch_groups: list[list[int]]):
-        self._groups = batch_groups
-
-    def __iter__(self):
-        return iter(self._groups)
-
-    def __len__(self):
-        return len(self._groups)
-
+# ── Training dataset ──────────────────────────────────────────────────────────
 
 class EpochShuffledDataset(Dataset):
-    """PyTorch Dataset over a per-epoch shuffled flat schedule of individual samples.
+    """PyTorch Dataset where each item IS a full collated batch.
 
-    Since every task has the same number of pos and neg samples, the schedule
-    is a flat list of (task, batch_within_task) pairs globally shuffled once per
-    epoch.  DDP distribution is a trivial rank-strided slice of that list.
+    __len__ returns the number of batches this rank handles.
+    __getitem__(j) reads all samples for batch j in one grouped read_rows() call
+    (row-group-aware, so each row-group is opened at most once per batch), then
+    collates and returns a ready-to-use dict of CPU tensors.
 
-    Call set_epoch(epoch) before each epoch to regenerate the schedule.
-    __getitem__ reads one sample lazily from parquet (row-group granularity),
-    enabling DataLoader's num_workers to parallelize IO across samples in a batch.
+    With DataLoader(batch_size=1, collate_fn=lambda b: b[0], num_workers=N),
+    N workers each prepare a *different* batch simultaneously — IO for batch j+1,
+    j+2, … overlaps with GPU forward on batch j.  This avoids the per-sample
+    row-group re-read overhead of sample-level __getitem__ designs.
 
-    Use with EpochBatchSampler (from the batch_groups property) to ensure each
-    DataLoader batch contains exactly half positives + half negatives from the
-    same task, as required by BatchAllTripletLoss.
+    Call set_epoch(epoch) before each epoch to regenerate the shuffled schedule.
     """
 
     def __init__(
@@ -421,16 +380,15 @@ class EpochShuffledDataset(Dataset):
             min(len(index.pos[t]), len(index.neg[t])) // half
             for t in self.valid_tasks
         )
-        total_batches   = len(self.valid_tasks) * self._n_batches_per_task
-        self.n_batches  = len(range(rank, total_batches, world_size))
+        total_batches  = len(self.valid_tasks) * self._n_batches_per_task
+        self.n_batches = len(range(rank, total_batches, world_size))
 
-        # Populated by set_epoch(); accessed by DataLoader workers via fork.
-        # schedule[i] = (file_idx, abs_row, label)
-        self._schedule:     list[tuple[int, int, int]] = []
-        self._batch_groups: list[list[int]]            = []
+        # _batches[j] = [(file_idx, abs_row, label), ...] for batch j.
+        # Populated by set_epoch(); workers access this via fork (read-only).
+        self._batches: list[list[tuple[int, int, int]]] = []
 
     def set_epoch(self, epoch: int) -> None:
-        """Regenerate the shuffled schedule and batch groups for this epoch."""
+        """Regenerate the shuffled batch list for this epoch."""
         g    = torch.Generator()
         g.manual_seed(self.seed + epoch)
         half = self.half
@@ -447,51 +405,76 @@ class EpochShuffledDataset(Dataset):
         }
 
         # Globally shuffled flat list; this rank takes every world_size-th entry.
-        flat = [(t, b) for t in self.valid_tasks for b in range(n)]
-        flat = [flat[i] for i in torch.randperm(len(flat), generator=g).tolist()]
+        flat    = [(t, b) for t in self.valid_tasks for b in range(n)]
+        flat    = [flat[i] for i in torch.randperm(len(flat), generator=g).tolist()]
         my_flat = flat[self.rank :: self.world_size]
 
-        schedule:     list[tuple[int, int, int]] = []
-        batch_groups: list[list[int]]            = []
+        batches: list[list[tuple[int, int, int]]] = []
         for task, b in my_flat:
             pos_list = self.index.pos[task]
             neg_list = self.index.neg[task]
-            start    = len(schedule)
+            entries: list[tuple[int, int, int]] = []
             for i in range(half):
                 fi, ar = pos_list[task_pos_perm[task][b * half + i]]
-                schedule.append((fi, ar, 1))
+                entries.append((fi, ar, 1))
             for i in range(half):
                 fi, ar = neg_list[task_neg_perm[task][b * half + i]]
-                schedule.append((fi, ar, 0))
-            batch_groups.append(list(range(start, start + self.batch_size)))
+                entries.append((fi, ar, 0))
+            batches.append(entries)
 
-        self._schedule     = schedule
-        self._batch_groups = batch_groups
-
-    @property
-    def batch_groups(self) -> list[list[int]]:
-        return self._batch_groups
+        self._batches = batches
 
     def __len__(self) -> int:
-        return len(self._schedule)
+        return len(self._batches)
 
-    def __getitem__(self, idx: int) -> tuple[np.ndarray, torch.Tensor, int]:
-        """Lazy-load one sample: parquet row-group read → mmap embedding lookup."""
-        file_idx, abs_row, label = self._schedule[idx]
-        row    = self.index.read_rows([(file_idx, abs_row)])[0]
+    def __getitem__(self, j: int) -> dict[str, torch.Tensor]:
+        """Read and collate all samples for batch j in one grouped parquet call.
+
+        read_rows() groups entries by (file_idx, row_group_idx) so each
+        row-group is opened at most once, regardless of how many samples
+        fall in it.  Workers call this for different j values in parallel.
+        """
+        batch_entries = self._batches[j]
+        entries = [(fi, ar) for fi, ar, _  in batch_entries]
+        labels  = [lbl      for _,  _,  lbl in batch_entries]
+
+        rows   = self.index.read_rows(entries)
         lookup = self.index.lookup
-        eids: list[int] = []
-        for e in row["events"]:
-            key = normalise_event_key(e.get("code"), e.get("value"), e.get("unit"))
-            eid = lookup.key2idx.get(key)
-            if eid is None:
-                raise KeyError(
-                    f"Event key not found in BioLinkBERT index: {key!r} "
-                    f"(task={row['task']})"
-                )
-            eids.append(eid)
-        embs = np.stack([lookup.embeddings[eid] for eid in eids]).astype(np.float32)
-        return embs, self.disease_emb_dict[row["disease_name"]], label
+
+        embs_list:    list[np.ndarray]   = []
+        disease_list: list[torch.Tensor] = []
+        for row in rows:
+            eids: list[int] = []
+            for e in row["events"]:
+                key = normalise_event_key(e.get("code"), e.get("value"), e.get("unit"))
+                eid = lookup.key2idx.get(key)
+                if eid is None:
+                    raise KeyError(
+                        f"Event key not found in BioLinkBERT index: {key!r} "
+                        f"(task={row['task']})"
+                    )
+                eids.append(eid)
+            embs_list.append(
+                np.stack([lookup.embeddings[eid] for eid in eids]).astype(np.float32)
+            )
+            disease_list.append(self.disease_emb_dict[row["disease_name"]])
+
+        B        = len(embs_list)
+        max_e    = max(e.shape[0] for e in embs_list)
+        bert_dim = embs_list[0].shape[1]
+        padded   = np.zeros((B, max_e, bert_dim), dtype=np.float32)
+        mask     = np.zeros((B, max_e),            dtype=np.int64)
+        for i, embs in enumerate(embs_list):
+            n = embs.shape[0]
+            padded[i, :n] = embs
+            mask[i, :n]   = 1
+
+        return {
+            "event_embs":   torch.from_numpy(padded),
+            "event_mask":   torch.from_numpy(mask),
+            "disease_embs": torch.stack(disease_list),
+            "labels":       torch.tensor(labels, dtype=torch.long),
+        }
 
 
 
@@ -1120,13 +1103,14 @@ def main():
 
         train_loader = DataLoader(
             train_ds,
-            batch_sampler=EpochBatchSampler(train_ds.batch_groups),
-            collate_fn=_train_collate,
+            batch_size=1,
+            shuffle=False,
+            collate_fn=lambda b: b[0],  # each item is already a full batch dict
             num_workers=4,
             pin_memory=True,
         )
         prefetcher = CudaPrefetcher(
-            AsyncDataLoader(train_loader, buffer_size=2),
+            AsyncDataLoader(train_loader, buffer_size=4),
             device=device, cuda_keys=[],
         )
         pbar = tqdm(prefetcher, desc=f"Epoch {epoch+1}/{args.epochs}",
