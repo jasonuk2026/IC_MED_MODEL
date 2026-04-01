@@ -73,7 +73,6 @@ Single GPU
 NOTE: QLoRA (--qlora) is incompatible with multi-GPU DDP.
 """
 
-import bisect
 import os
 import math
 import random
@@ -84,8 +83,6 @@ from contextlib import nullcontext
 from collections import defaultdict, Counter
 from datetime import datetime
 from pathlib import Path
-
-import pyarrow.parquet as _pq
 
 import numpy as np
 import torch
@@ -245,19 +242,25 @@ class LazyDataIndex:
     def __init__(self, paths: list[str], split: str | None, lookup: EventLookup):
         self.file_paths = list(paths)
         self.lookup     = lookup
-        # row-group offset cache: file_idx -> [cumulative row count at start of each rg]
-        self._rg_offsets: dict[int, list[int]] = {}
 
         pos: dict[str, list[tuple[int, int]]] = defaultdict(list)
         neg: dict[str, list[tuple[int, int]]] = defaultdict(list)
         task_counts: Counter = Counter()
         pos_counts:  Counter = Counter()
 
+        # Pre-load all event IDs into memory to eliminate parquet I/O during training.
+        # Each shard row group is ~20 MB compressed; with random global shuffling a
+        # single batch can touch 10-15 different row groups → hundreds of MB per batch.
+        # Pre-loading resolves all (code, value, unit) → event_id lookups at startup
+        # and stores compact integer lists, so __getitem__ never touches parquet again.
+        # Memory cost: ~100 MB for 50 K samples × 500 events (int32 lists).
+        self._preloaded: dict[tuple[int, int], tuple[str, list[int]]] = {}
+
         for file_idx, path in enumerate(self.file_paths):
-            logger.info(f"Indexing {path} …")
-            df_meta = pd.read_parquet(path, columns=["split", "label", "task"])
-            for abs_row, (split_val, task, label) in enumerate(
-                zip(df_meta["split"], df_meta["task"], df_meta["label"])
+            logger.info(f"Indexing + pre-loading {path} …")
+            df = pd.read_parquet(path, columns=["split", "label", "task", "events"])
+            for abs_row, (split_val, label, task, events) in enumerate(
+                zip(df["split"], df["label"], df["task"], df["events"])
             ):
                 if split is not None and split_val != split:
                     continue
@@ -266,61 +269,42 @@ class LazyDataIndex:
                 task_counts[task] += 1
                 if lbl:
                     pos_counts[task] += 1
-            del df_meta
+                # Resolve event keys → integer IDs now, once, at startup.
+                eids: list[int] = []
+                for e in events:
+                    key = normalise_event_key(e.get("code"), e.get("value"), e.get("unit"))
+                    eid = lookup.key2idx.get(key)
+                    if eid is not None:
+                        eids.append(eid)
+                self._preloaded[(file_idx, abs_row)] = (task, eids)
+            del df
 
         self.pos: dict[str, list[tuple[int, int]]] = dict(pos)
         self.neg: dict[str, list[tuple[int, int]]] = dict(neg)
 
         logger.info(f"  {sum(task_counts.values())} samples "
-                    f"(split={split!r}) across {len(task_counts)} tasks")
+                    f"(split={split!r}) across {len(task_counts)} tasks  "
+                    f"[{len(self._preloaded):,} pre-loaded]")
         for task in sorted(task_counts):
             logger.info(f"    {task}: {pos_counts[task]} pos / "
                         f"{task_counts[task] - pos_counts[task]} neg")
 
-    # ── Row-group metadata (cached) ───────────────────────────────────────────
-
-    def _get_rg_offsets(self, file_idx: int) -> list[int]:
-        """Cumulative row-count offsets at the start of each row-group (cached)."""
-        if file_idx not in self._rg_offsets:
-            meta   = _pq.ParquetFile(self.file_paths[file_idx]).metadata
-            offs   = []
-            cumul  = 0
-            for i in range(meta.num_row_groups):
-                offs.append(cumul)
-                cumul += meta.row_group(i).num_rows
-            self._rg_offsets[file_idx] = offs
-        return self._rg_offsets[file_idx]
-
-    # ── Lazy row read ─────────────────────────────────────────────────────────
+    # ── In-memory row read ────────────────────────────────────────────────────
 
     def read_rows(self, entries: list[tuple[int, int]]) -> list[dict]:
-        """Read events and task for a list of (file_idx, abs_row) entries.
+        """Return pre-loaded event IDs and task for a list of (file_idx, abs_row) entries.
 
-        Groups reads by (file_idx, row_group_idx) so each row-group is opened
-        at most once per call.  Returns a list of dicts in the same order as
-        entries, each with keys: 'events' (list[dict]), 'task' (str),
-        'disease_name' (str).
+        No parquet I/O — all data was resolved to integer event IDs at init time.
         """
-        # Map each entry to its (file_idx, rg_idx, row_within_rg)
-        groups: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
-        for batch_pos, (file_idx, abs_row) in enumerate(entries):
-            offs   = self._get_rg_offsets(file_idx)
-            rg_idx = bisect.bisect_right(offs, abs_row) - 1
-            groups[(file_idx, rg_idx)].append((batch_pos, abs_row - offs[rg_idx]))
-
-        results: list[dict | None] = [None] * len(entries)
-        for (file_idx, rg_idx), items in groups.items():
-            pf    = _pq.ParquetFile(self.file_paths[file_idx])
-            table = pf.read_row_group(rg_idx, columns=["events", "task"])
-            for batch_pos, row_in_rg in items:
-                task   = table["task"][row_in_rg].as_py()
-                events = table["events"][row_in_rg].as_py()
-                results[batch_pos] = {
-                    "events":       events,
-                    "task":         task,
-                    "disease_name": TASK_2_DISEASE_NAME.get(task, task),
-                }
-        return results  # type: ignore[return-value]
+        return [
+            {
+                "event_ids":   self._preloaded[(fi, ar)][1],
+                "task":        self._preloaded[(fi, ar)][0],
+                "disease_name": TASK_2_DISEASE_NAME.get(self._preloaded[(fi, ar)][0],
+                                                         self._preloaded[(fi, ar)][0]),
+            }
+            for fi, ar in entries
+        ]
 
 
 # ── Training dataset ──────────────────────────────────────────────────────────
@@ -440,26 +424,17 @@ class EpochShuffledDataset(Dataset):
         entries = [(fi, ar) for fi, ar, _  in batch_entries]
         labels  = [lbl      for _,  _,  lbl in batch_entries]
 
-        rows   = self.index.read_rows(entries)
-        lookup = self.index.lookup
+        rows       = self.index.read_rows(entries)
+        embeddings = self.index.lookup.embeddings
 
         embs_list:    list[np.ndarray]   = []
         disease_list: list[torch.Tensor] = []
         for row in rows:
-            eids: list[int] = []
-            for e in row["events"]:
-                key = normalise_event_key(e.get("code"), e.get("value"), e.get("unit"))
-                eid = lookup.key2idx.get(key)
-                if eid is None:
-                    raise KeyError(
-                        f"Event key not found in BioLinkBERT index: {key!r} "
-                        f"(task={row['task']})"
-                    )
-                eids.append(eid)
+            eids = row["event_ids"]
             if self.pad_to_num_events is not None:
                 eids = eids[:self.pad_to_num_events]
             embs_list.append(
-                np.stack([lookup.embeddings[eid] for eid in eids]).astype(np.float32)
+                np.stack([embeddings[eid] for eid in eids]).astype(np.float32)
             )
             disease_list.append(self.disease_emb_dict[row["disease_name"]])
 
@@ -730,22 +705,17 @@ class EvalBatchDataset(Dataset):
         return len(self._batches)
 
     def __getitem__(self, j: int) -> dict[str, torch.Tensor]:
-        rows   = self.index.read_rows(self._batches[j])
-        lookup = self.index.lookup
+        rows       = self.index.read_rows(self._batches[j])
+        embeddings = self.index.lookup.embeddings
 
         embs_list:    list[np.ndarray]   = []
         disease_list: list[torch.Tensor] = []
         for row in rows:
-            eids: list[int] = []
-            for e in row["events"]:
-                key = normalise_event_key(e.get("code"), e.get("value"), e.get("unit"))
-                eid = lookup.key2idx.get(key)
-                if eid is not None:
-                    eids.append(eid)
+            eids = row["event_ids"]
             if self.pad_to_num_events is not None:
                 eids = eids[:self.pad_to_num_events]
             embs_list.append(
-                np.stack([lookup.embeddings[eid] for eid in eids]).astype(np.float32)
+                np.stack([embeddings[eid] for eid in eids]).astype(np.float32)
             )
             disease_list.append(self.disease_emb_dict[row["disease_name"]])
 
