@@ -7,7 +7,7 @@ Disease-conditioned EHR embedding model using a BioLinkBERT disease virtual toke
 Pre-computed BioLinkBERT event embeddings are conditioned on disease-specific
 BioLinkBERT embeddings via a lightweight cross-attention layer, then fed into a
 Qwen3-Embedding model (LoRA fine-tuned) to produce disease-aware patient
-representations trained with BatchAllTripletLoss.
+representations trained with BatchHardSoftMarginTripletLoss.
 
 Architecture per sample
 ───────────────────────
@@ -99,7 +99,8 @@ import pandas as pd
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig, logging as hf_logging
 from extract_biolinkbert_embeddings import mean_pool_no_special, normalise_event_key
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training, PeftModel
-from sentence_transformers.losses import BatchAllTripletLoss
+from sentence_transformers.losses import BatchHardSoftMarginTripletLoss, BatchHardTripletLossDistanceFunction
+from model import DiseaseAwareEHREncoder
 
 hf_logging.set_verbosity_warning()
 
@@ -457,130 +458,6 @@ class EpochShuffledDataset(Dataset):
         }
 
 
-
-# ── Disease-Aware EHR Encoder ─────────────────────────────────────────────────
-
-class DiseaseAwareEHREncoder(nn.Module):
-    """Qwen model conditioned on disease via a single projected virtual token.
-
-    The BioLinkBERT disease embedding is projected to Qwen's hidden size and
-    inserted at the position of the disease name in the prompt template:
-
-        [prefix_embeds | disease_virtual_token | middle_embeds | projected event embs | EOS]
-
-    where prefix = PROMPT_PREFIX = "Please predict disease "
-    and   middle = PROMPT_MIDDLE = " based on the following events.\\nStart of medical events:"
-
-    The text prefix/middle/EOS embeddings are pre-computed once at init time from the
-    frozen Qwen embedding table and stored as buffers — no embed_fn calls in forward.
-
-    Qwen's own self-attention at every layer then lets:
-      • each event attend to the disease token with an event-specific weight
-      • the disease token attend to all events (bidirectional within each layer)
-
-    Interpretability: after inference, extract Qwen's self-attention weights at
-    the disease token column (position = len(prefix_tokens)) to see which events
-    attended to disease most at each layer.
-
-    Trainable modules beyond Qwen LoRA:
-        bert_proj     Linear(bert_dim → qwen_dim)   no bias  (shared by events and disease)
-    """
-
-    def __init__(
-        self,
-        qwen_model: nn.Module,
-        bert_dim:   int,
-        qwen_dim:   int,
-        prefix_ids: torch.Tensor,   # (1, P1)  token ids for PROMPT_PREFIX
-        middle_ids: torch.Tensor,   # (1, P2)  token ids for PROMPT_MIDDLE
-    ):
-        super().__init__()
-        self.qwen      = qwen_model
-        self.bert_proj = nn.Linear(bert_dim, qwen_dim, bias=False)
-
-        nn.init.xavier_uniform_(self.bert_proj.weight)
-
-        # Pre-compute frozen text embeddings once; store as buffers so they
-        # move to the right device automatically and never appear in the forward graph.
-        embed_fn = qwen_model.get_input_embeddings()
-        with torch.no_grad():
-            self.register_buffer("prefix_embeds", embed_fn(prefix_ids).float())  # (1, P1, D)
-            self.register_buffer("middle_embeds", embed_fn(middle_ids).float())  # (1, P2, D)
-            eos_ids = torch.full((1, 1), EOS_TOKEN_ID, dtype=torch.long)
-            self.register_buffer("eos_embed",    embed_fn(eos_ids).float())       # (1,  1, D)
-
-    def forward(
-        self,
-        event_embs:    torch.Tensor,   # (B, N, 768)  float
-        event_mask:    torch.Tensor,   # (B, N)       long
-        disease_embs:  torch.Tensor,   # (B, 768)     float
-        compute_dtype: torch.dtype = torch.float32,
-    ) -> torch.Tensor:                 # (B, D_qwen)  L2-normalised embeddings
-        B      = event_embs.size(0)
-        device = event_embs.device
-
-        # 1. Project event embeddings to Qwen hidden size
-        ev_proj   = self.bert_proj(event_embs.to(compute_dtype))                     # (B, N, D)
-
-        # 2. Project disease embedding → virtual token (B, 1, D)
-        dis_token = self.bert_proj(disease_embs.to(compute_dtype)).unsqueeze(1)
-
-        # 3. Retrieve pre-computed text embeddings (registered buffers, frozen).
-        #    Sequence layout matches the prompt template:
-        #      "Please predict disease <DISEASE> based on the following events.
-        #       Start of medical events: <EVENTS>"
-        prefix = self.prefix_embeds.to(compute_dtype).expand(B, -1, -1)  # (B, P1, D)
-        middle = self.middle_embeds.to(compute_dtype).expand(B, -1, -1)  # (B, P2, D)
-        eos    = self.eos_embed.to(compute_dtype).expand(B, -1, -1)       # (B,  1, D)
-
-        # 4. Assemble: [prefix | disease_token | middle | events | EOS]
-        inputs_embeds = torch.cat([prefix, dis_token, middle, ev_proj, eos], dim=1)
-
-        P1 = prefix.size(1)
-        P2 = middle.size(1)
-        ones = lambda n: torch.ones(B, n, dtype=torch.long, device=device)
-        attention_mask = torch.cat(
-            [ones(P1), ones(1), ones(P2), event_mask, ones(1)], dim=1
-        )
-
-        # 5. Forward through Qwen (inputs_embeds bypasses embed_tokens)
-        out = self.qwen(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
-
-        # 6. Last-token pool (EOS) → L2 normalise
-        seq_lengths = attention_mask.sum(dim=1) - 1
-        batch_idx   = torch.arange(B, device=device)
-        emb = out.last_hidden_state[batch_idx, seq_lengths]
-        return F.normalize(emb.float(), p=2, dim=-1)
-
-    # ── Checkpoint helpers ────────────────────────────────────────────────────
-
-    def save_checkpoint(self, save_dir: Path):
-        save_dir.mkdir(parents=True, exist_ok=True)
-        raw_qwen = self.qwen.module if isinstance(self.qwen, DDP) else self.qwen
-        raw_qwen.save_pretrained(str(save_dir / "lora"))
-        torch.save(
-            {"bert_proj": self.bert_proj.state_dict()},
-            save_dir / "extra_modules.pt",
-        )
-        logger.info(f"  Saved checkpoint → {save_dir}")
-
-    @classmethod
-    def load_from_checkpoint(
-        cls,
-        save_dir:   Path,
-        qwen_base:  nn.Module,
-        bert_dim:   int,
-        qwen_dim:   int,
-        prefix_ids: torch.Tensor,
-        middle_ids: torch.Tensor,
-    ) -> "DiseaseAwareEHREncoder":
-        qwen_lora = PeftModel.from_pretrained(qwen_base, str(save_dir / "lora"))
-        encoder   = cls(qwen_lora, bert_dim, qwen_dim, prefix_ids, middle_ids)
-        extra     = torch.load(save_dir / "extra_modules.pt", map_location="cpu")
-        encoder.bert_proj.load_state_dict(extra["bert_proj"])
-        return encoder
-
-
 # ── Model setup ───────────────────────────────────────────────────────────────
 
 def load_qwen(args):
@@ -648,31 +525,29 @@ def build_encoder(qwen_model, tokenizer, args) -> DiseaseAwareEHREncoder:
         PROMPT_MIDDLE, add_special_tokens=False, return_tensors="pt"
     )["input_ids"]  # (1, P2)
 
-    encoder  = DiseaseAwareEHREncoder(
+    dtype = (
+        torch.bfloat16 if args.bf16 else
+        torch.float16  if args.fp16 else
+        torch.float32
+    )
+    encoder = DiseaseAwareEHREncoder(
         qwen_model = qwen_model,
         bert_dim   = BERT_DIM,
         qwen_dim   = qwen_dim,
         prefix_ids = prefix_ids,
         middle_ids = middle_ids,
+        dtype      = dtype,
     )
     logger.info(
         f"  Prompt template: {repr(PROMPT_PREFIX)} <DISEASE> {repr(PROMPT_MIDDLE)} <EVENTS>"
     )
-    logger.info(f"  bert_proj Linear({BERT_DIM}→{qwen_dim}) shared by events and disease")
-
-    compute_dtype = (
-        torch.bfloat16 if args.bf16 else
-        torch.float16  if args.fp16 else
-        torch.float32
-    )
-    if compute_dtype != torch.float32:
-        encoder.bert_proj.to(compute_dtype)
+    logger.info(f"  Projection MLP: Linear({BERT_DIM}→{BERT_DIM}) → GELU → Linear({BERT_DIM}→{qwen_dim})  dtype={dtype}")
 
     total     = sum(p.numel() for p in encoder.parameters())
     trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
     logger.info(f"  Total encoder trainable params: {trainable:,} / {total:,} "
                 f"({100 * trainable / total:.2f}%)")
-    return encoder, compute_dtype
+    return encoder
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
@@ -743,7 +618,6 @@ def evaluate_ddp(
     val_index:        LazyDataIndex,
     disease_emb_dict: dict[str, torch.Tensor],
     device:           torch.device,
-    compute_dtype:    torch.dtype,
     args,
     rank:             int,
     world_size:       int,
@@ -822,7 +696,6 @@ def evaluate_ddp(
                 batch["event_embs"],
                 batch["event_mask"],
                 batch["disease_embs"],
-                compute_dtype=compute_dtype,
             ).cpu()
         )
     n_my = len(my_triple_idx)
@@ -903,7 +776,6 @@ def parse_args():
     p.add_argument("--log_steps",    type=int,   default=10)
 
     # Loss / Eval
-    p.add_argument("--triplet_margin",           type=float, default=0.5)
     p.add_argument("--n_eval_triplets_per_task", type=int,   default=100)
     p.add_argument("--eval_batch_size",          type=int,   default=32)
     p.add_argument("--pad_to_num_events",        type=int,   default=None,
@@ -1012,12 +884,15 @@ def main():
         logger.info(f"Loading checkpoint from {args.checkpoint}")
         qwen_model.config.use_cache = False
         qwen_lora = PeftModel.from_pretrained(qwen_model, str(Path(args.checkpoint) / "lora"))
-        encoder, compute_dtype = build_encoder(qwen_lora, tokenizer, args)
+        encoder = build_encoder(qwen_lora, tokenizer, args)
         extra = torch.load(Path(args.checkpoint) / "extra_modules.pt", map_location="cpu")
-        encoder.bert_proj.load_state_dict(extra["bert_proj"])
+        encoder.bert_proj_1.load_state_dict(extra["bert_proj_1"])
+        encoder.bert_proj_2.load_state_dict(extra["bert_proj_2"])
+        if "input_norm" in extra:
+            encoder.input_norm.load_state_dict(extra["input_norm"])
     else:
         qwen_lora = setup_lora(qwen_model, args)
-        encoder, compute_dtype = build_encoder(qwen_lora, tokenizer, args)
+        encoder = build_encoder(qwen_lora, tokenizer, args)
 
     encoder = encoder.to(device)
 
@@ -1040,7 +915,7 @@ def main():
         val_index = LazyDataIndex(args.val_data_paths, args.val_split, lookup)
         val_acc = evaluate_ddp(
             encoder, val_index, disease_emb_dict,
-            device, compute_dtype, args, rank, world_size, is_ddp,
+            device, args, rank, world_size, is_ddp,
         )
         if rank == 0:
             logger.info(f"Eval triplet accuracy: {val_acc:.4f}")
@@ -1087,13 +962,16 @@ def main():
         return max(0.0, 1.0 - progress)
 
     scheduler   = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    loss_module = BatchAllTripletLoss(model=None, margin=args.triplet_margin)
+    loss_module = BatchHardSoftMarginTripletLoss(
+        model=None,
+        distance_metric=BatchHardTripletLossDistanceFunction.cosine_distance,
+    )
 
     if rank == 0:
         logger.info(f"Training: {args.epochs} epochs, "
                     f"{n_batches_per_epoch} batches/epoch, "
                     f"{total_opt_steps} optimizer steps total")
-        logger.info(f"BatchAllTripletLoss margin={args.triplet_margin}")
+        logger.info("BatchHardSoftMarginTripletLoss (soft margin, no manual margin needed)")
 
     # ── Training DataLoader (created once; workers persist across epochs) ─────
     train_loader = DataLoader(
@@ -1143,9 +1021,8 @@ def main():
                     batch["event_embs"],
                     batch["event_mask"],
                     batch["disease_embs"],
-                    compute_dtype=compute_dtype,
                 )
-                loss = loss_module.batch_all_triplet_loss(labels_t, emb)
+                loss = loss_module.batch_hard_triplet_soft_margin_loss(labels_t, emb)
                 loss = loss / args.grad_accum
                 loss.backward()
 
@@ -1190,7 +1067,7 @@ def main():
                 dist.barrier()
             val_acc = evaluate_ddp(
                 encoder, val_index, disease_emb_dict,
-                device, compute_dtype, args, rank, world_size, is_ddp,
+                device, args, rank, world_size, is_ddp,
             )
             if rank == 0:
                 logger.info(f"  val triplet accuracy: {val_acc:.4f}")  # noqa: F821
