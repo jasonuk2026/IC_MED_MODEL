@@ -25,15 +25,13 @@ Usage (single node, 4 GPUs)
       --data_paths     EHRSHOT_ASSETS/llm_data_v6/new_hypertension/train.parquet \\
       --val_data_paths EHRSHOT_ASSETS/llm_data_v6/new_hypertension/val.parquet \\
       --bert_embeddings data/biolinkbert_embeddings/embeddings.npy \\
-      --bert_model     michiyasunaga/BioLinkBERT-base \\
       --bf16 --flash_attn
 
 Single GPU
 ──────────
   python train_embedding_disease_cond_v2.py \\
       --data_paths EHRSHOT_ASSETS/llm_data_v6/new_hypertension/train.parquet \\
-      --bert_embeddings data/biolinkbert_embeddings/embeddings.npy \\
-      --bert_model michiyasunaga/BioLinkBERT-base
+      --bert_embeddings data/biolinkbert_embeddings/embeddings.npy
 
 NOTE: QLoRA (--qlora) is incompatible with multi-GPU DDP.
 """
@@ -53,8 +51,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 
@@ -63,7 +59,6 @@ from utils.async_dataloader import AsyncDataLoader
 
 import pandas as pd
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig, logging as hf_logging
-from extract_biolinkbert_embeddings import mean_pool_no_special
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training, PeftModel
 from sentence_transformers.losses import BatchHardSoftMarginTripletLoss, BatchHardTripletLossDistanceFunction
 from model import DiseaseAwareEHREncoder
@@ -89,6 +84,10 @@ TASK_2_DISEASE_NAME = {
     "new_lupus":          "systemic lupus erythematosus",
     "new_acutemi":        "acute myocardial infarction",
 }
+
+# Stable integer index for each task — used as input to the model instead of
+# disease embeddings.  Sorted alphabetically so the mapping is reproducible.
+TASK_2_IDX: dict[str, int] = {t: i for i, t in enumerate(sorted(TASK_2_DISEASE_NAME))}
 
 BERT_DIM    = 768     # BioLinkBERT-base hidden size
 EOS_TOKEN_ID = 151643  # Qwen3 <|endoftext|> — pooling anchor token
@@ -156,51 +155,6 @@ class EmbeddingStore:
         logger.info(f"  Embeddings shape: {self.embeddings.shape}  dtype: {self.embeddings.dtype}")
 
 
-# ── BioLinkBERT disease encoder ───────────────────────────────────────────────
-
-def encode_disease_names(
-    bert_model_path: str,
-    disease_names: list[str],
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    """Encode disease name strings with BioLinkBERT (mean pool, no special tokens).
-
-    Returns {disease_name: tensor(768,)} on CPU, float32.
-    """
-    logger.info(f"Encoding {len(disease_names)} disease names with BioLinkBERT "
-                f"from {bert_model_path} …")
-
-    bert_tok = AutoTokenizer.from_pretrained(bert_model_path, local_files_only=True)
-    bert_mod = AutoModel.from_pretrained(bert_model_path, local_files_only=True)
-    bert_mod = bert_mod.to(device).eval()
-
-    special_ids: set[int] = set(bert_tok.all_special_ids)
-
-    result: dict[str, torch.Tensor] = {}
-    with torch.no_grad():
-        for name in disease_names:
-            enc = bert_tok(
-                name, return_tensors="pt", padding=False,
-                truncation=False,
-            )
-            enc = {k: v.to(device) for k, v in enc.items()}
-            out = bert_mod(**enc)
-            emb = mean_pool_no_special(
-                out.last_hidden_state,
-                enc["input_ids"],
-                enc["attention_mask"],
-                special_ids,
-            )   # (1, 768)
-            result[name] = emb[0].cpu().float()
-
-    bert_mod.cpu()
-    del bert_mod
-    torch.cuda.empty_cache()
-
-    logger.info("  Disease name encoding complete.")
-    return result
-
-
 # ── Lazy data index ───────────────────────────────────────────────────────────
 
 class LazyDataIndex:
@@ -266,15 +220,12 @@ class LazyDataIndex:
                         f"{task_counts[task] - pos_counts[task]} neg")
 
     def read_rows(self, entries: list[tuple[int, int]]) -> list[dict]:
-        """Return pre-loaded event IDs and task for a list of (file_idx, abs_row) entries."""
+        """Return pre-loaded event IDs and task index for a list of (file_idx, abs_row) entries."""
         return [
             {
-                "event_ids":    self._preloaded[(fi, ar)][1],
-                "task":         self._preloaded[(fi, ar)][0],
-                "disease_name": TASK_2_DISEASE_NAME.get(
-                    self._preloaded[(fi, ar)][0],
-                    self._preloaded[(fi, ar)][0],
-                ),
+                "event_ids": self._preloaded[(fi, ar)][1],
+                "task":      self._preloaded[(fi, ar)][0],
+                "task_idx":  TASK_2_IDX[self._preloaded[(fi, ar)][0]],
             }
             for fi, ar in entries
         ]
@@ -298,8 +249,7 @@ class EpochShuffledDataset(Dataset):
 
     def __init__(
         self,
-        index:            LazyDataIndex,
-        disease_emb_dict: dict[str, torch.Tensor],
+        index:             LazyDataIndex,
         batch_size:          int,
         rank:                int = 0,
         world_size:          int = 1,
@@ -309,7 +259,6 @@ class EpochShuffledDataset(Dataset):
         if batch_size < 4 or batch_size % 2 != 0:
             raise ValueError(f"batch_size must be even and ≥4, got {batch_size}")
         self.index              = index
-        self.disease_emb_dict   = disease_emb_dict
         self.batch_size         = batch_size
         self.half               = batch_size // 2
         self.rank               = rank
@@ -389,21 +338,20 @@ class EpochShuffledDataset(Dataset):
         rows       = self.index.read_rows(entries)
         embeddings = self.index.store.embeddings
 
-        embs_list:    list[np.ndarray]   = []
-        disease_list: list[torch.Tensor] = []
+        embs_list:     list[np.ndarray] = []
+        task_idx_list: list[int]        = []
         for row in rows:
             eids = row["event_ids"]
             if self.pad_to_num_events is not None:
                 eids = eids[:self.pad_to_num_events]
             if not eids:
-                # Fallback: zero vector for empty timelines
                 bert_dim = embeddings.shape[1]
                 embs_list.append(np.zeros((1, bert_dim), dtype=np.float32))
             else:
                 embs_list.append(
                     np.stack([embeddings[eid] for eid in eids]).astype(np.float32)
                 )
-            disease_list.append(self.disease_emb_dict[row["disease_name"]])
+            task_idx_list.append(row["task_idx"])
 
         B        = len(embs_list)
         max_e    = self.pad_to_num_events if self.pad_to_num_events is not None \
@@ -417,10 +365,10 @@ class EpochShuffledDataset(Dataset):
             mask[i, :n]   = 1
 
         return {
-            "event_embs":   torch.from_numpy(padded),
-            "event_mask":   torch.from_numpy(mask),
-            "disease_embs": torch.stack(disease_list),
-            "labels":       torch.tensor(labels, dtype=torch.long),
+            "event_embs": torch.from_numpy(padded),
+            "event_mask": torch.from_numpy(mask),
+            "task_idxs":  torch.tensor(task_idx_list, dtype=torch.long),
+            "labels":     torch.tensor(labels, dtype=torch.long),
         }
 
 
@@ -479,12 +427,44 @@ def setup_lora(model, args):
     return model
 
 
+def build_task_prefix_ids(tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build left-padded prefix token ids and attention masks for all tasks.
+
+    Each task's prefix is  PROMPT_PREFIX + disease_name,
+    e.g. "Please predict disease hypertension".
+    All prefixes are left-padded to the same length (max across tasks) using
+    the tokenizer's pad_token_id so that torch.compile sees static shapes.
+
+    Returns:
+        task_prefix_ids  : (num_tasks, max_P)  long  — left-padded token ids
+        task_prefix_mask : (num_tasks, max_P)  long  — 0=pad, 1=real token
+    """
+    tasks_sorted  = sorted(TASK_2_DISEASE_NAME)  # stable order matching TASK_2_IDX
+    pad_id        = tokenizer.pad_token_id
+
+    all_ids: list[list[int]] = []
+    for task in tasks_sorted:
+        prefix_str = PROMPT_PREFIX + TASK_2_DISEASE_NAME[task]
+        ids = tokenizer(prefix_str, add_special_tokens=False)["input_ids"]
+        all_ids.append(ids)
+        logger.info(f"  Task prefix [{task}]: {repr(prefix_str)}  ({len(ids)} tokens)")
+
+    max_len = max(len(ids) for ids in all_ids)
+    task_prefix_ids  = torch.full((len(tasks_sorted), max_len), pad_id, dtype=torch.long)
+    task_prefix_mask = torch.zeros((len(tasks_sorted), max_len), dtype=torch.long)
+    for i, ids in enumerate(all_ids):
+        n = len(ids)
+        task_prefix_ids[i,  max_len - n:] = torch.tensor(ids, dtype=torch.long)
+        task_prefix_mask[i, max_len - n:] = 1
+
+    logger.info(f"  Padded prefix length: {max_len} tokens (left-padded with pad_token_id={pad_id})")
+    return task_prefix_ids, task_prefix_mask
+
+
 def build_encoder(qwen_model, tokenizer, args) -> DiseaseAwareEHREncoder:
     qwen_dim = qwen_model.config.hidden_size
 
-    prefix_ids = tokenizer(
-        PROMPT_PREFIX, add_special_tokens=False, return_tensors="pt"
-    )["input_ids"]
+    task_prefix_ids, task_prefix_mask = build_task_prefix_ids(tokenizer)
     middle_ids = tokenizer(
         PROMPT_MIDDLE, add_special_tokens=False, return_tensors="pt"
     )["input_ids"]
@@ -495,15 +475,16 @@ def build_encoder(qwen_model, tokenizer, args) -> DiseaseAwareEHREncoder:
         torch.float32
     )
     encoder = DiseaseAwareEHREncoder(
-        qwen_model = qwen_model,
-        bert_dim   = BERT_DIM,
-        qwen_dim   = qwen_dim,
-        prefix_ids = prefix_ids,
-        middle_ids = middle_ids,
-        dtype      = dtype,
+        qwen_model       = qwen_model,
+        bert_dim         = BERT_DIM,
+        qwen_dim         = qwen_dim,
+        task_prefix_ids  = task_prefix_ids,
+        task_prefix_mask = task_prefix_mask,
+        middle_ids       = middle_ids,
+        dtype            = dtype,
     )
     logger.info(
-        f"  Prompt template: {repr(PROMPT_PREFIX)} <DISEASE> {repr(PROMPT_MIDDLE)} <EVENTS>"
+        f"  Prompt template: [{repr(PROMPT_PREFIX)}<disease_name>]{repr(PROMPT_MIDDLE)}<events>"
     )
     logger.info(f"  Projection MLP: Linear({BERT_DIM}→{BERT_DIM}) → GELU → Linear({BERT_DIM}→{qwen_dim})  dtype={dtype}")
 
@@ -523,12 +504,10 @@ class EvalBatchDataset(Dataset):
         self,
         entries:           list[tuple[int, int]],
         index:             LazyDataIndex,
-        disease_emb_dict:  dict[str, torch.Tensor],
         batch_size:        int,
         pad_to_num_events: int | None = None,
     ):
         self.index             = index
-        self.disease_emb_dict  = disease_emb_dict
         self.pad_to_num_events = pad_to_num_events
         self._batches: list[list[tuple[int, int]]] = [
             entries[i : i + batch_size]
@@ -542,8 +521,8 @@ class EvalBatchDataset(Dataset):
         rows       = self.index.read_rows(self._batches[j])
         embeddings = self.index.store.embeddings
 
-        embs_list:    list[np.ndarray]   = []
-        disease_list: list[torch.Tensor] = []
+        embs_list:     list[np.ndarray] = []
+        task_idx_list: list[int]        = []
         for row in rows:
             eids = row["event_ids"]
             if self.pad_to_num_events is not None:
@@ -555,7 +534,7 @@ class EvalBatchDataset(Dataset):
                 embs_list.append(
                     np.stack([embeddings[eid] for eid in eids]).astype(np.float32)
                 )
-            disease_list.append(self.disease_emb_dict[row["disease_name"]])
+            task_idx_list.append(row["task_idx"])
 
         B        = len(embs_list)
         max_e    = self.pad_to_num_events if self.pad_to_num_events is not None \
@@ -569,22 +548,21 @@ class EvalBatchDataset(Dataset):
             mask[i, :n]   = 1
 
         return {
-            "event_embs":   torch.from_numpy(padded),
-            "event_mask":   torch.from_numpy(mask),
-            "disease_embs": torch.stack(disease_list),
+            "event_embs": torch.from_numpy(padded),
+            "event_mask": torch.from_numpy(mask),
+            "task_idxs":  torch.tensor(task_idx_list, dtype=torch.long),
         }
 
 
 @torch.inference_mode()
 def evaluate_ddp(
-    encoder:          DiseaseAwareEHREncoder,
-    val_index:        LazyDataIndex,
-    disease_emb_dict: dict[str, torch.Tensor],
-    device:           torch.device,
+    encoder:    DiseaseAwareEHREncoder,
+    val_index:  LazyDataIndex,
+    device:     torch.device,
     args,
-    rank:             int,
-    world_size:       int,
-    is_ddp:           bool,
+    rank:       int,
+    world_size: int,
+    is_ddp:     bool,
 ) -> tuple[float, dict[str, float]]:
     """Triplet accuracy distributed across all ranks.
 
@@ -645,7 +623,7 @@ def evaluate_ddp(
         [negatives_e[t] for t in my_triple_idx]
     )
 
-    eval_ds = EvalBatchDataset(my_entries, val_index, disease_emb_dict,
+    eval_ds = EvalBatchDataset(my_entries, val_index,
                                args.eval_batch_size, args.pad_to_num_events)
     eval_dl = DataLoader(
         eval_ds,
@@ -667,7 +645,7 @@ def evaluate_ddp(
             raw_encoder(
                 batch["event_embs"],
                 batch["event_mask"],
-                batch["disease_embs"],
+                batch["task_idxs"],
             ).cpu()
         )
 
@@ -737,9 +715,7 @@ def parse_args():
                    help="Validation parquet files.")
     p.add_argument("--val_split",      default="val", choices=["train", "val", "test"])
 
-    # BioLinkBERT
-    p.add_argument("--bert_model",      default="michiyasunaga/BioLinkBERT-base",
-                   help="BioLinkBERT model path — used to encode disease names at startup.")
+    # BioLinkBERT event embeddings
     p.add_argument("--bert_embeddings", required=True,
                    help="embeddings.npy produced by extract_biolinkbert_embeddings.py.")
 
@@ -840,22 +816,8 @@ def main():
                    base_path=os.path.dirname(os.path.abspath(__file__)))
         logger.info(f"wandb run: {wandb_run.url}")
 
-    # ── BioLinkBERT embeddings (shared read-only mmap) ────────────────────────
+    # ── BioLinkBERT event embeddings (shared read-only mmap) ─────────────────
     store = EmbeddingStore(args.bert_embeddings)
-
-    # ── Pre-compute disease name embeddings (rank 0 then broadcast) ──────────
-    disease_names  = list(TASK_2_DISEASE_NAME.values())
-    if rank == 0:
-        disease_emb_dict = encode_disease_names(args.bert_model, disease_names, device)
-        disease_emb_tensor = torch.stack([disease_emb_dict[n] for n in disease_names])
-    else:
-        disease_emb_tensor = torch.zeros(len(disease_names), BERT_DIM, dtype=torch.float32)
-
-    if is_ddp:
-        disease_emb_tensor = disease_emb_tensor.to(device)
-        dist.broadcast(disease_emb_tensor, src=0)
-        disease_emb_tensor = disease_emb_tensor.cpu()
-        disease_emb_dict   = {n: disease_emb_tensor[i] for i, n in enumerate(disease_names)}
 
     # ── Build Qwen model + tokenizer ───────────────────────────────────────────
     if rank == 0:
@@ -893,7 +855,7 @@ def main():
             raise ValueError("--eval_only requires --val_data_paths.")
         val_index = LazyDataIndex(args.val_data_paths, args.val_split, store)
         val_acc, val_task_acc = evaluate_ddp(
-            encoder, val_index, disease_emb_dict,
+            encoder, val_index,
             device, args, rank, world_size, is_ddp,
         )
         if rank == 0:
@@ -915,7 +877,6 @@ def main():
     train_index = LazyDataIndex(args.data_paths, "train", store)
     train_ds    = EpochShuffledDataset(
         index=train_index,
-        disease_emb_dict=disease_emb_dict,
         batch_size=args.batch_size,
         rank=rank,
         world_size=world_size,
@@ -1002,7 +963,7 @@ def main():
                 emb = encoder(
                     batch["event_embs"],
                     batch["event_mask"],
-                    batch["disease_embs"],
+                    batch["task_idxs"],
                 )
                 loss = loss_module.batch_hard_triplet_soft_margin_loss(labels_t, emb)
                 loss = loss / args.grad_accum
@@ -1048,7 +1009,7 @@ def main():
             if is_ddp:
                 dist.barrier()
             val_acc, val_task_acc = evaluate_ddp(
-                encoder, val_index, disease_emb_dict,
+                encoder, val_index,
                 device, args, rank, world_size, is_ddp,
             )
             if rank == 0:

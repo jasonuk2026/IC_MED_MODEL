@@ -4,16 +4,27 @@ model.py
 DiseaseAwareEHREncoder — Qwen3-style disease-conditioned patient encoder.
 
 Architecture per sample:
-  event_embs   (B, N, 768)  ──► input_norm ──► bert_proj_1(768→768) ──► GELU ──► bert_proj_2(768→D) ──► ev_proj   (B, N, D)
-  disease_embs (B, 768)     ──► input_norm ──► bert_proj_1(768→768) ──► GELU ──► bert_proj_2(768→D) ──► dis_token (B, 1, D)
+  event_embs  (B, N, 768)  ──► input_norm ──► bert_proj_1(768→768) ──► GELU ──► bert_proj_2(768→D) ──► ev_proj (B, N, D)
 
-  Qwen input: [prefix | dis_token | middle | ev_proj | EOS]
+  Per-task prefix string: "Please predict disease <name>"
+  Tokenised with the Qwen tokenizer, left-padded to a uniform length across all
+  tasks so that torch.compile sees static shapes.  The padded token ids are
+  embedded once at init via embed_tokens and stored as a (num_tasks, max_P, D)
+  buffer — no BioLinkBERT disease projection needed.
+
+  Qwen input sequence:
+    [PAD…PAD | prefix+disease tokens | middle tokens | projected events | EOS]
+
+  where middle = " based on the following events.\nStart of medical events:"
+
+  attention_mask = 0 for pad positions, 1 everywhere else.
+
   Pool: last token (EOS) → L2 normalise
 
-Norm philosophy (Qwen3 style): normalise *before* every neural-network layer,
-not after.  input_norm (RMSNorm over bert_dim=768) is applied to the raw
-BioLinkBERT embeddings before they enter the projection MLP.  No norm is
-applied after any linear layer.
+Trainable modules beyond Qwen LoRA:
+    input_norm   RMSNorm(bert_dim)               (stabilises event MLP input)
+    bert_proj_1  Linear(bert_dim → bert_dim)     (hidden)
+    bert_proj_2  Linear(bert_dim → qwen_dim)     (up-project)
 """
 
 import logging
@@ -31,35 +42,34 @@ EOS_TOKEN_ID = 151643  # Qwen3 <|endoftext|>
 
 
 class DiseaseAwareEHREncoder(nn.Module):
-    """Qwen model conditioned on disease via a single projected virtual token.
+    """Qwen model conditioned on disease via per-task prefix token embeddings.
 
-    The BioLinkBERT disease embedding is projected to Qwen's hidden size and
-    inserted at the position of the disease name in the prompt template:
+    Each task has a fixed prompt prefix "Please predict disease <name>" that is
+    tokenised and embedded once at construction time.  All prefixes are
+    left-padded to the same length (max across tasks) so that the sequence
+    length is static — required for torch.compile with static shapes.
 
-        [prefix_embeds | disease_virtual_token | middle_embeds | projected event embs | EOS]
+    forward() accepts a task_idx tensor (B,) of integer task indices and looks
+    up the corresponding prefix embeddings and attention masks from buffers.
 
-    where prefix = PROMPT_PREFIX = "Please predict disease "
-    and   middle = PROMPT_MIDDLE = " based on the following events.\\nStart of medical events:"
+    Sequence layout:
+        [PAD…PAD | "Please predict disease <name>" | middle | events | EOS]
 
-    Norm order (Qwen3 style):
-        input_norm (RMSNorm over bert_dim) is applied to event_embs and
-        disease_embs *before* the projection MLP.  No normalisation is applied
-        after any linear layer.
-
-    Trainable modules beyond Qwen LoRA:
-        input_norm   RMSNorm(bert_dim)                       (stabilises MLP input)
-        bert_proj_1  Linear(bert_dim → bert_dim)  no bias    (hidden)
-        bert_proj_2  Linear(bert_dim → qwen_dim)  no bias    (up-project; shared by events and disease)
+    Trainable modules (beyond Qwen LoRA):
+        input_norm   RMSNorm(bert_dim)
+        bert_proj_1  Linear(bert_dim → bert_dim, no bias)
+        bert_proj_2  Linear(bert_dim → qwen_dim, no bias)
     """
 
     def __init__(
         self,
-        qwen_model: nn.Module,
-        bert_dim:   int,
-        qwen_dim:   int,
-        prefix_ids: torch.Tensor,               # (1, P1)  token ids for PROMPT_PREFIX
-        middle_ids: torch.Tensor,               # (1, P2)  token ids for PROMPT_MIDDLE
-        dtype:      torch.dtype = torch.float32,
+        qwen_model:       nn.Module,
+        bert_dim:         int,
+        qwen_dim:         int,
+        task_prefix_ids:  torch.Tensor,   # (num_tasks, max_P)  left-padded token ids
+        task_prefix_mask: torch.Tensor,   # (num_tasks, max_P)  0=pad, 1=real
+        middle_ids:       torch.Tensor,   # (1, P2)
+        dtype:            torch.dtype = torch.float32,
     ):
         super().__init__()
         self.qwen        = qwen_model
@@ -71,58 +81,54 @@ class DiseaseAwareEHREncoder(nn.Module):
         nn.init.xavier_uniform_(self.bert_proj_1.weight)
         nn.init.xavier_uniform_(self.bert_proj_2.weight)
 
-        # Pre-compute frozen text embeddings once; store as buffers so they
-        # move to the right device automatically and never appear in the forward graph.
         embed_fn = qwen_model.get_input_embeddings()
         with torch.no_grad():
-            self.register_buffer("prefix_embeds", embed_fn(prefix_ids).to(dtype))  # (1, P1, D)
+            # Per-task prefix embeddings — frozen, derived from Qwen embed_tokens.
+            # Shape: (num_tasks, max_P, D)
+            self.register_buffer(
+                "task_prefix_embeds",
+                embed_fn(task_prefix_ids).to(dtype),
+            )
+            # Attention mask for prefix positions (0 = pad, 1 = real token).
+            # Shape: (num_tasks, max_P)
+            self.register_buffer("task_prefix_mask", task_prefix_mask.long())
+
             self.register_buffer("middle_embeds", embed_fn(middle_ids).to(dtype))  # (1, P2, D)
             eos_ids = torch.full((1, 1), EOS_TOKEN_ID, dtype=torch.long)
             self.register_buffer("eos_embed",    embed_fn(eos_ids).to(dtype))       # (1,  1, D)
 
     def forward(
         self,
-        event_embs:   torch.Tensor,   # (B, N, bert_dim)
-        event_mask:   torch.Tensor,   # (B, N)            long
-        disease_embs: torch.Tensor,   # (B, bert_dim)
-    ) -> torch.Tensor:                # (B, qwen_dim)  L2-normalised embeddings
+        event_embs: torch.Tensor,   # (B, N, bert_dim)
+        event_mask: torch.Tensor,   # (B, N)            long
+        task_idx:   torch.Tensor,   # (B,)              long  — integer task indices
+    ) -> torch.Tensor:              # (B, qwen_dim)  L2-normalised embeddings
         B      = event_embs.size(0)
         device = event_embs.device
 
-        # Cast inputs to the module's compute dtype
-        event_embs   = event_embs.to(self.dtype)
-        disease_embs = disease_embs.to(self.dtype)
+        event_embs = event_embs.to(self.dtype)
 
-        # 1. RMSNorm before MLP (Qwen3 style: norm before any linear layer)
-        ev_normed  = self.input_norm(event_embs)    # (B, N, bert_dim)
-        dis_normed = self.input_norm(disease_embs)  # (B, bert_dim)
+        # 1. RMSNorm → MLP projection for events (Qwen3-style: norm before linear)
+        ev_normed = self.input_norm(event_embs)                                      # (B, N, bert_dim)
+        ev_proj   = self.bert_proj_2(F.gelu(self.bert_proj_1(ev_normed)))            # (B, N, qwen_dim)
 
-        # 2. Project: RMSNorm → Linear → GELU → Linear
-        ev_proj   = self.bert_proj_2(F.gelu(self.bert_proj_1(ev_normed)))             # (B, N, qwen_dim)
-        dis_token = self.bert_proj_2(F.gelu(self.bert_proj_1(dis_normed))).unsqueeze(1)  # (B, 1, qwen_dim)
+        # 2. Per-task prefix embeddings and masks (looked up from buffers)
+        prefix      = self.task_prefix_embeds[task_idx]   # (B, max_P, D)
+        prefix_mask = self.task_prefix_mask[task_idx]     # (B, max_P)
+        middle      = self.middle_embeds.expand(B, -1, -1)
+        eos         = self.eos_embed.expand(B, -1, -1)
 
-        # 3. Retrieve pre-computed text embeddings (registered buffers, frozen).
-        #    Sequence layout matches the prompt template:
-        #      "Please predict disease <DISEASE> based on the following events.
-        #       Start of medical events: <EVENTS>"
-        prefix = self.prefix_embeds.expand(B, -1, -1)  # (B, P1, D)
-        middle = self.middle_embeds.expand(B, -1, -1)  # (B, P2, D)
-        eos    = self.eos_embed.expand(B, -1, -1)       # (B,  1, D)
+        # 3. Assemble: [prefix+disease | middle | events | EOS]
+        inputs_embeds = torch.cat([prefix, middle, ev_proj, eos], dim=1)
 
-        # 4. Assemble: [prefix | disease_token | middle | events | EOS]
-        inputs_embeds = torch.cat([prefix, dis_token, middle, ev_proj, eos], dim=1)
-
-        P1 = prefix.size(1)
         P2 = middle.size(1)
         ones = lambda n: torch.ones(B, n, dtype=torch.long, device=device)
-        attention_mask = torch.cat(
-            [ones(P1), ones(1), ones(P2), event_mask, ones(1)], dim=1
-        )
+        attention_mask = torch.cat([prefix_mask, ones(P2), event_mask, ones(1)], dim=1)
 
-        # 5. Forward through Qwen (inputs_embeds bypasses embed_tokens)
+        # 4. Forward through Qwen (inputs_embeds bypasses embed_tokens)
         out = self.qwen(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
 
-        # 6. Last-token pool (EOS) → L2 normalise
+        # 5. Last-token pool (EOS position) → L2 normalise
         seq_lengths = attention_mask.sum(dim=1) - 1
         batch_idx   = torch.arange(B, device=device)
         emb = out.last_hidden_state[batch_idx, seq_lengths]
@@ -135,9 +141,11 @@ class DiseaseAwareEHREncoder(nn.Module):
         raw_qwen = self.qwen.module if isinstance(self.qwen, DDP) else self.qwen
         raw_qwen.save_pretrained(str(save_dir / "lora"))
         torch.save(
-            {"bert_proj_1": self.bert_proj_1.state_dict(),
-             "bert_proj_2": self.bert_proj_2.state_dict(),
-             "input_norm":  self.input_norm.state_dict()},
+            {
+                "bert_proj_1": self.bert_proj_1.state_dict(),
+                "bert_proj_2": self.bert_proj_2.state_dict(),
+                "input_norm":  self.input_norm.state_dict(),
+            },
             save_dir / "extra_modules.pt",
         )
         logger.info(f"  Saved checkpoint → {save_dir}")
@@ -145,17 +153,22 @@ class DiseaseAwareEHREncoder(nn.Module):
     @classmethod
     def load_from_checkpoint(
         cls,
-        save_dir:   Path,
-        qwen_base:  nn.Module,
-        bert_dim:   int,
-        qwen_dim:   int,
-        prefix_ids: torch.Tensor,
-        middle_ids: torch.Tensor,
-        dtype:      torch.dtype = torch.float32,
+        save_dir:         Path,
+        qwen_base:        nn.Module,
+        bert_dim:         int,
+        qwen_dim:         int,
+        task_prefix_ids:  torch.Tensor,
+        task_prefix_mask: torch.Tensor,
+        middle_ids:       torch.Tensor,
+        dtype:            torch.dtype = torch.float32,
     ) -> "DiseaseAwareEHREncoder":
         qwen_lora = PeftModel.from_pretrained(qwen_base, str(save_dir / "lora"))
-        encoder   = cls(qwen_lora, bert_dim, qwen_dim, prefix_ids, middle_ids, dtype=dtype)
-        extra     = torch.load(save_dir / "extra_modules.pt", map_location="cpu")
+        encoder   = cls(
+            qwen_lora, bert_dim, qwen_dim,
+            task_prefix_ids, task_prefix_mask, middle_ids,
+            dtype=dtype,
+        )
+        extra = torch.load(save_dir / "extra_modules.pt", map_location="cpu")
         encoder.bert_proj_1.load_state_dict(extra["bert_proj_1"])
         encoder.bert_proj_2.load_state_dict(extra["bert_proj_2"])
         if "input_norm" in extra:
