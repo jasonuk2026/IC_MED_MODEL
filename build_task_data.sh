@@ -1,0 +1,8 @@
+#!/bin/bash
+my_list=("new_hypertension" "new_hyperlipidemia" "new_pancan" "new_celiac" "new_lupus" "new_acutemi")
+
+for item in "${my_list[@]}"; do
+    echo "Processing: $item"
+    
+    python dataset/build_task_data.py --task "$item" --max_events 1000 --num_workers 32
+done
