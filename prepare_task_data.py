@@ -389,6 +389,9 @@ def main():
                              "(default: cpu_count)")
     parser.add_argument("--row_group_size", type=int, default=4096,
                         help="Rows per output parquet row group")
+    parser.add_argument("--splits", nargs="+", default=["train"],
+                        choices=["train", "val", "test"],
+                        help="Which splits to process (default: train only)")
     args = parser.parse_args()
 
     n_workers  = args.num_workers or mp.cpu_count()
@@ -403,7 +406,7 @@ def main():
     print(f"Workers: {n_workers}")
     print()
 
-    for split in SPLITS:
+    for split in args.splits:
         print(f"── {split} ─────────────────────────────")
         task_records: dict[str, list[dict]] = {}
 

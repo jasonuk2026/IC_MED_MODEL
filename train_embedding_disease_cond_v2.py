@@ -2,49 +2,47 @@
 """
 train_embedding_disease_cond_v2.py
 
-Disease-conditioned EHR embedding model — adapted for the v6 dataset format
-produced by dataset/build_task_data.py.
+Disease-conditioned EHR embedding model.
 
-Key differences from v1:
-- Input parquet schema: patient_id, prediction_time, label (string), label_type,
-  split, timeline (newline-delimited JSON), task_name, task_description,
-  num_events, sample_event_indices, oversample_copy_idx.
-- Each event JSON already contains an "embedding_idx" field pointing to the
-  corresponding row in embeddings.npy — no separate event_index.parquet lookup
-  needed.  --bert_index is therefore removed.
-- Label is a string ("0"/"1" for binary tasks).  Positive = int(float(label)) != 0.
-- Batch-level 1:1 pos/neg balance is enforced by construction in EpochShuffledDataset
-  (half positives + half negatives per batch), consistent with the approximate 1:1
-  ratio already produced by the data collection strategy.
+Train data: output of prepare_task_data.py
+    schema: task_idx (int16), label (int8), event_ids (list<int32>), source_row (int32)
+    Rows are pre-shuffled with guaranteed pos/neg ratio — no runtime sampling needed.
+    Sequential reads: each batch = batch_size consecutive rows from the shard.
+
+Eval data: output of dataset/build_eval_task_data.py
+    schema: patient_id (int64), task_idx (int16), label (int8), event_ids (list<int32>)
+    One row per labeled patient.  Triplet evaluation with patient-level constraints:
+      anchor and positive come from different patients,
+      anchor and negative come from different patients.
 
 Architecture / training loop are unchanged from v1.
 
 Usage (single node, 4 GPUs)
 ─────────────────────────────
   torchrun --nproc_per_node=4 train_embedding_disease_cond_v2.py \\
-      --data_paths     EHRSHOT_ASSETS/llm_data_v6/new_hypertension/train.parquet \\
-      --val_data_paths EHRSHOT_ASSETS/llm_data_v6/new_hypertension/val.parquet \\
-      --bert_embeddings data/biolinkbert_embeddings/embeddings.npy \\
+      --train_data_paths data/prepared/all/train/shard_*.parquet \\
+      --eval_data_paths  EHRSHOT_ASSETS/llm_eval_data/new_*/val.parquet \\
+      --bert_embeddings  data/biolinkbert_embeddings/embeddings.npy \\
       --bf16 --flash_attn
 
 Single GPU
 ──────────
   python train_embedding_disease_cond_v2.py \\
-      --data_paths EHRSHOT_ASSETS/llm_data_v6/new_hypertension/train.parquet \\
-      --bert_embeddings data/biolinkbert_embeddings/embeddings.npy
+      --train_data_paths data/prepared/all/train/shard_0.parquet \\
+      --eval_data_paths  EHRSHOT_ASSETS/llm_eval_data/new_*/val.parquet \\
+      --bert_embeddings  data/biolinkbert_embeddings/embeddings.npy
 
 NOTE: QLoRA (--qlora) is incompatible with multi-GPU DDP.
 """
 
 import os
 import math
-import json
 import random
 import logging
 import argparse
 from tqdm import tqdm
 from contextlib import nullcontext
-from collections import defaultdict, Counter
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -99,48 +97,6 @@ PROMPT_PREFIX = "Please predict disease "
 PROMPT_MIDDLE = " based on the following events.\nStart of medical events:"
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _is_positive(label_str) -> bool:
-    """Return True if label represents a positive sample.
-
-    Handles numeric strings ("0"/"1"), boolean strings ("True"/"False"),
-    and actual bool/int values.
-    """
-    if isinstance(label_str, bool):
-        return label_str
-    s = str(label_str).strip()
-    if s.lower() == "true":
-        return True
-    if s.lower() == "false":
-        return False
-    try:
-        return int(float(s)) != 0
-    except (ValueError, TypeError):
-        return False
-
-
-def _parse_timeline_event_ids(timeline: str) -> list[int]:
-    """Parse a newline-delimited timeline string and extract embedding_idx values.
-
-    Each line is a JSON object with an "embedding_idx" field (int).
-    Lines without "embedding_idx" or with null are skipped.
-    """
-    eids: list[int] = []
-    for line in timeline.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        eid = ev.get("embedding_idx")
-        if eid is not None:
-            eids.append(int(eid))
-    return eids
-
-
 # ── BioLinkBERT embeddings (read-only mmap) ───────────────────────────────────
 
 class EmbeddingStore:
@@ -156,234 +112,150 @@ class EmbeddingStore:
         logger.info(f"  Embeddings shape: {self.embeddings.shape}  dtype: {self.embeddings.dtype}")
 
 
-# ── Lazy data index ───────────────────────────────────────────────────────────
+# ── Shared collation helper ───────────────────────────────────────────────────
 
-class LazyDataIndex:
-    """Lightweight per-split index for the v6 parquet schema.
+def _collate_event_embs(
+    eids_list:         list[np.ndarray],
+    task_idxs:         list[int],
+    labels:            list[int] | None,
+    embeddings:        np.ndarray,
+    pad_to_num_events: int | None,
+) -> dict[str, torch.Tensor]:
+    """Collate a list of event-id arrays into padded tensors ready for the model."""
+    bert_dim   = embeddings.shape[1]
+    embs_list: list[np.ndarray] = []
+    for eids in eids_list:
+        if pad_to_num_events is not None:
+            eids = eids[:pad_to_num_events]
+        if len(eids) == 0:
+            embs_list.append(np.zeros((1, bert_dim), dtype=np.float32))
+        else:
+            embs_list.append(embeddings[eids].astype(np.float32))
 
-    Reads only split / label / task_name / timeline columns at init time.
-    Each event's embedding_idx is extracted from the timeline JSON strings
-    and stored as a compact int list — no parquet I/O during training.
+    B     = len(embs_list)
+    max_e = pad_to_num_events if pad_to_num_events is not None \
+            else max(e.shape[0] for e in embs_list)
+    padded = np.zeros((B, max_e, bert_dim), dtype=np.float32)
+    mask   = np.zeros((B, max_e),           dtype=np.int64)
+    for i, embs in enumerate(embs_list):
+        n = embs.shape[0]
+        padded[i, :n] = embs
+        mask[i, :n]   = 1
 
-    Attributes
-    ----------
-    pos : dict[task -> list[(file_idx, abs_row)]]  — positive samples per task
-    neg : dict[task -> list[(file_idx, abs_row)]]  — negative samples per task
-    """
-
-    def __init__(self, paths: list[str], split: str | None, store: EmbeddingStore):
-        self.file_paths = list(paths)
-        self.store      = store
-
-        pos: dict[str, list[tuple[int, int]]] = defaultdict(list)
-        neg: dict[str, list[tuple[int, int]]] = defaultdict(list)
-        task_counts: Counter = Counter()
-        pos_counts:  Counter = Counter()
-
-        # (file_idx, abs_row) → (task_name, np.ndarray[int32] of embedding_idx)
-        # np.int32 costs 4 bytes/element vs ~28 bytes for a Python int in a list,
-        # reducing peak memory by ~7x when storing thousands of event IDs per sample.
-        self._preloaded: dict[tuple[int, int], tuple[str, np.ndarray]] = {}
-
-        for file_idx, path in enumerate(self.file_paths):
-            logger.info(f"Indexing + pre-loading {path} …")
-            # Stream row-group by row-group to avoid loading the full timeline
-            # column (JSONL strings) into RAM at once.  Each row group is
-            # typically ~50-100 MB on disk; expanded timeline strings can be
-            # 10-20x larger, so loading one row group at a time keeps peak RAM
-            # per file at ~1-2 GB instead of >20 GB for a full pd.read_parquet.
-            pf      = pq.ParquetFile(path)
-            abs_row = 0
-            for batch in pf.iter_batches(
-                columns=["split", "label", "task_name", "timeline"]
-            ):
-                df = batch.to_pandas()
-                for split_val, label, task_name, timeline in zip(
-                    df["split"], df["label"], df["task_name"], df["timeline"]
-                ):
-                    if split is not None and split_val != split:
-                        abs_row += 1
-                        continue
-                    if task_name not in TASK_2_DISEASE_NAME:
-                        abs_row += 1
-                        continue
-
-                    is_pos = _is_positive(label)
-                    lbl    = 1 if is_pos else 0
-                    (pos if lbl else neg)[task_name].append((file_idx, abs_row))
-                    task_counts[task_name] += 1
-                    if lbl:
-                        pos_counts[task_name] += 1
-
-                    eids = _parse_timeline_event_ids(timeline if isinstance(timeline, str) else "")
-                    self._preloaded[(file_idx, abs_row)] = (
-                        task_name,
-                        np.array(eids, dtype=np.int32),
-                    )
-                    abs_row += 1
-                del df
-
-        self.pos: dict[str, list[tuple[int, int]]] = dict(pos)
-        self.neg: dict[str, list[tuple[int, int]]] = dict(neg)
-
-        logger.info(f"  {sum(task_counts.values())} samples "
-                    f"(split={split!r}) across {len(task_counts)} tasks  "
-                    f"[{len(self._preloaded):,} pre-loaded]")
-        for task in sorted(task_counts):
-            logger.info(f"    {task}: {pos_counts[task]} pos / "
-                        f"{task_counts[task] - pos_counts[task]} neg")
-
-    def read_rows(self, entries: list[tuple[int, int]]) -> list[dict]:
-        """Return pre-loaded event IDs and task index for a list of (file_idx, abs_row) entries."""
-        return [
-            {
-                "event_ids": self._preloaded[(fi, ar)][1],
-                "task":      self._preloaded[(fi, ar)][0],
-                "task_idx":  TASK_2_IDX[self._preloaded[(fi, ar)][0]],
-            }
-            for fi, ar in entries
-        ]
+    out: dict[str, torch.Tensor] = {
+        "event_embs": torch.from_numpy(padded),
+        "event_mask": torch.from_numpy(mask),
+        "task_idxs":  torch.tensor(task_idxs, dtype=torch.long),
+    }
+    if labels is not None:
+        out["labels"] = torch.tensor(labels, dtype=torch.long)
+    return out
 
 
 # ── Training dataset ──────────────────────────────────────────────────────────
 
-class EpochShuffledDataset(Dataset):
-    """PyTorch Dataset where each item IS a full collated batch.
+class PreparedDataset(Dataset):
+    """Training dataset for prepare_task_data.py output.
 
-    Each batch contains exactly half positives and half negatives from the
-    same task — enforcing strict 1:1 pos/neg balance regardless of the overall
-    ratio in the data files.
+    Loads pre-shuffled parquet shards into RAM at init (event_ids stored as
+    compact np.int32 arrays — ~4 bytes/element).  __getitem__(j) returns batch j
+    (rank-strided) as collated CPU tensors.  No runtime shuffle needed.
 
-    __len__ returns the number of batches this rank handles.
-    __getitem__(j) reads all samples for batch j, collates and returns a dict
-    of CPU tensors.
-
-    Call set_epoch(epoch) before each epoch to regenerate the shuffled schedule.
+    Schema: task_idx (int16), label (int8), event_ids (list<int32>), source_row (int32)
     """
 
     def __init__(
         self,
-        index:             LazyDataIndex,
-        batch_size:          int,
-        rank:                int = 0,
-        world_size:          int = 1,
-        seed:                int = 42,
-        pad_to_num_events:   int | None = None,
+        paths:             list[str],
+        store:             EmbeddingStore,
+        batch_size:        int,
+        rank:              int = 0,
+        world_size:        int = 1,
+        pad_to_num_events: int | None = None,
     ):
-        if batch_size < 4 or batch_size % 2 != 0:
-            raise ValueError(f"batch_size must be even and ≥4, got {batch_size}")
-        self.index              = index
-        self.batch_size         = batch_size
-        self.half               = batch_size // 2
-        self.rank               = rank
-        self.world_size         = world_size
-        self.seed               = seed
-        self.pad_to_num_events  = pad_to_num_events
+        self.store             = store
+        self.batch_size        = batch_size
+        self.pad_to_num_events = pad_to_num_events
 
-        half = self.half
-        self.valid_tasks = sorted(
-            t for t in index.pos
-            if len(index.pos[t]) >= half and len(index.neg.get(t, [])) >= half
+        all_task_idxs: list[int]       = []
+        all_labels:    list[int]       = []
+        all_event_ids: list[np.ndarray] = []
+
+        for path in paths:
+            logger.info(f"Loading prepared shard {path} …")
+            pf = pq.ParquetFile(path)
+            for rg_batch in pf.iter_batches(columns=["task_idx", "label", "event_ids"]):
+                df = rg_batch.to_pandas()
+                for row in df.itertuples(index=False):
+                    all_task_idxs.append(int(row.task_idx))
+                    all_labels.append(int(row.label))
+                    all_event_ids.append(np.array(row.event_ids, dtype=np.int32))
+                del df
+
+        total_rows    = len(all_task_idxs)
+        n_batches_all = total_rows // batch_size
+        self._task_idxs  = all_task_idxs
+        self._labels     = all_labels
+        self._event_ids  = all_event_ids
+        # Each rank takes every world_size-th batch.
+        self._my_batches = list(range(rank, n_batches_all, world_size))
+        self.n_batches   = len(self._my_batches)
+
+        logger.info(
+            f"  PreparedDataset: {total_rows:,} rows across {len(paths)} shard(s)  "
+            f"→ {n_batches_all} full batches  ({self.n_batches} for rank {rank})"
         )
-        if not self.valid_tasks:
-            raise ValueError(
-                f"No task has ≥{half} positives and ≥{half} negatives. "
-                f"Reduce --batch_size or provide more data."
-            )
-        skipped = set(index.pos) - set(self.valid_tasks)
-        if skipped:
-            logger.warning(f"  EpochShuffledDataset: skipped tasks with insufficient "
-                           f"data (need ≥{half} per class): {sorted(skipped)}")
-
-        # Number of batches = min(pos, neg) // half  across all valid tasks.
-        self._n_batches_per_task = min(
-            min(len(index.pos[t]), len(index.neg[t])) // half
-            for t in self.valid_tasks
-        )
-        total_batches  = len(self.valid_tasks) * self._n_batches_per_task
-        self.n_batches = len(range(rank, total_batches, world_size))
-
-        # _batches[j] = [(file_idx, abs_row, label), ...] for batch j.
-        self._batches: list[list[tuple[int, int, int]]] = []
-
-    def set_epoch(self, epoch: int) -> None:
-        """Regenerate the shuffled batch list for this epoch."""
-        g    = torch.Generator()
-        g.manual_seed(self.seed + epoch)
-        half = self.half
-        n    = self._n_batches_per_task
-
-        task_pos_perm = {
-            t: torch.randperm(len(self.index.pos[t]), generator=g).tolist()
-            for t in self.valid_tasks
-        }
-        task_neg_perm = {
-            t: torch.randperm(len(self.index.neg[t]), generator=g).tolist()
-            for t in self.valid_tasks
-        }
-
-        flat    = [(t, b) for t in self.valid_tasks for b in range(n)]
-        flat    = [flat[i] for i in torch.randperm(len(flat), generator=g).tolist()]
-        my_flat = flat[self.rank :: self.world_size]
-
-        batches: list[list[tuple[int, int, int]]] = []
-        for task, b in my_flat:
-            pos_list = self.index.pos[task]
-            neg_list = self.index.neg[task]
-            entries: list[tuple[int, int, int]] = []
-            for i in range(half):
-                fi, ar = pos_list[task_pos_perm[task][b * half + i]]
-                entries.append((fi, ar, 1))
-            for i in range(half):
-                fi, ar = neg_list[task_neg_perm[task][b * half + i]]
-                entries.append((fi, ar, 0))
-            batches.append(entries)
-
-        self._batches = batches
 
     def __len__(self) -> int:
-        return len(self._batches)
+        return self.n_batches
 
     def __getitem__(self, j: int) -> dict[str, torch.Tensor]:
-        batch_entries = self._batches[j]
-        entries = [(fi, ar) for fi, ar, _   in batch_entries]
-        labels  = [lbl      for _,  _,  lbl in batch_entries]
+        start = self._my_batches[j] * self.batch_size
+        end   = start + self.batch_size
+        return _collate_event_embs(
+            self._event_ids[start:end],
+            self._task_idxs[start:end],
+            self._labels[start:end],
+            self.store.embeddings,
+            self.pad_to_num_events,
+        )
 
-        rows       = self.index.read_rows(entries)
-        embeddings = self.index.store.embeddings
 
-        embs_list:     list[np.ndarray] = []
-        task_idx_list: list[int]        = []
-        for row in rows:
-            eids = row["event_ids"]
-            if self.pad_to_num_events is not None:
-                eids = eids[:self.pad_to_num_events]
-            if not eids:
-                bert_dim = embeddings.shape[1]
-                embs_list.append(np.zeros((1, bert_dim), dtype=np.float32))
-            else:
-                embs_list.append(
-                    embeddings[eids].astype(np.float32)
-                )
-            task_idx_list.append(row["task_idx"])
+# ── Eval data index ───────────────────────────────────────────────────────────
 
-        B        = len(embs_list)
-        max_e    = self.pad_to_num_events if self.pad_to_num_events is not None \
-                   else max(e.shape[0] for e in embs_list)
-        bert_dim = embs_list[0].shape[1]
-        padded   = np.zeros((B, max_e, bert_dim), dtype=np.float32)
-        mask     = np.zeros((B, max_e),            dtype=np.int64)
-        for i, embs in enumerate(embs_list):
-            n = embs.shape[0]
-            padded[i, :n] = embs
-            mask[i, :n]   = 1
+class EvalDataIndex:
+    """In-memory index for build_eval_task_data.py output.
 
-        return {
-            "event_embs": torch.from_numpy(padded),
-            "event_mask": torch.from_numpy(mask),
-            "task_idxs":  torch.tensor(task_idx_list, dtype=torch.long),
-            "labels":     torch.tensor(labels, dtype=torch.long),
-        }
+    Schema: patient_id (int64), task_idx (int16), label (int8), event_ids (list<int32>)
+
+    pos[task_idx] = list[(patient_id, event_ids_array)]
+    neg[task_idx] = list[(patient_id, event_ids_array)]
+    """
+
+    def __init__(self, paths: list[str], store: EmbeddingStore):
+        self.store = store
+        pos: dict[int, list[tuple[int, np.ndarray]]] = defaultdict(list)
+        neg: dict[int, list[tuple[int, np.ndarray]]] = defaultdict(list)
+
+        for path in paths:
+            logger.info(f"Loading eval data {path} …")
+            df = pd.read_parquet(path, columns=["patient_id", "task_idx", "label", "event_ids"])
+            for row in df.itertuples(index=False):
+                task_idx = int(row.task_idx)
+                pid      = int(row.patient_id)
+                eids     = np.array(row.event_ids, dtype=np.int32)
+                (pos if int(row.label) == 1 else neg)[task_idx].append((pid, eids))
+            del df
+
+        self.pos: dict[int, list[tuple[int, np.ndarray]]] = dict(pos)
+        self.neg: dict[int, list[tuple[int, np.ndarray]]] = dict(neg)
+        self._idx_to_name = {v: k for k, v in TASK_2_IDX.items()}
+
+        for task_idx in sorted(set(list(pos.keys()) + list(neg.keys()))):
+            name  = self._idx_to_name.get(task_idx, str(task_idx))
+            n_pos = len(pos.get(task_idx, []))
+            n_neg = len(neg.get(task_idx, []))
+            logger.info(f"  EvalDataIndex [{name}]: {n_pos} pos / {n_neg} neg")
 
 
 # ── Model setup ───────────────────────────────────────────────────────────────
@@ -512,18 +384,23 @@ def build_encoder(qwen_model, tokenizer, args) -> DiseaseAwareEHREncoder:
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
 class EvalBatchDataset(Dataset):
-    """Batch-level Dataset for evaluation."""
+    """Batch-level Dataset for evaluation.
+
+    Receives a flat list of (event_ids_array, task_idx) entries (already split
+    into anchor / positive / negative segments by evaluate_ddp) and yields
+    collated CPU tensors batch-by-batch.
+    """
 
     def __init__(
         self,
-        entries:           list[tuple[int, int]],
-        index:             LazyDataIndex,
+        entries:           list[tuple[np.ndarray, int]],
+        store:             EmbeddingStore,
         batch_size:        int,
         pad_to_num_events: int | None = None,
     ):
-        self.index             = index
+        self.store             = store
         self.pad_to_num_events = pad_to_num_events
-        self._batches: list[list[tuple[int, int]]] = [
+        self._batches = [
             entries[i : i + batch_size]
             for i in range(0, len(entries), batch_size)
         ]
@@ -532,46 +409,19 @@ class EvalBatchDataset(Dataset):
         return len(self._batches)
 
     def __getitem__(self, j: int) -> dict[str, torch.Tensor]:
-        rows       = self.index.read_rows(self._batches[j])
-        embeddings = self.index.store.embeddings
-
-        embs_list:     list[np.ndarray] = []
-        task_idx_list: list[int]        = []
-        for row in rows:
-            eids = row["event_ids"]
-            if self.pad_to_num_events is not None:
-                eids = eids[:self.pad_to_num_events]
-            if not eids:
-                bert_dim = embeddings.shape[1]
-                embs_list.append(np.zeros((1, bert_dim), dtype=np.float32))
-            else:
-                embs_list.append(
-                    embeddings[eids].astype(np.float32)
-                )
-            task_idx_list.append(row["task_idx"])
-
-        B        = len(embs_list)
-        max_e    = self.pad_to_num_events if self.pad_to_num_events is not None \
-                   else max(e.shape[0] for e in embs_list)
-        bert_dim = embs_list[0].shape[1]
-        padded   = np.zeros((B, max_e, bert_dim), dtype=np.float32)
-        mask     = np.zeros((B, max_e),            dtype=np.int64)
-        for i, embs in enumerate(embs_list):
-            n = embs.shape[0]
-            padded[i, :n] = embs
-            mask[i, :n]   = 1
-
-        return {
-            "event_embs": torch.from_numpy(padded),
-            "event_mask": torch.from_numpy(mask),
-            "task_idxs":  torch.tensor(task_idx_list, dtype=torch.long),
-        }
+        batch      = self._batches[j]
+        eids_list  = [e[0] for e in batch]
+        task_idxs  = [e[1] for e in batch]
+        return _collate_event_embs(
+            eids_list, task_idxs, None,
+            self.store.embeddings, self.pad_to_num_events,
+        )
 
 
 @torch.inference_mode()
 def evaluate_ddp(
     encoder:    DiseaseAwareEHREncoder,
-    val_index:  LazyDataIndex,
+    eval_index: EvalDataIndex,
     device:     torch.device,
     args,
     rank:       int,
@@ -580,49 +430,74 @@ def evaluate_ddp(
 ) -> tuple[float, dict[str, float]]:
     """Triplet accuracy distributed across all ranks.
 
-    Returns (overall_acc, {task: acc}).
+    Returns (overall_acc, {task_name: acc}).
 
-    Both pos and neg entry lists are shuffled before selecting triplets so that
-    oversampled copies (which are consecutive in the index) are not preferentially
-    picked together, which would inflate apparent similarity and bias evaluation.
+    Triplet constraints:
+      - anchor and positive come from *different* patients
+      - anchor and negative come from *different* patients
+
+    Both pools are shuffled before selection so consecutive eval samples
+    are spread out.
     """
     raw_encoder = encoder.module if isinstance(encoder, DDP) else encoder
     raw_encoder.eval()
 
     rng = random.Random(args.seed)
+    idx_to_name = eval_index._idx_to_name
 
-    anchors_e:      list[tuple[int, int]] = []
-    positives_e:    list[tuple[int, int]] = []
-    negatives_e:    list[tuple[int, int]] = []
-    task_of_triplet: list[str]            = []
+    # Each entry in these lists is (event_ids_array, task_idx).
+    anchors_e:      list[tuple[np.ndarray, int]] = []
+    positives_e:    list[tuple[np.ndarray, int]] = []
+    negatives_e:    list[tuple[np.ndarray, int]] = []
+    task_of_triplet: list[int]                   = []
 
-    valid_tasks_for_eval = sorted(
-        t for t in val_index.pos
-        if len(val_index.pos[t]) >= 2 and val_index.neg.get(t)
+    valid_task_idxs = sorted(
+        t for t in eval_index.pos
+        if len(eval_index.pos[t]) >= 2 and eval_index.neg.get(t)
     )
 
-    for task in valid_tasks_for_eval:
-        pos_entries = val_index.pos[task]
-        neg_entries = val_index.neg[task]
+    for task_idx in valid_task_idxs:
+        pos_entries = eval_index.pos[task_idx]   # list[(pid, eids)]
+        neg_entries = eval_index.neg[task_idx]
 
-        # Shuffle both pools so consecutive oversampled copies are spread out.
+        # Shuffle both pools so adjacent duplicates are spread out.
         pos_pool = list(range(len(pos_entries)))
         neg_pool = list(range(len(neg_entries)))
         rng.shuffle(pos_pool)
         rng.shuffle(neg_pool)
 
         n = min(args.n_eval_triplets_per_task, len(pos_entries))
+        ni_cursor = 0
         for i in range(n):
-            ai = pos_pool[i]
-            # Positive: next slot in the shuffled pool (wraps around), ensuring
-            # anchor != positive while still respecting the shuffled order.
-            pi = pos_pool[(i + 1) % len(pos_pool)]
-            # Negative: drawn from the shuffled neg pool (wraps around).
-            ni = neg_pool[i % len(neg_pool)]
-            anchors_e.append(pos_entries[ai])
-            positives_e.append(pos_entries[pi])
-            negatives_e.append(neg_entries[ni])
-            task_of_triplet.append(task)
+            ai           = pos_pool[i]
+            anchor_pid   = pos_entries[ai][0]
+            anchor_eids  = pos_entries[ai][1]
+
+            # Positive: find a sample from a *different* patient.
+            pi = None
+            for offset in range(1, len(pos_pool)):
+                cand = pos_pool[(i + offset) % len(pos_pool)]
+                if pos_entries[cand][0] != anchor_pid:
+                    pi = cand
+                    break
+            if pi is None:
+                continue   # all positives are from the same patient — skip
+
+            # Negative: find a sample from a *different* patient.
+            ni = None
+            for offset in range(len(neg_pool)):
+                cand = neg_pool[(ni_cursor + offset) % len(neg_pool)]
+                if neg_entries[cand][0] != anchor_pid:
+                    ni = cand
+                    break
+            ni_cursor += 1
+            if ni is None:
+                continue   # all negatives are from the same patient — skip
+
+            anchors_e.append((anchor_eids,          task_idx))
+            positives_e.append((pos_entries[pi][1], task_idx))
+            negatives_e.append((neg_entries[ni][1], task_idx))
+            task_of_triplet.append(task_idx)
 
     if not anchors_e:
         if rank == 0:
@@ -631,13 +506,13 @@ def evaluate_ddp(
 
     n_triplets    = len(anchors_e)
     my_triple_idx = list(range(rank, n_triplets, world_size))
-    my_entries: list[tuple[int, int]] = (
+    my_entries: list[tuple[np.ndarray, int]] = (
         [anchors_e[t]   for t in my_triple_idx] +
         [positives_e[t] for t in my_triple_idx] +
         [negatives_e[t] for t in my_triple_idx]
     )
 
-    eval_ds = EvalBatchDataset(my_entries, val_index,
+    eval_ds = EvalBatchDataset(my_entries, eval_index.store,
                                args.eval_batch_size, args.pad_to_num_events)
     eval_dl = DataLoader(
         eval_ds,
@@ -671,39 +546,40 @@ def evaluate_ddp(
         correct = (d_ap < d_an)   # (n_my,) bool
 
         # ── Per-task local counts ─────────────────────────────────────────────
-        my_tasks = [task_of_triplet[t] for t in my_triple_idx]
-        local_task_correct: dict[str, torch.Tensor] = {}
-        local_task_total:   dict[str, torch.Tensor] = {}
-        for task in valid_tasks_for_eval:
-            mask = torch.tensor([t == task for t in my_tasks], dtype=torch.bool)
-            local_task_correct[task] = correct[mask].sum().to(torch.long).to(device)
-            local_task_total[task]   = mask.sum().to(torch.long).to(device)
+        my_task_idxs = [task_of_triplet[t] for t in my_triple_idx]
+        local_task_correct: dict[int, torch.Tensor] = {}
+        local_task_total:   dict[int, torch.Tensor] = {}
+        for t_idx in valid_task_idxs:
+            mask = torch.tensor([t == t_idx for t in my_task_idxs], dtype=torch.bool)
+            local_task_correct[t_idx] = correct[mask].sum().to(torch.long).to(device)
+            local_task_total[t_idx]   = mask.sum().to(torch.long).to(device)
 
         local_correct = correct.sum().to(torch.long).to(device)
         local_total   = torch.tensor(n_my, dtype=torch.long, device=device)
     else:
         local_task_correct = {t: torch.tensor(0, dtype=torch.long, device=device)
-                              for t in valid_tasks_for_eval}
+                              for t in valid_task_idxs}
         local_task_total   = {t: torch.tensor(0, dtype=torch.long, device=device)
-                              for t in valid_tasks_for_eval}
+                              for t in valid_task_idxs}
         local_correct = torch.tensor(0, dtype=torch.long, device=device)
         local_total   = torch.tensor(0, dtype=torch.long, device=device)
 
     if is_ddp:
         dist.all_reduce(local_correct, op=dist.ReduceOp.SUM)
         dist.all_reduce(local_total,   op=dist.ReduceOp.SUM)
-        for task in valid_tasks_for_eval:
-            dist.all_reduce(local_task_correct[task], op=dist.ReduceOp.SUM)
-            dist.all_reduce(local_task_total[task],   op=dist.ReduceOp.SUM)
+        for t_idx in valid_task_idxs:
+            dist.all_reduce(local_task_correct[t_idx], op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_task_total[t_idx],   op=dist.ReduceOp.SUM)
 
     overall_acc = (local_correct.float() / local_total.float()).item() \
                   if local_total.item() > 0 else 0.0
 
     task_acc: dict[str, float] = {}
-    for task in valid_tasks_for_eval:
-        n_t = local_task_total[task].item()
-        task_acc[task] = (local_task_correct[task].float() / n_t).item() \
-                         if n_t > 0 else 0.0
+    for t_idx in valid_task_idxs:
+        n_t = local_task_total[t_idx].item()
+        task_name = idx_to_name.get(t_idx, str(t_idx))
+        task_acc[task_name] = (local_task_correct[t_idx].float() / n_t).item() \
+                              if n_t > 0 else 0.0
 
     raw_encoder.train()
     return overall_acc, task_acc
@@ -723,11 +599,11 @@ def parse_args():
                    help="Path to a saved checkpoint dir (contains lora/ + extra_modules.pt).")
 
     # Data
-    p.add_argument("--data_paths",     nargs="+", default=None,
-                   help="Train parquet files (required unless --eval_only).")
-    p.add_argument("--val_data_paths", nargs="+", default=None,
-                   help="Validation parquet files.")
-    p.add_argument("--val_split",      default="val", choices=["train", "val", "test"])
+    p.add_argument("--train_data_paths", nargs="+", default=None,
+                   help="Prepared train shard parquets (output of prepare_task_data.py). "
+                        "Required unless --eval_only.")
+    p.add_argument("--eval_data_paths",  nargs="+", default=None,
+                   help="Eval parquets (output of build_eval_task_data.py).")
 
     # BioLinkBERT event embeddings
     p.add_argument("--bert_embeddings", required=True,
@@ -803,8 +679,8 @@ def main():
 
     if args.qlora and is_ddp:
         raise RuntimeError("QLoRA is incompatible with multi-GPU DDP. Use single GPU.")
-    if not args.eval_only and not args.data_paths:
-        raise ValueError("--data_paths is required unless --eval_only is set.")
+    if not args.eval_only and not args.train_data_paths:
+        raise ValueError("--train_data_paths is required unless --eval_only is set.")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir   = Path(args.output_dir) / timestamp
@@ -865,11 +741,11 @@ def main():
 
     # ── Eval-only mode ─────────────────────────────────────────────────────────
     if args.eval_only:
-        if not args.val_data_paths:
-            raise ValueError("--eval_only requires --val_data_paths.")
-        val_index = LazyDataIndex(args.val_data_paths, args.val_split, store)
+        if not args.eval_data_paths:
+            raise ValueError("--eval_only requires --eval_data_paths.")
+        eval_index = EvalDataIndex(args.eval_data_paths, store)
         val_acc, val_task_acc = evaluate_ddp(
-            encoder, val_index,
+            encoder, eval_index,
             device, args, rank, world_size, is_ddp,
         )
         if rank == 0:
@@ -887,20 +763,19 @@ def main():
             dist.destroy_process_group()
         return
 
-    # ── Lazy data indices & training dataset ──────────────────────────────────
-    train_index = LazyDataIndex(args.data_paths, "train", store)
-    train_ds    = EpochShuffledDataset(
-        index=train_index,
+    # ── Training dataset ───────────────────────────────────────────────────────
+    train_ds = PreparedDataset(
+        paths=args.train_data_paths,
+        store=store,
         batch_size=args.batch_size,
         rank=rank,
         world_size=world_size,
-        seed=args.seed,
         pad_to_num_events=args.pad_to_num_events,
     )
 
-    val_index = None
-    if args.val_data_paths:
-        val_index = LazyDataIndex(args.val_data_paths, args.val_split, store)
+    eval_index = None
+    if args.eval_data_paths:
+        eval_index = EvalDataIndex(args.eval_data_paths, store)
 
     # ── Optimizer + LR scheduler ───────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -950,7 +825,7 @@ def main():
     for epoch in range(args.epochs):
         if is_ddp:
             dist.barrier()
-        train_ds.set_epoch(epoch)
+        # PreparedDataset is pre-shuffled — no set_epoch needed.
         encoder.train()
 
         epoch_loss = 0.0
@@ -1019,11 +894,11 @@ def main():
             logger.info(f"Epoch {epoch+1}/{args.epochs}  avg_loss={avg_loss:.4f}")
 
         # ── Distributed evaluation ─────────────────────────────────────────
-        if val_index is not None:
+        if eval_index is not None:
             if is_ddp:
                 dist.barrier()
             val_acc, val_task_acc = evaluate_ddp(
-                encoder, val_index,
+                encoder, eval_index,
                 device, args, rank, world_size, is_ddp,
             )
             if rank == 0:

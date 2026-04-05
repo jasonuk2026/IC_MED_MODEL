@@ -431,6 +431,9 @@ def main():
                         help="Directory containing event_index.parquet from BioLinkBERT extraction")
     parser.add_argument("--num_workers", type=int, default=None,
                         help="Number of worker processes (default: cpu_count)")
+    parser.add_argument("--splits", nargs="+", default=["train", "val", "test"],
+                        choices=["train", "val", "test"],
+                        help="Which splits to process (default: all three)")
     args = parser.parse_args()
 
     task = args.task
@@ -471,8 +474,13 @@ def main():
     df_labels = df_labels.dropna(subset=["split"])
     if len(df_labels) < n_before:
         print(f"  Warning: dropped {n_before - len(df_labels)} samples with no split assignment")
+    # Filter to requested splits
+    df_labels = df_labels[df_labels["split"].isin(args.splits)]
+    print(f"  Processing splits: {args.splits}")
     for split in ["train", "val", "test"]:
-        print(f"  {split}: {(df_labels['split'] == split).sum()} samples")
+        n = (df_labels['split'] == split).sum()
+        if n > 0:
+            print(f"  {split}: {n} samples")
 
     # ── 5. Load raw EHR data ──────────────────────────────────────────────────
     print("Loading raw EHR data (this may take a moment)...")
