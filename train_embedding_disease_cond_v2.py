@@ -58,6 +58,7 @@ from utils.h2d import CudaPrefetcher
 from utils.async_dataloader import AsyncDataLoader
 
 import pandas as pd
+import pyarrow.parquet as pq
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig, logging as hf_logging
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training, PeftModel
 from sentence_transformers.losses import BatchHardSoftMarginTripletLoss, BatchHardTripletLossDistanceFunction
@@ -186,33 +187,41 @@ class LazyDataIndex:
 
         for file_idx, path in enumerate(self.file_paths):
             logger.info(f"Indexing + pre-loading {path} …")
-            df = pd.read_parquet(
-                path,
-                columns=["split", "label", "task_name", "timeline"],
-            )
-            for abs_row, (split_val, label, task_name, timeline) in enumerate(
-                zip(df["split"], df["label"], df["task_name"], df["timeline"])
+            # Stream row-group by row-group to avoid loading the full timeline
+            # column (JSONL strings) into RAM at once.  Each row group is
+            # typically ~50-100 MB on disk; expanded timeline strings can be
+            # 10-20x larger, so loading one row group at a time keeps peak RAM
+            # per file at ~1-2 GB instead of >20 GB for a full pd.read_parquet.
+            pf      = pq.ParquetFile(path)
+            abs_row = 0
+            for batch in pf.iter_batches(
+                columns=["split", "label", "task_name", "timeline"]
             ):
-                if split is not None and split_val != split:
-                    continue
-                # Only train tasks that have a known disease name mapping.
-                if task_name not in TASK_2_DISEASE_NAME:
-                    continue
+                df = batch.to_pandas()
+                for split_val, label, task_name, timeline in zip(
+                    df["split"], df["label"], df["task_name"], df["timeline"]
+                ):
+                    if split is not None and split_val != split:
+                        abs_row += 1
+                        continue
+                    if task_name not in TASK_2_DISEASE_NAME:
+                        abs_row += 1
+                        continue
 
-                is_pos = _is_positive(label)
-                lbl    = 1 if is_pos else 0
-                (pos if lbl else neg)[task_name].append((file_idx, abs_row))
-                task_counts[task_name] += 1
-                if lbl:
-                    pos_counts[task_name] += 1
+                    is_pos = _is_positive(label)
+                    lbl    = 1 if is_pos else 0
+                    (pos if lbl else neg)[task_name].append((file_idx, abs_row))
+                    task_counts[task_name] += 1
+                    if lbl:
+                        pos_counts[task_name] += 1
 
-                # Extract embedding indices and store as compact int32 array.
-                eids = _parse_timeline_event_ids(timeline if isinstance(timeline, str) else "")
-                self._preloaded[(file_idx, abs_row)] = (
-                    task_name,
-                    np.array(eids, dtype=np.int32),
-                )
-            del df
+                    eids = _parse_timeline_event_ids(timeline if isinstance(timeline, str) else "")
+                    self._preloaded[(file_idx, abs_row)] = (
+                        task_name,
+                        np.array(eids, dtype=np.int32),
+                    )
+                    abs_row += 1
+                del df
 
         self.pos: dict[str, list[tuple[int, int]]] = dict(pos)
         self.neg: dict[str, list[tuple[int, int]]] = dict(neg)
