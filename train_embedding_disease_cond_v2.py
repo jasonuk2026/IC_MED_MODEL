@@ -157,9 +157,12 @@ def _collate_event_embs(
 class PreparedDataset(Dataset):
     """Training dataset for prepare_task_data.py output.
 
-    Loads pre-shuffled parquet shards into RAM at init (event_ids stored as
-    compact np.int32 arrays — ~4 bytes/element).  __getitem__(j) returns batch j
-    (rank-strided) as collated CPU tensors.  No runtime shuffle needed.
+    Loads all shards into RAM, groups samples by (task_idx, label).
+    Each epoch: pos/neg pools per task are independently shuffled, then a
+    batch schedule is built so that every batch contains exactly one task
+    and half positives + half negatives.  Batches alternate across tasks.
+
+    Call set_epoch(epoch) before each epoch to regenerate the schedule.
 
     Schema: task_idx (int16), label (int8), event_ids (list<int32>), source_row (int32)
     """
@@ -171,53 +174,112 @@ class PreparedDataset(Dataset):
         batch_size:        int,
         rank:              int = 0,
         world_size:        int = 1,
+        seed:              int = 42,
         pad_to_num_events: int | None = None,
     ):
+        if batch_size < 4 or batch_size % 2 != 0:
+            raise ValueError(f"batch_size must be even and ≥4, got {batch_size}")
+
         self.store             = store
         self.batch_size        = batch_size
+        self.half              = batch_size // 2
+        self.rank              = rank
+        self.world_size        = world_size
+        self.seed              = seed
         self.pad_to_num_events = pad_to_num_events
 
-        all_task_idxs: list[int]       = []
-        all_labels:    list[int]       = []
-        all_event_ids: list[np.ndarray] = []
+        # pos[task_idx] / neg[task_idx] = list of event_id arrays
+        pos: dict[int, list[np.ndarray]] = defaultdict(list)
+        neg: dict[int, list[np.ndarray]] = defaultdict(list)
 
         for path in paths:
-            logger.info(f"Loading prepared shard {path} …")
+            logger.info(f"Loading shard {path} …")
             pf = pq.ParquetFile(path)
             for rg_batch in pf.iter_batches(columns=["task_idx", "label", "event_ids"]):
                 df = rg_batch.to_pandas()
                 for row in df.itertuples(index=False):
-                    all_task_idxs.append(int(row.task_idx))
-                    all_labels.append(int(row.label))
-                    all_event_ids.append(np.array(row.event_ids, dtype=np.int32))
+                    eids = np.array(row.event_ids, dtype=np.int32)
+                    (pos if row.label == 1 else neg)[int(row.task_idx)].append(eids)
                 del df
 
-        total_rows    = len(all_task_idxs)
-        n_batches_all = total_rows // batch_size
-        self._task_idxs  = all_task_idxs
-        self._labels     = all_labels
-        self._event_ids  = all_event_ids
-        # Each rank takes every world_size-th batch.
-        self._my_batches = list(range(rank, n_batches_all, world_size))
-        self.n_batches   = len(self._my_batches)
+        self.pos = dict(pos)
+        self.neg = dict(neg)
 
-        logger.info(
-            f"  PreparedDataset: {total_rows:,} rows across {len(paths)} shard(s)  "
-            f"→ {n_batches_all} full batches  ({self.n_batches} for rank {rank})"
+        half = self.half
+        self.valid_tasks = sorted(
+            t for t in self.pos
+            if len(self.pos[t]) >= half and len(self.neg.get(t, [])) >= half
         )
+        if not self.valid_tasks:
+            raise ValueError(
+                f"No task has ≥{half} positives and ≥{half} negatives. "
+                f"Reduce --batch_size or provide more data."
+            )
+        skipped = set(self.pos) - set(self.valid_tasks)
+        if skipped:
+            logger.warning(f"  Skipped tasks with insufficient data: {sorted(skipped)}")
+
+        idx_to_name = {v: k for k, v in TASK_2_IDX.items()}
+        for t in self.valid_tasks:
+            logger.info(f"  [{idx_to_name.get(t, t)}] "
+                        f"{len(self.pos[t]):,} pos / {len(self.neg[t]):,} neg")
+
+        self._n_per_task = {
+            t: min(len(self.pos[t]), len(self.neg[t])) // half
+            for t in self.valid_tasks
+        }
+
+        # _batches populated by set_epoch(); initialise for epoch 0
+        self._batches:  list[tuple[int, int]] = []
+        self._pos_perm: dict[int, list[int]]  = {}
+        self._neg_perm: dict[int, list[int]]  = {}
+        self.n_batches = 0
+        self.set_epoch(0)
+
+    def set_epoch(self, epoch: int) -> None:
+        """Shuffle pos/neg pools per task and rebuild the interleaved batch schedule."""
+        g    = torch.Generator()
+        g.manual_seed(self.seed + epoch)
+        half = self.half
+
+        self._pos_perm = {
+            t: torch.randperm(len(self.pos[t]), generator=g).tolist()
+            for t in self.valid_tasks
+        }
+        self._neg_perm = {
+            t: torch.randperm(len(self.neg[t]), generator=g).tolist()
+            for t in self.valid_tasks
+        }
+
+        # Interleave (task, slot) pairs then globally shuffle
+        flat = [(t, b) for t in self.valid_tasks for b in range(self._n_per_task[t])]
+        perm = torch.randperm(len(flat), generator=g).tolist()
+        flat = [flat[i] for i in perm]
+
+        self._batches  = flat[self.rank :: self.world_size]
+        self.n_batches = len(self._batches)
 
     def __len__(self) -> int:
         return self.n_batches
 
     def __getitem__(self, j: int) -> dict[str, torch.Tensor]:
-        start = self._my_batches[j] * self.batch_size
-        end   = start + self.batch_size
+        task, slot = self._batches[j]
+        half       = self.half
+        pos_perm   = self._pos_perm[task]
+        neg_perm   = self._neg_perm[task]
+
+        eids_list: list[np.ndarray] = []
+        labels:    list[int]        = []
+        for i in range(half):
+            eids_list.append(self.pos[task][pos_perm[slot * half + i]])
+            labels.append(1)
+        for i in range(half):
+            eids_list.append(self.neg[task][neg_perm[slot * half + i]])
+            labels.append(0)
+
         return _collate_event_embs(
-            self._event_ids[start:end],
-            self._task_idxs[start:end],
-            self._labels[start:end],
-            self.store.embeddings,
-            self.pad_to_num_events,
+            eids_list, [task] * self.batch_size, labels,
+            self.store.embeddings, self.pad_to_num_events,
         )
 
 
@@ -770,6 +832,7 @@ def main():
         batch_size=args.batch_size,
         rank=rank,
         world_size=world_size,
+        seed=args.seed,
         pad_to_num_events=args.pad_to_num_events,
     )
 
@@ -818,6 +881,24 @@ def main():
         prefetch_factor=args.prefetch_factor,
     )
 
+    # ── Sanity-check first batch ───────────────────────────────────────────────
+    if rank == 0:
+        first_batch = train_ds[0]
+        task_ids = first_batch["task_idxs"].tolist()
+        labels   = first_batch["labels"].tolist()
+        n_pos    = sum(labels)
+        n_neg    = len(labels) - n_pos
+        unique_tasks = set(task_ids)
+        idx_to_name  = {v: k for k, v in TASK_2_IDX.items()}
+        assert len(unique_tasks) == 1, \
+            f"First batch has {len(unique_tasks)} tasks: {unique_tasks}"
+        assert n_pos == n_neg, \
+            f"First batch pos/neg imbalance: {n_pos} pos / {n_neg} neg"
+        logger.info(
+            f"First batch check OK: task={idx_to_name.get(task_ids[0], task_ids[0])}  "
+            f"pos={n_pos}  neg={n_neg}"
+        )
+
     # ── Training loop ──────────────────────────────────────────────────────────
     best_val_acc = 0.0
     opt_step     = 0
@@ -825,7 +906,7 @@ def main():
     for epoch in range(args.epochs):
         if is_ddp:
             dist.barrier()
-        # PreparedDataset is pre-shuffled — no set_epoch needed.
+        train_ds.set_epoch(epoch)
         encoder.train()
 
         epoch_loss = 0.0
