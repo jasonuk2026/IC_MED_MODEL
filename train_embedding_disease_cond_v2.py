@@ -179,8 +179,10 @@ class LazyDataIndex:
         task_counts: Counter = Counter()
         pos_counts:  Counter = Counter()
 
-        # (file_idx, abs_row) → (task_name, [embedding_idx, ...])
-        self._preloaded: dict[tuple[int, int], tuple[str, list[int]]] = {}
+        # (file_idx, abs_row) → (task_name, np.ndarray[int32] of embedding_idx)
+        # np.int32 costs 4 bytes/element vs ~28 bytes for a Python int in a list,
+        # reducing peak memory by ~7x when storing thousands of event IDs per sample.
+        self._preloaded: dict[tuple[int, int], tuple[str, np.ndarray]] = {}
 
         for file_idx, path in enumerate(self.file_paths):
             logger.info(f"Indexing + pre-loading {path} …")
@@ -204,9 +206,12 @@ class LazyDataIndex:
                 if lbl:
                     pos_counts[task_name] += 1
 
-                # Extract embedding indices from the timeline JSON strings once.
+                # Extract embedding indices and store as compact int32 array.
                 eids = _parse_timeline_event_ids(timeline if isinstance(timeline, str) else "")
-                self._preloaded[(file_idx, abs_row)] = (task_name, eids)
+                self._preloaded[(file_idx, abs_row)] = (
+                    task_name,
+                    np.array(eids, dtype=np.int32),
+                )
             del df
 
         self.pos: dict[str, list[tuple[int, int]]] = dict(pos)
@@ -349,7 +354,7 @@ class EpochShuffledDataset(Dataset):
                 embs_list.append(np.zeros((1, bert_dim), dtype=np.float32))
             else:
                 embs_list.append(
-                    np.stack([embeddings[eid] for eid in eids]).astype(np.float32)
+                    embeddings[eids].astype(np.float32)
                 )
             task_idx_list.append(row["task_idx"])
 
@@ -532,7 +537,7 @@ class EvalBatchDataset(Dataset):
                 embs_list.append(np.zeros((1, bert_dim), dtype=np.float32))
             else:
                 embs_list.append(
-                    np.stack([embeddings[eid] for eid in eids]).astype(np.float32)
+                    embeddings[eids].astype(np.float32)
                 )
             task_idx_list.append(row["task_idx"])
 
