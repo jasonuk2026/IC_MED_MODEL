@@ -979,7 +979,8 @@ def main():
 
             epoch_loss += loss.item() * args.grad_accum
 
-        avg_loss = epoch_loss / n_batches_per_epoch
+        n_batches_ran = min(batch_idx + 1, n_batches_per_epoch)
+        avg_loss = epoch_loss / max(n_batches_ran, 1)
         if rank == 0:
             logger.info(f"Epoch {epoch+1}/{args.epochs}  avg_loss={avg_loss:.4f}")
 
