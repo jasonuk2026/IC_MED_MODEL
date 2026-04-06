@@ -224,11 +224,11 @@ def _process_copy(args: tuple) -> tuple[dict, int, dict[str, int]]:
 
     Args:
         args: (pid, pred_time, label_val, label_type, split,
-               max_events, task_desc, task, is_chexpert, copy_idx, M)
+               max_events, task_desc, task, is_chexpert, copy_idx, M, epoch_idx)
     """
     (pid, pred_time, label_val, label_type, split,
      max_events, task_desc, task, is_chexpert,
-     copy_idx, M) = args
+     copy_idx, M, epoch_idx) = args
 
     label = _label_str(label_val, is_chexpert)
 
@@ -254,7 +254,7 @@ def _process_copy(args: tuple) -> tuple[dict, int, dict[str, int]]:
         timeline_text, n_hits, misses = _build_timeline_from_df(events_df)
         sample_indices_str = None
     else:
-        rng = random.Random(hash((int(pid), str(pred_time), copy_idx)))
+        rng = random.Random(hash((int(pid), str(pred_time), copy_idx, epoch_idx)))
         sample_indices = sorted(rng.sample(range(M), max_events))
         sampled_df = events_df.iloc[sample_indices]
         timeline_text, n_hits, misses = _build_timeline_from_df(sampled_df)
@@ -336,6 +336,7 @@ def _iter_copy_args(
     task_desc: str,
     task: str,
     is_chexpert: bool,
+    epoch_idx: int = 0,
 ) -> Iterator[tuple]:
     """Lazily yield one args-tuple per copy. Never materialises the full list."""
     for row in df_labels.itertuples(index=False):
@@ -350,7 +351,7 @@ def _iter_copy_args(
                 max_events, task_desc, task, is_chexpert)
 
         if max_events is None or M <= max_events:
-            yield base + (None, M)
+            yield base + (None, M, epoch_idx)
         else:
             n_copies = get_sample_n_times(
                 is_positive=_is_positive(label_val),
@@ -359,7 +360,7 @@ def _iter_copy_args(
                 task=task,
             )
             for copy_idx in range(n_copies):
-                yield base + (copy_idx, M)
+                yield base + (copy_idx, M, epoch_idx)
 
 
 # ── Parquet schema (explicit to avoid null-type inference on all-None batches) ──
@@ -413,6 +414,19 @@ class SplitParquetWriter:
         return self._row_counts
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _flush_direct(writer, records: list[dict]) -> None:
+    """Write a batch of train records directly to a ParquetWriter."""
+    if not records:
+        return
+    import pyarrow as _pa
+    df = pd.DataFrame(records)
+    # Keep only train rows (all records here are already train)
+    table = _pa.Table.from_pandas(df, schema=PARQUET_SCHEMA, preserve_index=False)
+    writer.write_table(table)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -421,7 +435,7 @@ def main():
     )
     parser.add_argument("--task", type=str, required=True, choices=VALID_TASKS)
     parser.add_argument("--output_dir", type=str,
-                        default=os.path.join(EHRSHOT_ASSETS, "llm_data_v6"))
+                        default=os.path.join(EHRSHOT_ASSETS, "llm_data_v7"))
     parser.add_argument("--max_events", type=int, default=None,
                         help="N_EVENTS threshold. Samples with more events are oversampled.")
     parser.add_argument("--buffer_size", type=int, default=2000,
@@ -434,6 +448,11 @@ def main():
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"],
                         choices=["train", "val", "test"],
                         help="Which splits to process (default: all three)")
+    parser.add_argument("--epochs", type=int, default=1,
+                        help="Number of train-split epoch variants to generate. "
+                             "Each epoch uses a different random seed so oversampled patients "
+                             "get different event subsets. Outputs train_000.parquet, "
+                             "train_001.parquet, ... Val/test are written once (unchanged).")
     args = parser.parse_args()
 
     task = args.task
@@ -506,62 +525,95 @@ def main():
     _EMBED_IDX = embed_idx
 
     # ── 7. Count total copies (fast pass, no materialisation) ─────────────────
-    task_desc = TASK_DESCRIPTIONS[task]
+    task_desc   = TASK_DESCRIPTIONS[task]
     is_chexpert = task == "chexpert"
 
-    print("Counting total copy-level tasks...")
-    n_total_copies, n_oversampled = _count_copies(df_labels, grouped, args.max_events, task=task)
-    print(f"  {len(df_labels)} original samples → {n_total_copies:,} copy-level tasks "
-          f"({n_oversampled} samples oversampled)")
+    # Only count for non-train splits (train is re-counted per epoch below)
+    non_train_splits = [s for s in args.splits if s != "train"]
+    if non_train_splits:
+        df_non_train = df_labels[df_labels["split"].isin(non_train_splits)]
+        n_non_train, _ = _count_copies(df_non_train, grouped, args.max_events, task=task)
+    else:
+        df_non_train = df_labels.iloc[:0]
+        n_non_train  = 0
 
-    # ── 8. Dispatch with streaming writes ─────────────────────────────────────
-    imap_chunksize = max(1, n_total_copies // (n_workers * 20))
-    out_paths = {
-        split: os.path.join(output_dir, f"{split}.parquet")
-        for split in ["train", "val", "test"]
-    }
-    writer = SplitParquetWriter(out_paths)
+    df_train = df_labels[df_labels["split"] == "train"] if "train" in args.splits else df_labels.iloc[:0]
+    n_train_copies, n_oversampled = _count_copies(df_train, grouped, args.max_events, task=task)
 
-    total_hits = 0
-    total_misses: dict[str, int] = {}
-    buffer: list[dict] = []
+    print(f"  {len(df_labels)} original samples")
+    print(f"  train: {n_train_copies:,} copy-level tasks ({n_oversampled} oversampled)")
 
-    print(f"Building LLM-ready dataset (chunksize={imap_chunksize}, "
-          f"flush every {args.buffer_size} records)...")
+    # ── 8a. Write val / test once (epoch-independent) ─────────────────────────
+    if non_train_splits:
+        imap_cs = max(1, n_non_train // (n_workers * 20))
+        out_paths_nontr = {s: os.path.join(output_dir, f"{s}.parquet") for s in ["train", "val", "test"]}
+        writer_nontr = SplitParquetWriter(out_paths_nontr)
+        buffer: list[dict] = []
+        total_hits   = 0
+        total_misses: dict[str, int] = {}
 
-    copy_gen = _iter_copy_args(df_labels, grouped, args.max_events,
-                               task_desc, task, is_chexpert)
+        copy_gen = _iter_copy_args(df_non_train, grouped, args.max_events,
+                                   task_desc, task, is_chexpert, epoch_idx=0)
+        print(f"\nBuilding val/test splits (chunksize={imap_cs}) …")
+        with mp.Pool(processes=n_workers) as pool:
+            for record, n_hits, misses in tqdm(
+                pool.imap(_process_copy, copy_gen, chunksize=imap_cs),
+                total=n_non_train, desc="val/test",
+            ):
+                buffer.append(record)
+                total_hits += n_hits
+                for code, count in misses.items():
+                    total_misses[code] = total_misses.get(code, 0) + count
+                if len(buffer) >= args.buffer_size:
+                    writer_nontr.write_batch(buffer)
+                    buffer.clear()
+        writer_nontr.write_batch(buffer)
+        row_counts_nontr = writer_nontr.close()
+        print_coverage_report(total_hits, total_misses)
+        for split in non_train_splits:
+            cnt = row_counts_nontr.get(split, 0)
+            print(f"  Saved {split}: {cnt:,} rows → {out_paths_nontr[split]}")
 
-    with mp.Pool(processes=n_workers) as pool:
-        for record, n_hits, misses in tqdm(
-            pool.imap(_process_copy, copy_gen, chunksize=imap_chunksize),
-            total=n_total_copies,
-            desc="Processing copies",
-        ):
-            buffer.append(record)
-            total_hits += n_hits
-            for code, count in misses.items():
-                total_misses[code] = total_misses.get(code, 0) + count
+    # ── 8b. Write train once per epoch ────────────────────────────────────────
+    if "train" in args.splits and len(df_train) > 0:
+        imap_cs = max(1, n_train_copies // (n_workers * 20))
+        for epoch_idx in range(args.epochs):
+            out_train = os.path.join(output_dir, f"train_{epoch_idx:03d}.parquet")
+            print(f"\n── Epoch {epoch_idx} → {out_train} ──")
 
-            if len(buffer) >= args.buffer_size:
-                writer.write_batch(buffer)
-                buffer.clear()
+            out_paths_tr = {"train": out_train, "val": "/dev/null", "test": "/dev/null"}
+            writer_tr = SplitParquetWriter({"train": out_train,
+                                            "val":   out_train + ".val_unused",
+                                            "test":  out_train + ".test_unused"})
+            # Simpler: use a direct parquet writer
+            import pyarrow.parquet as _pq
+            _writer = _pq.ParquetWriter(out_train, PARQUET_SCHEMA)
+            buffer = []
+            total_hits   = 0
+            total_misses = {}
 
-    # flush remaining records
-    writer.write_batch(buffer)
-    row_counts = writer.close()
+            copy_gen = _iter_copy_args(df_train, grouped, args.max_events,
+                                       task_desc, task, is_chexpert, epoch_idx=epoch_idx)
+            with mp.Pool(processes=n_workers) as pool:
+                for record, n_hits, misses in tqdm(
+                    pool.imap(_process_copy, copy_gen, chunksize=imap_cs),
+                    total=n_train_copies, desc=f"  epoch {epoch_idx}",
+                ):
+                    buffer.append(record)
+                    total_hits += n_hits
+                    for code, count in misses.items():
+                        total_misses[code] = total_misses.get(code, 0) + count
+                    if len(buffer) >= args.buffer_size:
+                        _flush_direct(_writer, buffer)
+                        buffer.clear()
+            _flush_direct(_writer, buffer)
+            _writer.close()
+            n_rows = _pq.read_metadata(out_train).num_rows
+            print(f"  Saved train epoch {epoch_idx}: {n_rows:,} rows → {out_train}")
+            if epoch_idx == 0:
+                print_coverage_report(total_hits, total_misses)
 
-    print_coverage_report(total_hits, total_misses)
-
-    total_rows = sum(row_counts.values())
-    print(f"Total output rows: {total_rows:,} (from {len(df_labels)} original samples)")
-    for split in ["train", "val", "test"]:
-        if row_counts[split] == 0:
-            print(f"  Warning: no samples for split '{split}'")
-            continue
-        print(f"  Saved {split}: {row_counts[split]:,} rows -> {out_paths[split]}")
-
-    print("Done!")
+    print("\nDone!")
 
 
 if __name__ == "__main__":

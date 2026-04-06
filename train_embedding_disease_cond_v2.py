@@ -35,6 +35,7 @@ Single GPU
 NOTE: QLoRA (--qlora) is incompatible with multi-GPU DDP.
 """
 
+import json
 import os
 import math
 import random
@@ -52,10 +53,8 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
 
-from utils.h2d import CudaPrefetcher
-from utils.async_dataloader import AsyncDataLoader
-
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig, logging as hf_logging
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training, PeftModel
@@ -196,176 +195,221 @@ def _collate_event_embs(
     return out
 
 
-# ── Training dataset ──────────────────────────────────────────────────────────
+# ── Per-epoch in-memory data store ────────────────────────────────────────────
 
-class PreparedDataset(Dataset):
-    """Training dataset for prepare_task_data.py output.
+class PreparedEpochData:
+    """Loads all tasks' prepare_task_data_v2.py output for one data epoch.
 
-    Loads all shards into RAM, groups samples by (task_idx, label).
-    Each epoch: pos/neg pools per task are independently shuffled, then a
-    batch schedule is built so that every batch contains exactly one task
-    and half positives + half negatives.  Batches alternate across tasks.
+    Data layout (per task): rows are interleaved pos/neg blocks of max_batch_size.
+    Each training batch of batch_size rows is a contiguous slice within one block.
 
-    Call set_epoch(epoch) before each epoch to regenerate the schedule.
-
-    Schema: task_idx (int16), label (int8), event_ids (list<int32>), source_row (int32)
+    Schema: patient_id (int64), task_idx (int16), label (int8),
+            event_ids (list<int32>), source_row (int32)
     """
 
     def __init__(
         self,
-        paths:             list[str],
+        data_dir:          str,
+        data_epoch_idx:    int,
+        tasks:             list[str],
         store:             EmbeddingStore,
-        batch_size:        int,
-        rank:              int = 0,
-        world_size:        int = 1,
-        seed:              int = 42,
         pad_to_num_events: int | None = None,
     ):
-        if batch_size < 4 or batch_size % 2 != 0:
-            raise ValueError(f"batch_size must be even and ≥4, got {batch_size}")
-
         self.store             = store
-        self.batch_size        = batch_size
-        self.half              = batch_size // 2
-        self.rank              = rank
-        self.world_size        = world_size
-        self.seed              = seed
         self.pad_to_num_events = pad_to_num_events
-
-        # pos[task_idx] / neg[task_idx] = list of event_id arrays
-        pos: dict[int, list[np.ndarray]] = defaultdict(list)
-        neg: dict[int, list[np.ndarray]] = defaultdict(list)
-
-        for path in paths:
-            logger.info(f"Loading shard {path} …")
-            pf = pq.ParquetFile(path)
-            for rg_batch in pf.iter_batches(columns=["task_idx", "label", "event_ids"]):
-                df = rg_batch.to_pandas()
-                for row in df.itertuples(index=False):
-                    eids = np.array(row.event_ids, dtype=np.int32)
-                    (pos if row.label == 1 else neg)[int(row.task_idx)].append(eids)
-                del df
-
-        self.pos = dict(pos)
-        self.neg = dict(neg)
-
-        half = self.half
-        self.valid_tasks = sorted(
-            t for t in self.pos
-            if len(self.pos[t]) >= half and len(self.neg.get(t, [])) >= half
-        )
-        if not self.valid_tasks:
-            raise ValueError(
-                f"No task has ≥{half} positives and ≥{half} negatives. "
-                f"Reduce --batch_size or provide more data."
-            )
-        skipped = set(self.pos) - set(self.valid_tasks)
-        if skipped:
-            logger.warning(f"  Skipped tasks with insufficient data: {sorted(skipped)}")
+        self.max_batch_size:   int | None = None
+        self.num_max_batches:  dict[int, int] = {}   # task_idx → n_max_batches
+        self.event_ids:        dict[int, list[np.ndarray]] = {}   # task_idx → per-row eids
+        self.labels:           dict[int, np.ndarray] = {}         # task_idx → label array
+        self.valid_task_idxs:  list[int] = []
 
         idx_to_name = {v: k for k, v in TASK_2_IDX.items()}
-        for t in self.valid_tasks:
-            logger.info(f"  [{idx_to_name.get(t, t)}] "
-                        f"{len(self.pos[t]):,} pos / {len(self.neg[t]):,} neg")
 
-        self._n_per_task = {
-            t: min(len(self.pos[t]), len(self.neg[t])) // half
-            for t in self.valid_tasks
-        }
+        for task in sorted(tasks):
+            task_idx = TASK_2_IDX[task]
+            p_parquet = Path(data_dir) / task / f"train_prepared_{data_epoch_idx:03d}.parquet"
+            p_json    = Path(data_dir) / task / f"train_prepared_{data_epoch_idx:03d}.json"
 
-        # _batches populated by set_epoch(); initialise for epoch 0
-        self._batches:  list[tuple[int, int]] = []
-        self._pos_perm: dict[int, list[int]]  = {}
-        self._neg_perm: dict[int, list[int]]  = {}
-        self.n_batches = 0
-        self.set_epoch(0)
+            if not p_parquet.exists():
+                logger.warning(f"  [{task}] {p_parquet} not found — skipping")
+                continue
 
-    def set_epoch(self, epoch: int) -> None:
-        """Shuffle pos/neg pools per task and rebuild the interleaved batch schedule."""
-        g    = torch.Generator()
-        g.manual_seed(self.seed + epoch)
+            with open(p_json) as f:
+                meta = json.load(f)
 
-        self._pos_perm = {
-            t: torch.randperm(len(self.pos[t]), generator=g).tolist()
-            for t in self.valid_tasks
-        }
-        self._neg_perm = {
-            t: torch.randperm(len(self.neg[t]), generator=g).tolist()
-            for t in self.valid_tasks
-        }
+            mbs = meta["max_batch_size"]
+            if self.max_batch_size is None:
+                self.max_batch_size = mbs
+            elif self.max_batch_size != mbs:
+                raise ValueError(
+                    f"Inconsistent max_batch_size across tasks: "
+                    f"{self.max_batch_size} vs {mbs} for {task}"
+                )
 
-        # Interleave (task, slot) pairs then globally shuffle
-        flat = [(t, b) for t in self.valid_tasks for b in range(self._n_per_task[t])]
-        perm = torch.randperm(len(flat), generator=g).tolist()
-        flat = [flat[i] for i in perm]
+            self.num_max_batches[task_idx] = meta["num_batches"]
+            logger.info(f"  [{task}] Loading {p_parquet.name} "
+                        f"({meta['num_batches']} max-batches, "
+                        f"{meta['used_rows']:,} rows) …")
 
-        # Truncate to a multiple of world_size so every rank gets the same
-        # number of batches — prevents NCCL hangs from rank imbalance.
-        n_total = (len(flat) // self.world_size) * self.world_size
-        flat = flat[:n_total]
+            df = pd.read_parquet(str(p_parquet), columns=["label", "event_ids"])
+            self.event_ids[task_idx] = [np.array(e, dtype=np.int32) for e in df["event_ids"]]
+            self.labels[task_idx]    = df["label"].values.astype(np.int8)
+            self.valid_task_idxs.append(task_idx)
+            del df
 
-        self._batches  = flat[self.rank :: self.world_size]
-        self.n_batches = len(self._batches)
+        if not self.valid_task_idxs:
+            raise ValueError("No valid prepared data found for any task.")
 
-    def __len__(self) -> int:
-        return self.n_batches
-
-    def __getitem__(self, j: int) -> dict[str, torch.Tensor]:
-        task, slot = self._batches[j]
-        half       = self.half
-        pos_perm   = self._pos_perm[task]
-        neg_perm   = self._neg_perm[task]
-
-        eids_list: list[np.ndarray] = []
-        labels:    list[int]        = []
-        for i in range(half):
-            eids_list.append(self.pos[task][pos_perm[slot * half + i]])
-            labels.append(1)
-        for i in range(half):
-            eids_list.append(self.neg[task][neg_perm[slot * half + i]])
-            labels.append(0)
-
+    def get_batch(self, task_idx: int, start_row: int, batch_size: int) -> dict[str, torch.Tensor]:
+        """Return a collated batch dict for rows [start_row, start_row+batch_size)."""
+        end_row   = start_row + batch_size
+        eids_list = self.event_ids[task_idx][start_row:end_row]
+        labels    = self.labels[task_idx][start_row:end_row].tolist()
         return _collate_event_embs(
-            eids_list, [task] * self.batch_size, labels,
+            eids_list, [task_idx] * len(eids_list), labels,
             self.store.embeddings, self.pad_to_num_events,
         )
 
 
-# ── Eval data index ───────────────────────────────────────────────────────────
+def build_epoch_schedule(
+    epoch_data: PreparedEpochData,
+    batch_size: int,
+    training_epoch: int,
+    seed: int,
+    world_size: int,
+) -> list[tuple[int, int]]:
+    """Build a shuffled list of (task_idx, start_row) for one training epoch.
 
-class EvalDataIndex:
-    """In-memory index for build_eval_task_data.py output.
-
-    Schema: patient_id (int64), task_idx (int16), label (int8), event_ids (list<int32>)
-
-    pos[task_idx] = list[(patient_id, event_ids_array)]
-    neg[task_idx] = list[(patient_id, event_ids_array)]
+    Each max_batch of max_batch_size rows yields (max_batch_size // batch_size)
+    training batches. The full list is shuffled, truncated to a world_size
+    multiple, and returned (all ranks get the same full list and slice by rank).
     """
+    sub_per_max = epoch_data.max_batch_size // batch_size
+    batches: list[tuple[int, int]] = []
 
-    def __init__(self, paths: list[str], store: EmbeddingStore):
-        self.store = store
-        pos: dict[int, list[tuple[int, np.ndarray]]] = defaultdict(list)
-        neg: dict[int, list[tuple[int, np.ndarray]]] = defaultdict(list)
+    for task_idx in epoch_data.valid_task_idxs:
+        n_max = epoch_data.num_max_batches[task_idx]
+        for max_i in range(n_max):
+            for sub_i in range(sub_per_max):
+                start_row = max_i * epoch_data.max_batch_size + sub_i * batch_size
+                batches.append((task_idx, start_row))
 
-        for path in paths:
-            logger.info(f"Loading eval data {path} …")
-            df = pd.read_parquet(path, columns=["patient_id", "task_idx", "label", "event_ids"])
-            for row in df.itertuples(index=False):
-                task_idx = int(row.task_idx)
-                pid      = int(row.patient_id)
-                eids     = np.array(row.event_ids, dtype=np.int32)
-                (pos if int(row.label) == 1 else neg)[task_idx].append((pid, eids))
-            del df
+    rng = random.Random(seed + training_epoch * 1337)
+    rng.shuffle(batches)
 
-        self.pos: dict[int, list[tuple[int, np.ndarray]]] = dict(pos)
-        self.neg: dict[int, list[tuple[int, np.ndarray]]] = dict(neg)
-        self._idx_to_name = {v: k for k, v in TASK_2_IDX.items()}
+    # Truncate to world_size multiple for balanced DDP
+    n_total = (len(batches) // world_size) * world_size
+    return batches[:n_total]
 
-        for task_idx in sorted(set(list(pos.keys()) + list(neg.keys()))):
-            name  = self._idx_to_name.get(task_idx, str(task_idx))
-            n_pos = len(pos.get(task_idx, []))
-            n_neg = len(neg.get(task_idx, []))
-            logger.info(f"  EvalDataIndex [{name}]: {n_pos} pos / {n_neg} neg")
+
+# ── Eval triplet pre-computation ──────────────────────────────────────────────
+
+EVAL_TRIPLET_SCHEMA = pa.schema([
+    pa.field("task_idx",      pa.int16()),
+    pa.field("anchor_eids",   pa.list_(pa.int32())),
+    pa.field("positive_eids", pa.list_(pa.int32())),
+    pa.field("negative_eids", pa.list_(pa.int32())),
+])
+
+
+def precompute_eval_triplets(
+    eval_data_paths:      list[str],
+    n_triplets_per_task:  int,
+    seed:                 int,
+    output_path:          Path,
+) -> int:
+    """Sample anchor/positive/negative triplets from eval data and save to parquet.
+
+    Triplet constraints (same as before):
+      - anchor and positive from different patients
+      - anchor and negative from different patient than anchor
+
+    Returns the number of triplets saved.
+    """
+    pos: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
+    neg: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
+
+    for path in eval_data_paths:
+        df = pd.read_parquet(path, columns=["patient_id", "task_idx", "label", "event_ids"])
+        for row in df.itertuples(index=False):
+            task_idx = int(row.task_idx)
+            pid      = int(row.patient_id)
+            eids     = list(row.event_ids)
+            (pos if int(row.label) == 1 else neg)[task_idx].append((pid, eids))
+        del df
+
+    rng = random.Random(seed)
+    idx_to_name = {v: k for k, v in TASK_2_IDX.items()}
+    records: list[dict] = []
+
+    for task_idx in sorted(set(list(pos.keys()) + list(neg.keys()))):
+        pos_list = pos.get(task_idx, [])
+        neg_list = neg.get(task_idx, [])
+
+        if len(pos_list) < 2 or not neg_list:
+            logger.warning(f"  [{idx_to_name.get(task_idx, task_idx)}] "
+                           f"insufficient eval data for triplets — skipping")
+            continue
+
+        pos_pool = list(range(len(pos_list)))
+        neg_pool = list(range(len(neg_list)))
+        rng.shuffle(pos_pool)
+        rng.shuffle(neg_pool)
+
+        n = min(n_triplets_per_task, len(pos_list))
+        ni_cursor = 0
+        task_count = 0
+
+        for i in range(n):
+            ai          = pos_pool[i]
+            anchor_pid  = pos_list[ai][0]
+            anchor_eids = pos_list[ai][1]
+
+            # Positive: different patient
+            pi = None
+            for offset in range(1, len(pos_pool)):
+                cand = pos_pool[(i + offset) % len(pos_pool)]
+                if pos_list[cand][0] != anchor_pid:
+                    pi = cand
+                    break
+            if pi is None:
+                continue
+
+            # Negative: different patient from anchor
+            ni = None
+            for offset in range(len(neg_pool)):
+                cand = neg_pool[(ni_cursor + offset) % len(neg_pool)]
+                if neg_list[cand][0] != anchor_pid:
+                    ni = cand
+                    break
+            ni_cursor += 1
+            if ni is None:
+                continue
+
+            records.append({
+                "task_idx":      task_idx,
+                "anchor_eids":   anchor_eids,
+                "positive_eids": pos_list[pi][1],
+                "negative_eids": neg_list[ni][1],
+            })
+            task_count += 1
+
+        logger.info(f"  [{idx_to_name.get(task_idx, task_idx)}] {task_count} eval triplets")
+
+    rng.shuffle(records)
+
+    table = pa.table(
+        {
+            "task_idx":      pa.array([r["task_idx"]      for r in records], type=pa.int16()),
+            "anchor_eids":   pa.array([r["anchor_eids"]   for r in records], type=pa.list_(pa.int32())),
+            "positive_eids": pa.array([r["positive_eids"] for r in records], type=pa.list_(pa.int32())),
+            "negative_eids": pa.array([r["negative_eids"] for r in records], type=pa.list_(pa.int32())),
+        },
+        schema=EVAL_TRIPLET_SCHEMA,
+    )
+    pq.write_table(table, str(output_path))
+    logger.info(f"  Saved {len(records)} eval triplets → {output_path}")
+    return len(records)
 
 
 # ── Model setup ───────────────────────────────────────────────────────────────
@@ -529,168 +573,77 @@ class EvalBatchDataset(Dataset):
 
 
 @torch.inference_mode()
-def evaluate_ddp(
-    encoder:    DiseaseAwareEHREncoder,
-    eval_index: EvalDataIndex,
-    device:     torch.device,
+def evaluate_rank0(
+    encoder:           DiseaseAwareEHREncoder,
+    eval_triplet_path: Path,
+    store:             EmbeddingStore,
+    device:            torch.device,
     args,
-    rank:       int,
-    world_size: int,
-    is_ddp:     bool,
 ) -> tuple[float, dict[str, float]]:
-    """Triplet accuracy distributed across all ranks.
+    """Rank-0-only triplet evaluation using pre-computed triplet parquet.
 
-    Returns (overall_acc, {task_name: acc}).
-
-    Triplet constraints:
-      - anchor and positive come from *different* patients
-      - anchor and negative come from *different* patients
-
-    Both pools are shuffled before selection so consecutive eval samples
-    are spread out.
+    Loads triplets from eval_triplet_path (written by precompute_eval_triplets),
+    encodes anchor/positive/negative, computes accuracy per task and overall.
     """
     raw_encoder = encoder.module if isinstance(encoder, DDP) else encoder
     raw_encoder.eval()
 
-    rng = random.Random(args.seed)
-    idx_to_name = eval_index._idx_to_name
-
-    # Each entry in these lists is (event_ids_array, task_idx).
-    anchors_e:      list[tuple[np.ndarray, int]] = []
-    positives_e:    list[tuple[np.ndarray, int]] = []
-    negatives_e:    list[tuple[np.ndarray, int]] = []
-    task_of_triplet: list[int]                   = []
-
-    valid_task_idxs = sorted(
-        t for t in eval_index.pos
-        if len(eval_index.pos[t]) >= 2 and eval_index.neg.get(t)
+    df = pd.read_parquet(
+        str(eval_triplet_path),
+        columns=["task_idx", "anchor_eids", "positive_eids", "negative_eids"],
     )
+    n_triplets = len(df)
 
-    for task_idx in valid_task_idxs:
-        pos_entries = eval_index.pos[task_idx]   # list[(pid, eids)]
-        neg_entries = eval_index.neg[task_idx]
-
-        # Shuffle both pools so adjacent duplicates are spread out.
-        pos_pool = list(range(len(pos_entries)))
-        neg_pool = list(range(len(neg_entries)))
-        rng.shuffle(pos_pool)
-        rng.shuffle(neg_pool)
-
-        n = min(args.n_eval_triplets_per_task, len(pos_entries))
-        ni_cursor = 0
-        for i in range(n):
-            ai           = pos_pool[i]
-            anchor_pid   = pos_entries[ai][0]
-            anchor_eids  = pos_entries[ai][1]
-
-            # Positive: find a sample from a *different* patient.
-            pi = None
-            for offset in range(1, len(pos_pool)):
-                cand = pos_pool[(i + offset) % len(pos_pool)]
-                if pos_entries[cand][0] != anchor_pid:
-                    pi = cand
-                    break
-            if pi is None:
-                continue   # all positives are from the same patient — skip
-
-            # Negative: find a sample from a *different* patient.
-            ni = None
-            for offset in range(len(neg_pool)):
-                cand = neg_pool[(ni_cursor + offset) % len(neg_pool)]
-                if neg_entries[cand][0] != anchor_pid:
-                    ni = cand
-                    break
-            ni_cursor += 1
-            if ni is None:
-                continue   # all negatives are from the same patient — skip
-
-            anchors_e.append((anchor_eids,          task_idx))
-            positives_e.append((pos_entries[pi][1], task_idx))
-            negatives_e.append((neg_entries[ni][1], task_idx))
-            task_of_triplet.append(task_idx)
-
-    if not anchors_e:
-        if rank == 0:
-            logger.warning("No eval triplets could be built.")
+    if n_triplets == 0:
+        logger.warning("eval_triplets.parquet is empty — skipping eval.")
+        raw_encoder.train()
         return 0.0, {}
 
-    n_triplets    = len(anchors_e)
-    my_triple_idx = list(range(rank, n_triplets, world_size))
-    my_entries: list[tuple[np.ndarray, int]] = (
-        [anchors_e[t]   for t in my_triple_idx] +
-        [positives_e[t] for t in my_triple_idx] +
-        [negatives_e[t] for t in my_triple_idx]
-    )
+    # Build interleaved entry list: [a0, p0, n0, a1, p1, n1, ...]
+    entries: list[tuple[np.ndarray, int]] = []
+    for row in df.itertuples(index=False):
+        t = int(row.task_idx)
+        entries.append((np.array(row.anchor_eids,   dtype=np.int32), t))
+        entries.append((np.array(row.positive_eids, dtype=np.int32), t))
+        entries.append((np.array(row.negative_eids, dtype=np.int32), t))
 
-    eval_ds = EvalBatchDataset(my_entries, eval_index.store,
-                               args.eval_batch_size, args.pad_to_num_events)
+    eval_ds = EvalBatchDataset(entries, store, args.eval_batch_size, args.pad_to_num_events)
     eval_dl = DataLoader(
-        eval_ds,
-        batch_size=1,
-        shuffle=False,
-        collate_fn=lambda b: b[0],
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-    eval_prefetcher = CudaPrefetcher(
-        AsyncDataLoader(eval_dl, buffer_size=4),
-        device=device, cuda_keys=[],
+        eval_ds, batch_size=1, shuffle=False,
+        collate_fn=lambda b: b[0], num_workers=0,
     )
 
-    all_emb_chunks = []
-    for batch in tqdm(eval_prefetcher, desc="Evaluating", disable=(rank != 0),
-                      dynamic_ncols=True, total=len(eval_ds)):
-        all_emb_chunks.append(
+    all_embs: list[torch.Tensor] = []
+    for batch in tqdm(eval_dl, desc="Evaluating", dynamic_ncols=True):
+        all_embs.append(
             raw_encoder(
-                batch["event_embs"],
-                batch["event_mask"],
-                batch["task_idxs"],
+                batch["event_embs"].to(device),
+                batch["event_mask"].to(device),
+                batch["task_idxs"].to(device),
             ).cpu()
         )
 
-    n_my = len(my_triple_idx)
-    if all_emb_chunks and n_my > 0:
-        embs    = torch.cat(all_emb_chunks, dim=0)   # (3 * n_my, D)
-        d_ap    = (embs[:n_my] - embs[n_my:2*n_my]).norm(dim=1)
-        d_an    = (embs[:n_my] - embs[2*n_my:]).norm(dim=1)
-        correct = (d_ap < d_an)   # (n_my,) bool
+    embs      = torch.cat(all_embs, dim=0)   # (3 * n_triplets, D)
+    anchors   = embs[0::3]                    # (n_triplets, D)
+    positives = embs[1::3]
+    negatives = embs[2::3]
 
-        # ── Per-task local counts ─────────────────────────────────────────────
-        my_task_idxs = [task_of_triplet[t] for t in my_triple_idx]
-        local_task_correct: dict[int, torch.Tensor] = {}
-        local_task_total:   dict[int, torch.Tensor] = {}
-        for t_idx in valid_task_idxs:
-            mask = torch.tensor([t == t_idx for t in my_task_idxs], dtype=torch.bool)
-            local_task_correct[t_idx] = correct[mask].sum().to(torch.long).to(device)
-            local_task_total[t_idx]   = mask.sum().to(torch.long).to(device)
+    d_ap    = (anchors - positives).norm(dim=1)
+    d_an    = (anchors - negatives).norm(dim=1)
+    correct = d_ap < d_an                    # (n_triplets,) bool
 
-        local_correct = correct.sum().to(torch.long).to(device)
-        local_total   = torch.tensor(n_my, dtype=torch.long, device=device)
-    else:
-        local_task_correct = {t: torch.tensor(0, dtype=torch.long, device=device)
-                              for t in valid_task_idxs}
-        local_task_total   = {t: torch.tensor(0, dtype=torch.long, device=device)
-                              for t in valid_task_idxs}
-        local_correct = torch.tensor(0, dtype=torch.long, device=device)
-        local_total   = torch.tensor(0, dtype=torch.long, device=device)
-
-    if is_ddp:
-        dist.all_reduce(local_correct, op=dist.ReduceOp.SUM)
-        dist.all_reduce(local_total,   op=dist.ReduceOp.SUM)
-        for t_idx in valid_task_idxs:
-            dist.all_reduce(local_task_correct[t_idx], op=dist.ReduceOp.SUM)
-            dist.all_reduce(local_task_total[t_idx],   op=dist.ReduceOp.SUM)
-
-    overall_acc = (local_correct.float() / local_total.float()).item() \
-                  if local_total.item() > 0 else 0.0
-
+    task_idxs_arr = df["task_idx"].values
+    idx_to_name   = {v: k for k, v in TASK_2_IDX.items()}
     task_acc: dict[str, float] = {}
-    for t_idx in valid_task_idxs:
-        n_t = local_task_total[t_idx].item()
-        task_name = idx_to_name.get(t_idx, str(t_idx))
-        task_acc[task_name] = (local_task_correct[t_idx].float() / n_t).item() \
-                              if n_t > 0 else 0.0
 
+    for t_idx in sorted(set(task_idxs_arr.tolist())):
+        mask = task_idxs_arr == t_idx
+        n_t  = int(mask.sum())
+        if n_t > 0:
+            acc = correct[torch.from_numpy(mask)].float().mean().item()
+            task_acc[idx_to_name.get(t_idx, str(t_idx))] = acc
+
+    overall_acc = correct.float().mean().item()
     raw_encoder.train()
     return overall_acc, task_acc
 
@@ -711,9 +664,12 @@ def parse_args():
                    help="Path to a saved checkpoint dir (contains lora/ + extra_modules.pt).")
 
     # Data
-    p.add_argument("--train_data_paths", nargs="+", default=None,
-                   help="Prepared train shard parquets (output of prepare_task_data.py). "
+    p.add_argument("--train_data_dir", default=None,
+                   help="Base directory for prepared training data from prepare_task_data_v2.py "
+                        "(contains {task}/train_prepared_{epoch:03d}.parquet). "
                         "Required unless --eval_only.")
+    p.add_argument("--tasks", nargs="+", default=list(sorted(TASK_2_DISEASE_NAME.keys())),
+                   help="Tasks to train on (default: all tasks in TASK_2_IDX).")
     p.add_argument("--eval_data_paths",  nargs="+", default=None,
                    help="Eval parquets (output of build_eval_task_data.py).")
 
@@ -755,7 +711,7 @@ def parse_args():
                    help="Temperature for InfoNCE loss.")
     p.add_argument("--triplet_margin",           type=float, default=0.3,
                    help="Margin for BatchHardTripletLoss (only used when --loss triplet).")
-    p.add_argument("--n_eval_triplets_per_task", type=int,   default=100)
+    p.add_argument("--n_eval_triplets_per_task", type=int,   default=256)
     p.add_argument("--eval_batch_size",          type=int,   default=32)
     p.add_argument("--pad_to_num_events",        type=int,   default=None)
 
@@ -797,8 +753,8 @@ def main():
 
     if args.qlora and is_ddp:
         raise RuntimeError("QLoRA is incompatible with multi-GPU DDP. Use single GPU.")
-    if not args.eval_only and not args.train_data_paths:
-        raise ValueError("--train_data_paths is required unless --eval_only is set.")
+    if not args.eval_only and args.train_data_dir is None:
+        raise ValueError("--train_data_dir is required unless --eval_only is set.")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir   = Path(args.output_dir) / timestamp
@@ -857,15 +813,25 @@ def main():
         encoder = DDP(encoder, device_ids=[local_rank], output_device=local_rank,
                       find_unused_parameters=False, static_graph=True)
 
+    # ── Pre-compute eval triplets (rank 0 only, once before training) ─────────
+    # Stored in run_dir so rank 0 can reload per epoch. Other ranks do not need
+    # this path because eval is rank-0-only.
+    eval_triplet_path: Path | None = None
+    if args.eval_data_paths and rank == 0:
+        eval_triplet_path = run_dir / "eval_triplets.parquet"
+        logger.info("Pre-computing eval triplets …")
+        precompute_eval_triplets(
+            args.eval_data_paths,
+            args.n_eval_triplets_per_task,
+            args.seed,
+            eval_triplet_path,
+        )
+
     # ── Eval-only mode ─────────────────────────────────────────────────────────
     if args.eval_only:
-        if not args.eval_data_paths:
+        if eval_triplet_path is None:
             raise ValueError("--eval_only requires --eval_data_paths.")
-        eval_index = EvalDataIndex(args.eval_data_paths, store)
-        val_acc, val_task_acc = evaluate_ddp(
-            encoder, eval_index,
-            device, args, rank, world_size, is_ddp,
-        )
+        val_acc, val_task_acc = evaluate_rank0(encoder, eval_triplet_path, store, device, args)
         if rank == 0:
             logger.info(f"Eval triplet accuracy: {val_acc:.4f}")
             for task, acc in sorted(val_task_acc.items()):
@@ -881,20 +847,25 @@ def main():
             dist.destroy_process_group()
         return
 
-    # ── Training dataset ───────────────────────────────────────────────────────
-    train_ds = PreparedDataset(
-        paths=args.train_data_paths,
-        store=store,
-        batch_size=args.batch_size,
-        rank=rank,
-        world_size=world_size,
-        seed=args.seed,
-        pad_to_num_events=args.pad_to_num_events,
-    )
+    # ── Count available data epochs ────────────────────────────────────────────
+    first_task = sorted(args.tasks)[0]
+    task_dir   = Path(args.train_data_dir) / first_task
+    data_epoch_files = sorted(task_dir.glob("train_prepared_*.parquet"))
+    n_data_epochs    = len(data_epoch_files)
+    if n_data_epochs == 0:
+        raise ValueError(f"No train_prepared_*.parquet found in {task_dir}")
+    if rank == 0:
+        logger.info(f"Found {n_data_epochs} data epoch(s) (task dir: {task_dir})")
 
-    eval_index = None
-    if args.eval_data_paths:
-        eval_index = EvalDataIndex(args.eval_data_paths, store)
+    # ── Estimate schedule size for LR scheduler (use data epoch 0) ────────────
+    if rank == 0:
+        logger.info("Estimating epoch size from data epoch 0 …")
+    epoch_data_0 = PreparedEpochData(
+        args.train_data_dir, 0, args.tasks, store, args.pad_to_num_events
+    )
+    schedule_0            = build_epoch_schedule(epoch_data_0, args.batch_size, 0, args.seed, world_size)
+    n_batches_per_rank_0  = len(schedule_0) // world_size
+    del epoch_data_0
 
     # ── Optimizer + LR scheduler ───────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -903,8 +874,7 @@ def main():
         fused=True,
     )
 
-    n_batches_per_epoch   = train_ds.n_batches
-    n_opt_steps_per_epoch = math.ceil(n_batches_per_epoch / args.grad_accum)
+    n_opt_steps_per_epoch = math.ceil(n_batches_per_rank_0 / args.grad_accum)
     total_opt_steps       = n_opt_steps_per_epoch * args.epochs
     warmup_steps          = int(total_opt_steps * args.warmup_ratio)
 
@@ -914,7 +884,8 @@ def main():
         progress = (step - warmup_steps) / max(total_opt_steps - warmup_steps, 1)
         return max(0.0, 1.0 - progress)
 
-    scheduler   = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     if args.loss == "infonce":
         _loss_fn  = lambda labels, emb: supervised_infonce_loss(emb, labels, args.temperature)
         loss_desc = f"SupervisedInfoNCE (temperature={args.temperature})"
@@ -936,38 +907,9 @@ def main():
 
     if rank == 0:
         logger.info(f"Training: {args.epochs} epochs, "
-                    f"{n_batches_per_epoch} batches/epoch, "
+                    f"~{n_batches_per_rank_0} batches/rank/epoch, "
                     f"{total_opt_steps} optimizer steps total")
         logger.info(loss_desc)
-
-    # ── Training DataLoader ────────────────────────────────────────────────────
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=1,
-        shuffle=False,
-        collate_fn=lambda b: b[0],
-        num_workers=args.num_workers,
-        pin_memory=True,
-        prefetch_factor=args.prefetch_factor,
-    )
-
-    # ── Sanity-check first batch ───────────────────────────────────────────────
-    if rank == 0:
-        first_batch = train_ds[0]
-        task_ids = first_batch["task_idxs"].tolist()
-        labels   = first_batch["labels"].tolist()
-        n_pos    = sum(labels)
-        n_neg    = len(labels) - n_pos
-        unique_tasks = set(task_ids)
-        idx_to_name  = {v: k for k, v in TASK_2_IDX.items()}
-        assert len(unique_tasks) == 1, \
-            f"First batch has {len(unique_tasks)} tasks: {unique_tasks}"
-        assert n_pos == n_neg, \
-            f"First batch pos/neg imbalance: {n_pos} pos / {n_neg} neg"
-        logger.info(
-            f"First batch check OK: task={idx_to_name.get(task_ids[0], task_ids[0])}  "
-            f"pos={n_pos}  neg={n_neg}"
-        )
 
     # ── Training loop ──────────────────────────────────────────────────────────
     best_val_acc = 0.0
@@ -976,39 +918,53 @@ def main():
     for epoch in range(args.epochs):
         if is_ddp:
             dist.barrier()
-        train_ds.set_epoch(epoch)
-        encoder.train()
 
+        # Map training epoch → data epoch (wraps around if fewer data epochs)
+        data_epoch = epoch % n_data_epochs
+        if rank == 0:
+            logger.info(f"Epoch {epoch+1}/{args.epochs}: loading data epoch {data_epoch} …")
+
+        epoch_data = PreparedEpochData(
+            args.train_data_dir, data_epoch, args.tasks, store, args.pad_to_num_events
+        )
+        schedule             = build_epoch_schedule(epoch_data, args.batch_size, epoch, args.seed, world_size)
+        my_schedule          = schedule[rank::world_size]   # this rank's batches
+        n_batches_this_epoch = len(my_schedule)
+
+        encoder.train()
         epoch_loss = 0.0
         optimizer.zero_grad()
 
-        prefetcher = CudaPrefetcher(
-            train_loader,
-            device=device, cuda_keys=[],
+        pbar = tqdm(
+            enumerate(my_schedule),
+            desc=f"Epoch {epoch+1}/{args.epochs}",
+            disable=(rank != 0),
+            dynamic_ncols=True,
+            total=n_batches_this_epoch,
         )
-        pbar = tqdm(prefetcher, desc=f"Epoch {epoch+1}/{args.epochs}",
-                    disable=(rank != 0), dynamic_ncols=True, total=n_batches_per_epoch)
 
-        for batch_idx, batch in enumerate(pbar):
+        batch_idx = -1
+        for batch_idx, (task_idx, start_row) in pbar:
             if args.debug_batches is not None and batch_idx >= args.debug_batches:
                 break
 
+            batch    = epoch_data.get_batch(task_idx, start_row, args.batch_size)
             labels_t = batch["labels"]
 
             is_update_step = (
                 (batch_idx + 1) % args.grad_accum == 0
-                or (batch_idx + 1) == n_batches_per_epoch
+                or (batch_idx + 1) == n_batches_this_epoch
             )
             sync_ctx = nullcontext() if (is_update_step or not is_ddp) \
                        else encoder.no_sync()
 
             with sync_ctx:
                 emb = encoder(
-                    batch["event_embs"],
-                    batch["event_mask"],
-                    batch["task_idxs"],
+                    batch["event_embs"].to(device),
+                    batch["event_mask"].to(device),
+                    batch["task_idxs"].to(device),
                 )
-                loss = _loss_fn(labels_t, emb)
+                loss = _loss_fn(labels_t.to(device), emb)
                 loss = loss / args.grad_accum
                 loss.backward()
 
@@ -1031,17 +987,17 @@ def main():
                     # Pairwise distance diagnostics
                     d_pp = d_pn = float("nan")
                     with torch.no_grad():
-                        e   = emb.detach().float()
-                        lbl = labels_t.detach()
+                        e     = emb.detach().float()
+                        lbl   = labels_t.detach().to(device)
                         e_pos = e[lbl == 1]
                         e_neg = e[lbl == 0]
                         if e_pos.size(0) >= 2:
-                            sim_pp  = e_pos @ e_pos.T
-                            n_pos_  = e_pos.size(0)
-                            tri     = torch.triu(torch.ones(n_pos_, n_pos_, dtype=torch.bool, device=e.device), diagonal=1)
-                            d_pp    = (1 - sim_pp[tri]).mean().item()
+                            sim_pp = e_pos @ e_pos.T
+                            n_pos_ = e_pos.size(0)
+                            tri    = torch.triu(torch.ones(n_pos_, n_pos_, dtype=torch.bool, device=e.device), diagonal=1)
+                            d_pp   = (1 - sim_pp[tri]).mean().item()
                         if e_pos.size(0) >= 1 and e_neg.size(0) >= 1:
-                            d_pn    = (1 - (e_pos @ e_neg.T)).mean().item()
+                            d_pn   = (1 - (e_pos @ e_neg.T)).mean().item()
 
                     pbar.set_postfix(
                         loss=f"{loss_now:.4f}",
@@ -1058,43 +1014,39 @@ def main():
                             "train/lr":           lr_now,
                             "train/dist_pos_pos": d_pp,
                             "train/dist_pos_neg": d_pn,
-                            "epoch":              epoch + (batch_idx + 1) / n_batches_per_epoch,
+                            "epoch":              epoch + (batch_idx + 1) / max(n_batches_this_epoch, 1),
                         }, step=opt_step)
 
             epoch_loss += loss.item() * args.grad_accum
 
-        n_batches_ran = min(batch_idx + 1, n_batches_per_epoch)
-        avg_loss = epoch_loss / max(n_batches_ran, 1)
+        del epoch_data   # free in-memory data before eval
+
+        n_batches_ran = batch_idx + 1   # 0 if no batches ran
+        avg_loss      = epoch_loss / max(n_batches_ran, 1)
         if rank == 0:
             logger.info(f"Epoch {epoch+1}/{args.epochs}  avg_loss={avg_loss:.4f}")
 
-        # ── Distributed evaluation ─────────────────────────────────────────
-        if eval_index is not None:
-            if is_ddp:
-                dist.barrier()
-            val_acc, val_task_acc = evaluate_ddp(
-                encoder, eval_index,
-                device, args, rank, world_size, is_ddp,
-            )
-            if rank == 0:
-                logger.info(f"  val triplet accuracy: {val_acc:.4f}")
-                for task, acc in sorted(val_task_acc.items()):
-                    logger.info(f"    {task}: {acc:.4f}")
-                if use_wandb:
-                    import wandb
-                    log_dict = {
-                        "val/triplet_acc":  val_acc,
-                        "train/epoch_loss": avg_loss,
-                        "epoch":            epoch + 1,
-                    }
-                    for task, acc in val_task_acc.items():
-                        log_dict[f"val/{task}/triplet_acc"] = acc
-                    wandb.log(log_dict, step=opt_step)
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    raw_enc = encoder.module if isinstance(encoder, DDP) else encoder
-                    raw_enc.save_checkpoint(run_dir / "best")
-                    logger.info(f"  New best: {best_val_acc:.4f}")
+        # ── Eval (rank 0 only — no barrier needed) ─────────────────────────────
+        if eval_triplet_path is not None and rank == 0:
+            val_acc, val_task_acc = evaluate_rank0(encoder, eval_triplet_path, store, device, args)
+            logger.info(f"  val triplet accuracy: {val_acc:.4f}")
+            for task, acc in sorted(val_task_acc.items()):
+                logger.info(f"    {task}: {acc:.4f}")
+            if use_wandb:
+                import wandb
+                log_dict = {
+                    "val/triplet_acc":  val_acc,
+                    "train/epoch_loss": avg_loss,
+                    "epoch":            epoch + 1,
+                }
+                for task, acc in val_task_acc.items():
+                    log_dict[f"val/{task}/triplet_acc"] = acc
+                wandb.log(log_dict, step=opt_step)
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                raw_enc = encoder.module if isinstance(encoder, DDP) else encoder
+                raw_enc.save_checkpoint(run_dir / "best")
+                logger.info(f"  New best: {best_val_acc:.4f}")
 
         if rank == 0:
             raw_enc = encoder.module if isinstance(encoder, DDP) else encoder
