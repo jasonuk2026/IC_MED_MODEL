@@ -240,7 +240,6 @@ class PreparedDataset(Dataset):
         """Shuffle pos/neg pools per task and rebuild the interleaved batch schedule."""
         g    = torch.Generator()
         g.manual_seed(self.seed + epoch)
-        half = self.half
 
         self._pos_perm = {
             t: torch.randperm(len(self.pos[t]), generator=g).tolist()
@@ -255,6 +254,11 @@ class PreparedDataset(Dataset):
         flat = [(t, b) for t in self.valid_tasks for b in range(self._n_per_task[t])]
         perm = torch.randperm(len(flat), generator=g).tolist()
         flat = [flat[i] for i in perm]
+
+        # Truncate to a multiple of world_size so every rank gets the same
+        # number of batches — prevents NCCL hangs from rank imbalance.
+        n_total = (len(flat) // self.world_size) * self.world_size
+        flat = flat[:n_total]
 
         self._batches  = flat[self.rank :: self.world_size]
         self.n_batches = len(self._batches)
