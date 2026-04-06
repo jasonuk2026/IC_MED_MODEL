@@ -661,6 +661,8 @@ def parse_args():
 
     # Mode
     p.add_argument("--eval_only",  action="store_true")
+    p.add_argument("--debug_batches", type=int, default=None,
+                   help="If set, stop each epoch after this many batches (for DDP smoke-test).")
     p.add_argument("--checkpoint", default=None,
                    help="Path to a saved checkpoint dir (contains lora/ + extra_modules.pt).")
 
@@ -924,6 +926,9 @@ def main():
                     disable=(rank != 0), dynamic_ncols=True, total=n_batches_per_epoch)
 
         for batch_idx, batch in enumerate(pbar):
+            if args.debug_batches is not None and batch_idx >= args.debug_batches:
+                break
+
             labels_t = batch["labels"]
 
             is_update_step = (
