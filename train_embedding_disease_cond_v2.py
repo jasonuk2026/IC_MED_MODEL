@@ -59,7 +59,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig, logging as hf_logging
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training, PeftModel
-from sentence_transformers.losses import BatchHardSoftMarginTripletLoss, BatchHardTripletLossDistanceFunction
+from sentence_transformers.losses import BatchHardSoftMarginTripletLoss, BatchHardTripletLoss, BatchHardTripletLossDistanceFunction
 from model import DiseaseAwareEHREncoder
 
 hf_logging.set_verbosity_warning()
@@ -705,6 +705,8 @@ def parse_args():
     p.add_argument("--log_steps",    type=int,   default=10)
 
     # Loss / Eval
+    p.add_argument("--triplet_margin",           type=float, default=0.3,
+                   help="Margin for BatchHardTripletLoss. Use 0 to fall back to soft-margin loss.")
     p.add_argument("--n_eval_triplets_per_task", type=int,   default=100)
     p.add_argument("--eval_batch_size",          type=int,   default=32)
     p.add_argument("--pad_to_num_events",        type=int,   default=None)
@@ -865,16 +867,27 @@ def main():
         return max(0.0, 1.0 - progress)
 
     scheduler   = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    loss_module = BatchHardSoftMarginTripletLoss(
-        model=None,
-        distance_metric=BatchHardTripletLossDistanceFunction.cosine_distance,
-    )
+    if args.triplet_margin > 0:
+        loss_module = BatchHardTripletLoss(
+            model=None,
+            distance_metric=BatchHardTripletLossDistanceFunction.cosine_distance,
+            margin=args.triplet_margin,
+        )
+        _loss_fn = lambda labels, emb: loss_module.batch_hard_triplet_loss(labels, emb)
+        loss_desc = f"BatchHardTripletLoss (margin={args.triplet_margin})"
+    else:
+        loss_module = BatchHardSoftMarginTripletLoss(
+            model=None,
+            distance_metric=BatchHardTripletLossDistanceFunction.cosine_distance,
+        )
+        _loss_fn = lambda labels, emb: loss_module.batch_hard_triplet_soft_margin_loss(labels, emb)
+        loss_desc = "BatchHardSoftMarginTripletLoss (soft margin)"
 
     if rank == 0:
         logger.info(f"Training: {args.epochs} epochs, "
                     f"{n_batches_per_epoch} batches/epoch, "
                     f"{total_opt_steps} optimizer steps total")
-        logger.info("BatchHardSoftMarginTripletLoss (soft margin)")
+        logger.info(loss_desc)
 
     # ── Training DataLoader ────────────────────────────────────────────────────
     train_loader = DataLoader(
@@ -944,7 +957,7 @@ def main():
                     batch["event_mask"],
                     batch["task_idxs"],
                 )
-                loss = loss_module.batch_hard_triplet_soft_margin_loss(labels_t, emb)
+                loss = _loss_fn(labels_t, emb)
                 loss = loss / args.grad_accum
                 loss.backward()
 
