@@ -195,16 +195,43 @@ def _collate_event_embs(
     return out
 
 
-# ── Per-epoch in-memory data store ────────────────────────────────────────────
+# ── Per-epoch lazy-loading Dataset ────────────────────────────────────────────
 
-class PreparedEpochData:
-    """Loads all tasks' prepare_task_data_v2.py output for one data epoch.
+# Worker-local ParquetFile handles — each DataLoader worker process has its own
+# copy (populated by _epoch_worker_init).  Empty in the main process.
+_worker_parquet_files: dict[int, pq.ParquetFile] = {}
 
-    Data layout (per task): rows are interleaved pos/neg blocks of max_batch_size.
-    Each training batch of batch_size rows is a contiguous slice within one block.
 
-    Schema: patient_id (int64), task_idx (int16), label (int8),
-            event_ids (list<int32>), source_row (int32)
+def _epoch_worker_init(worker_id: int) -> None:
+    """Called once per DataLoader worker process.
+
+    Opens one pq.ParquetFile per task so __getitem__ can read rows without
+    sharing file descriptors across processes.
+    """
+    worker_info = torch.utils.data.get_worker_info()
+    ds: EpochBatchDataset = worker_info.dataset
+    global _worker_parquet_files
+    _worker_parquet_files = {
+        task_idx: pq.ParquetFile(str(path))
+        for task_idx, path in ds.task_parquet_paths.items()
+    }
+
+
+class EpochBatchDataset(Dataset):
+    """Schedule-based lazy-loading dataset for one training epoch.
+
+    Construction reads only the JSON metadata files (milliseconds, no parquet
+    I/O).  Each __getitem__ reads exactly batch_size rows from the right row
+    group via pq.ParquetFile.read_row_group() — O(1) seek, no full-file load.
+
+    prepare_task_data_v2.py writes parquets with row_group_size=max_batch_size,
+    so the mapping is exact:
+        rg_idx      = start_row // max_batch_size   (which row group)
+        local_start = start_row %  max_batch_size   (offset within group)
+
+    Use with DataLoader(worker_init_fn=_epoch_worker_init, num_workers=N>=1)
+    to overlap parquet I/O with GPU computation.  Falls back to per-instance
+    lazy handles when num_workers=0.
     """
 
     def __init__(
@@ -213,20 +240,25 @@ class PreparedEpochData:
         data_epoch_idx:    int,
         tasks:             list[str],
         store:             EmbeddingStore,
+        batch_size:        int,
+        training_epoch:    int,
+        seed:              int,
+        world_size:        int,
+        rank:              int,
         pad_to_num_events: int | None = None,
     ):
-        self.store             = store
-        self.pad_to_num_events = pad_to_num_events
-        self.max_batch_size:   int | None = None
-        self.num_max_batches:  dict[int, int] = {}   # task_idx → n_max_batches
-        self.event_ids:        dict[int, list[np.ndarray]] = {}   # task_idx → per-row eids
-        self.labels:           dict[int, np.ndarray] = {}         # task_idx → label array
-        self.valid_task_idxs:  list[int] = []
+        self.store               = store
+        self.batch_size          = batch_size
+        self.pad_to_num_events   = pad_to_num_events
+        self.max_batch_size:     int | None        = None
+        self.task_parquet_paths: dict[int, Path]   = {}
+        # Lazy file handles used only when num_workers=0 (main process)
+        self._main_pq_files: dict[int, pq.ParquetFile] = {}
 
-        idx_to_name = {v: k for k, v in TASK_2_IDX.items()}
+        all_batches: list[tuple[int, int]] = []
 
         for task in sorted(tasks):
-            task_idx = TASK_2_IDX[task]
+            task_idx  = TASK_2_IDX[task]
             p_parquet = Path(data_dir) / task / f"train_prepared_{data_epoch_idx:03d}.parquet"
             p_json    = Path(data_dir) / task / f"train_prepared_{data_epoch_idx:03d}.json"
 
@@ -246,60 +278,58 @@ class PreparedEpochData:
                     f"{self.max_batch_size} vs {mbs} for {task}"
                 )
 
-            self.num_max_batches[task_idx] = meta["num_batches"]
-            logger.info(f"  [{task}] Loading {p_parquet.name} "
-                        f"({meta['num_batches']} max-batches, "
-                        f"{meta['used_rows']:,} rows) …")
+            self.task_parquet_paths[task_idx] = p_parquet
 
-            df = pd.read_parquet(str(p_parquet), columns=["label", "event_ids"])
-            self.event_ids[task_idx] = [np.array(e, dtype=np.int32) for e in df["event_ids"]]
-            self.labels[task_idx]    = df["label"].values.astype(np.int8)
-            self.valid_task_idxs.append(task_idx)
-            del df
+            sub_per_max = mbs // batch_size
+            n_max       = meta["num_batches"]
+            for max_i in range(n_max):
+                for sub_i in range(sub_per_max):
+                    all_batches.append((task_idx, max_i * mbs + sub_i * batch_size))
 
-        if not self.valid_task_idxs:
+            logger.info(f"  [{task}] epoch={data_epoch_idx}  "
+                        f"{n_max} max-batches × {sub_per_max} sub = "
+                        f"{n_max * sub_per_max} training batches")
+
+        if not all_batches:
             raise ValueError("No valid prepared data found for any task.")
 
-    def get_batch(self, task_idx: int, start_row: int, batch_size: int) -> dict[str, torch.Tensor]:
-        """Return a collated batch dict for rows [start_row, start_row+batch_size)."""
-        end_row   = start_row + batch_size
-        eids_list = self.event_ids[task_idx][start_row:end_row]
-        labels    = self.labels[task_idx][start_row:end_row].tolist()
+        # Shuffle and DDP-balance; all ranks use the same shuffle then slice by rank
+        rng = random.Random(seed + training_epoch * 1337)
+        rng.shuffle(all_batches)
+        n_total     = (len(all_batches) // world_size) * world_size
+        all_batches = all_batches[:n_total]
+        self.schedule: list[tuple[int, int]] = all_batches[rank::world_size]
+
+    def __len__(self) -> int:
+        return len(self.schedule)
+
+    def _get_pq_file(self, task_idx: int) -> pq.ParquetFile:
+        global _worker_parquet_files
+        if _worker_parquet_files:                           # inside a worker process
+            return _worker_parquet_files[task_idx]
+        if task_idx not in self._main_pq_files:            # main process, lazy open
+            self._main_pq_files[task_idx] = pq.ParquetFile(
+                str(self.task_parquet_paths[task_idx])
+            )
+        return self._main_pq_files[task_idx]
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        task_idx, start_row = self.schedule[idx]
+        pf = self._get_pq_file(task_idx)
+
+        rg_idx      = start_row // self.max_batch_size
+        local_start = start_row %  self.max_batch_size
+
+        df  = pf.read_row_group(rg_idx, columns=["label", "event_ids"]).to_pandas()
+        sub = df.iloc[local_start : local_start + self.batch_size]
+
+        eids_list = [np.array(e, dtype=np.int32) for e in sub["event_ids"]]
+        labels    = sub["label"].tolist()
+
         return _collate_event_embs(
             eids_list, [task_idx] * len(eids_list), labels,
             self.store.embeddings, self.pad_to_num_events,
         )
-
-
-def build_epoch_schedule(
-    epoch_data: PreparedEpochData,
-    batch_size: int,
-    training_epoch: int,
-    seed: int,
-    world_size: int,
-) -> list[tuple[int, int]]:
-    """Build a shuffled list of (task_idx, start_row) for one training epoch.
-
-    Each max_batch of max_batch_size rows yields (max_batch_size // batch_size)
-    training batches. The full list is shuffled, truncated to a world_size
-    multiple, and returned (all ranks get the same full list and slice by rank).
-    """
-    sub_per_max = epoch_data.max_batch_size // batch_size
-    batches: list[tuple[int, int]] = []
-
-    for task_idx in epoch_data.valid_task_idxs:
-        n_max = epoch_data.num_max_batches[task_idx]
-        for max_i in range(n_max):
-            for sub_i in range(sub_per_max):
-                start_row = max_i * epoch_data.max_batch_size + sub_i * batch_size
-                batches.append((task_idx, start_row))
-
-    rng = random.Random(seed + training_epoch * 1337)
-    rng.shuffle(batches)
-
-    # Truncate to world_size multiple for balanced DDP
-    n_total = (len(batches) // world_size) * world_size
-    return batches[:n_total]
 
 
 # ── Eval triplet pre-computation ──────────────────────────────────────────────
@@ -857,15 +887,14 @@ def main():
     if rank == 0:
         logger.info(f"Found {n_data_epochs} data epoch(s) (task dir: {task_dir})")
 
-    # ── Estimate schedule size for LR scheduler (use data epoch 0) ────────────
-    if rank == 0:
-        logger.info("Estimating epoch size from data epoch 0 …")
-    epoch_data_0 = PreparedEpochData(
-        args.train_data_dir, 0, args.tasks, store, args.pad_to_num_events
+    # ── Estimate schedule size for LR scheduler (reads JSON only, very fast) ──
+    est_ds = EpochBatchDataset(
+        args.train_data_dir, 0, args.tasks, store,
+        args.batch_size, 0, args.seed, world_size, rank,
+        args.pad_to_num_events,
     )
-    schedule_0            = build_epoch_schedule(epoch_data_0, args.batch_size, 0, args.seed, world_size)
-    n_batches_per_rank_0  = len(schedule_0) // world_size
-    del epoch_data_0
+    n_batches_per_rank_0 = len(est_ds)
+    del est_ds
 
     # ── Optimizer + LR scheduler ───────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -922,21 +951,33 @@ def main():
         # Map training epoch → data epoch (wraps around if fewer data epochs)
         data_epoch = epoch % n_data_epochs
         if rank == 0:
-            logger.info(f"Epoch {epoch+1}/{args.epochs}: loading data epoch {data_epoch} …")
+            logger.info(f"Epoch {epoch+1}/{args.epochs}: data epoch {data_epoch} …")
 
-        epoch_data = PreparedEpochData(
-            args.train_data_dir, data_epoch, args.tasks, store, args.pad_to_num_events
+        epoch_ds = EpochBatchDataset(
+            args.train_data_dir, data_epoch, args.tasks, store,
+            args.batch_size, epoch, args.seed, world_size, rank,
+            args.pad_to_num_events,
         )
-        schedule             = build_epoch_schedule(epoch_data, args.batch_size, epoch, args.seed, world_size)
-        my_schedule          = schedule[rank::world_size]   # this rank's batches
-        n_batches_this_epoch = len(my_schedule)
+        n_batches_this_epoch = len(epoch_ds)
+
+        train_loader = DataLoader(
+            epoch_ds,
+            batch_size=1,
+            shuffle=False,
+            collate_fn=lambda b: b[0],
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+            pin_memory=torch.cuda.is_available(),
+            worker_init_fn=_epoch_worker_init,
+            persistent_workers=False,
+        )
 
         encoder.train()
         epoch_loss = 0.0
         optimizer.zero_grad()
 
         pbar = tqdm(
-            enumerate(my_schedule),
+            train_loader,
             desc=f"Epoch {epoch+1}/{args.epochs}",
             disable=(rank != 0),
             dynamic_ncols=True,
@@ -944,11 +985,10 @@ def main():
         )
 
         batch_idx = -1
-        for batch_idx, (task_idx, start_row) in pbar:
+        for batch_idx, batch in enumerate(pbar):
             if args.debug_batches is not None and batch_idx >= args.debug_batches:
                 break
 
-            batch    = epoch_data.get_batch(task_idx, start_row, args.batch_size)
             labels_t = batch["labels"]
 
             is_update_step = (
@@ -1018,8 +1058,6 @@ def main():
                         }, step=opt_step)
 
             epoch_loss += loss.item() * args.grad_accum
-
-        del epoch_data   # free in-memory data before eval
 
         n_batches_ran = batch_idx + 1   # 0 if no batches ran
         avg_loss      = epoch_loss / max(n_batches_ran, 1)
