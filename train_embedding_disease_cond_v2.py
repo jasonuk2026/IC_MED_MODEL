@@ -976,41 +976,39 @@ def main():
                     loss_now  = loss.item() * args.grad_accum
                     gnorm_now = grad_norm.item() if isinstance(grad_norm, torch.Tensor) \
                                 else grad_norm
+
+                    # Pairwise distance diagnostics
+                    d_pp = d_pn = float("nan")
+                    with torch.no_grad():
+                        e   = emb.detach().float()
+                        lbl = labels_t.detach()
+                        e_pos = e[lbl == 1]
+                        e_neg = e[lbl == 0]
+                        if e_pos.size(0) >= 2:
+                            sim_pp  = e_pos @ e_pos.T
+                            n_pos_  = e_pos.size(0)
+                            tri     = torch.triu(torch.ones(n_pos_, n_pos_, dtype=torch.bool, device=e.device), diagonal=1)
+                            d_pp    = (1 - sim_pp[tri]).mean().item()
+                        if e_pos.size(0) >= 1 and e_neg.size(0) >= 1:
+                            d_pn    = (1 - (e_pos @ e_neg.T)).mean().item()
+
                     pbar.set_postfix(
                         loss=f"{loss_now:.4f}",
+                        dpp=f"{d_pp:.3f}",
+                        dpn=f"{d_pn:.3f}",
                         gnorm=f"{gnorm_now:.3f}",
                         lr=f"{lr_now:.2e}",
                     )
                     if use_wandb and opt_step % args.log_steps == 0:
                         import wandb
-                        log_dict = {
-                            "train/loss":  loss_now,
-                            "train/gnorm": gnorm_now,
-                            "train/lr":    lr_now,
-                            "epoch":       epoch + (batch_idx + 1) / n_batches_per_epoch,
-                        }
-                        # Pairwise distance diagnostics (no grad needed, emb already detached via .item())
-                        with torch.no_grad():
-                            e = emb.detach().float()          # (B, D), already L2-normalised
-                            lbl = labels_t.detach()           # (B,)
-                            pos_mask = lbl == 1               # (B,)
-                            neg_mask = lbl == 0
-                            e_pos = e[pos_mask]               # (n_pos, D)
-                            e_neg = e[neg_mask]               # (n_neg, D)
-                            # cosine distance = 1 - cosine_similarity (embs are L2-normed)
-                            if e_pos.size(0) >= 2:
-                                # pairwise among positives: upper triangle
-                                sim_pp = e_pos @ e_pos.T       # (n_pos, n_pos)
-                                n_pos_ = e_pos.size(0)
-                                mask_pp = torch.triu(torch.ones(n_pos_, n_pos_, dtype=torch.bool, device=e.device), diagonal=1)
-                                d_pp = (1 - sim_pp[mask_pp]).mean().item()
-                                log_dict["train/dist_pos_pos"] = d_pp
-                            if e_pos.size(0) >= 1 and e_neg.size(0) >= 1:
-                                # pairwise between positives and negatives
-                                sim_pn = e_pos @ e_neg.T       # (n_pos, n_neg)
-                                d_pn = (1 - sim_pn).mean().item()
-                                log_dict["train/dist_pos_neg"] = d_pn
-                        wandb.log(log_dict, step=opt_step)
+                        wandb.log({
+                            "train/loss":         loss_now,
+                            "train/gnorm":        gnorm_now,
+                            "train/lr":           lr_now,
+                            "train/dist_pos_pos": d_pp,
+                            "train/dist_pos_neg": d_pn,
+                            "epoch":              epoch + (batch_idx + 1) / n_batches_per_epoch,
+                        }, step=opt_step)
 
             epoch_loss += loss.item() * args.grad_accum
 
