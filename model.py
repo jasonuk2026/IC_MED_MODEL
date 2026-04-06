@@ -129,9 +129,9 @@ class DiseaseAwareEHREncoder(nn.Module):
         out = self.qwen(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
 
         # 5. Last-token pool (EOS position) → L2 normalise
-        seq_lengths = attention_mask.sum(dim=1) - 1
-        batch_idx   = torch.arange(B, device=device)
-        emb = out.last_hidden_state[batch_idx, seq_lengths]
+        # EOS is always appended as the very last token in inputs_embeds,
+        # so its hidden state is always at position [-1] regardless of padding.
+        emb = out.last_hidden_state[:, -1]
         return F.normalize(emb.float(), p=2, dim=-1)
 
     # ── Checkpoint helpers ────────────────────────────────────────────────────
