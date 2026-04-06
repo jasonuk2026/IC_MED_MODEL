@@ -197,41 +197,81 @@ def _collate_event_embs(
 
 # ── Per-epoch lazy-loading Dataset ────────────────────────────────────────────
 
-# Worker-local ParquetFile handles — each DataLoader worker process has its own
-# copy (populated by _epoch_worker_init).  Empty in the main process.
-_worker_parquet_files: dict[int, pq.ParquetFile] = {}
+import bisect
+
+# Worker-local state: ParquetFile handles + cumulative row-group offsets.
+# Each DataLoader worker process has its own copy (populated by _epoch_worker_init).
+_worker_pq_files:    dict[int, pq.ParquetFile] = {}
+_worker_pq_cum_rows: dict[int, list[int]]       = {}   # task_idx → [0, rg0, rg0+rg1, ...]
+
+
+def _build_cum_rows(pf: pq.ParquetFile) -> list[int]:
+    """Build cumulative row-count list from parquet metadata (no data read)."""
+    meta = pf.metadata
+    cum  = [0]
+    for i in range(meta.num_row_groups):
+        cum.append(cum[-1] + meta.row_group(i).num_rows)
+    return cum
 
 
 def _epoch_worker_init(worker_id: int) -> None:
     """Called once per DataLoader worker process.
 
-    Opens one pq.ParquetFile per task so __getitem__ can read rows without
-    sharing file descriptors across processes.
+    Opens one pq.ParquetFile per task and precomputes cumulative row counts
+    from metadata only (no data I/O) so __getitem__ can seek to any row.
     """
     worker_info = torch.utils.data.get_worker_info()
     ds: EpochBatchDataset = worker_info.dataset
-    global _worker_parquet_files
-    _worker_parquet_files = {
-        task_idx: pq.ParquetFile(str(path))
-        for task_idx, path in ds.task_parquet_paths.items()
-    }
+    global _worker_pq_files, _worker_pq_cum_rows
+    _worker_pq_files    = {}
+    _worker_pq_cum_rows = {}
+    for task_idx, path in ds.task_parquet_paths.items():
+        pf = pq.ParquetFile(str(path))
+        _worker_pq_files[task_idx]    = pf
+        _worker_pq_cum_rows[task_idx] = _build_cum_rows(pf)
+
+
+def _read_rows(
+    pf:       pq.ParquetFile,
+    cum_rows: list[int],
+    start:    int,
+    length:   int,
+    columns:  list[str],
+) -> "pd.DataFrame":
+    """Read `length` rows starting at absolute row `start`.
+
+    Uses bisect on the precomputed cumulative row-group offsets — O(log G)
+    lookup then reads only the 1–2 row groups that cover the range.
+    Works regardless of row_group_size used when writing the parquet.
+    """
+    end     = start + length - 1
+    rg_first = bisect.bisect_right(cum_rows, start) - 1
+    rg_last  = bisect.bisect_right(cum_rows, end)   - 1
+
+    if rg_first == rg_last:
+        df          = pf.read_row_group(rg_first, columns=columns).to_pandas()
+        local_start = start - cum_rows[rg_first]
+        return df.iloc[local_start : local_start + length]
+
+    # Batch spans two (or more) row groups — concatenate then slice
+    parts = [pf.read_row_group(rg, columns=columns).to_pandas()
+             for rg in range(rg_first, rg_last + 1)]
+    df          = pd.concat(parts, ignore_index=True)
+    local_start = start - cum_rows[rg_first]
+    return df.iloc[local_start : local_start + length]
 
 
 class EpochBatchDataset(Dataset):
     """Schedule-based lazy-loading dataset for one training epoch.
 
-    Construction reads only the JSON metadata files (milliseconds, no parquet
-    I/O).  Each __getitem__ reads exactly batch_size rows from the right row
-    group via pq.ParquetFile.read_row_group() — O(1) seek, no full-file load.
-
-    prepare_task_data_v2.py writes parquets with row_group_size=max_batch_size,
-    so the mapping is exact:
-        rg_idx      = start_row // max_batch_size   (which row group)
-        local_start = start_row %  max_batch_size   (offset within group)
+    Construction reads only JSON metadata files (milliseconds, no parquet I/O).
+    Each __getitem__ reads exactly batch_size rows by seeking directly to the
+    right row group(s) using PyArrow metadata — no full-file load, no
+    row_group_size constraint on the parquet.
 
     Use with DataLoader(worker_init_fn=_epoch_worker_init, num_workers=N>=1)
     to overlap parquet I/O with GPU computation.  Falls back to per-instance
-    lazy handles when num_workers=0.
+    lazy state when num_workers=0.
     """
 
     def __init__(
@@ -250,12 +290,13 @@ class EpochBatchDataset(Dataset):
         self.store               = store
         self.batch_size          = batch_size
         self.pad_to_num_events   = pad_to_num_events
-        self.max_batch_size:     int | None        = None
-        self.task_parquet_paths: dict[int, Path]   = {}
-        # Lazy file handles used only when num_workers=0 (main process)
-        self._main_pq_files: dict[int, pq.ParquetFile] = {}
+        self.task_parquet_paths: dict[int, Path] = {}
+        # Lazy state for main process (num_workers=0)
+        self._main_pq_files:    dict[int, pq.ParquetFile] = {}
+        self._main_pq_cum_rows: dict[int, list[int]]       = {}
 
         all_batches: list[tuple[int, int]] = []
+        max_batch_size: int | None = None
 
         for task in sorted(tasks):
             task_idx  = TASK_2_IDX[task]
@@ -270,12 +311,12 @@ class EpochBatchDataset(Dataset):
                 meta = json.load(f)
 
             mbs = meta["max_batch_size"]
-            if self.max_batch_size is None:
-                self.max_batch_size = mbs
-            elif self.max_batch_size != mbs:
+            if max_batch_size is None:
+                max_batch_size = mbs
+            elif max_batch_size != mbs:
                 raise ValueError(
                     f"Inconsistent max_batch_size across tasks: "
-                    f"{self.max_batch_size} vs {mbs} for {task}"
+                    f"{max_batch_size} vs {mbs} for {task}"
                 )
 
             self.task_parquet_paths[task_idx] = p_parquet
@@ -303,25 +344,23 @@ class EpochBatchDataset(Dataset):
     def __len__(self) -> int:
         return len(self.schedule)
 
-    def _get_pq_file(self, task_idx: int) -> pq.ParquetFile:
-        global _worker_parquet_files
-        if _worker_parquet_files:                           # inside a worker process
-            return _worker_parquet_files[task_idx]
-        if task_idx not in self._main_pq_files:            # main process, lazy open
-            self._main_pq_files[task_idx] = pq.ParquetFile(
-                str(self.task_parquet_paths[task_idx])
-            )
-        return self._main_pq_files[task_idx]
+    def _get_pq_state(self, task_idx: int) -> tuple[pq.ParquetFile, list[int]]:
+        """Return (ParquetFile, cum_rows) — from worker state or lazy main-process init."""
+        global _worker_pq_files, _worker_pq_cum_rows
+        if _worker_pq_files:
+            return _worker_pq_files[task_idx], _worker_pq_cum_rows[task_idx]
+        if task_idx not in self._main_pq_files:
+            pf = pq.ParquetFile(str(self.task_parquet_paths[task_idx]))
+            self._main_pq_files[task_idx]    = pf
+            self._main_pq_cum_rows[task_idx] = _build_cum_rows(pf)
+        return self._main_pq_files[task_idx], self._main_pq_cum_rows[task_idx]
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         task_idx, start_row = self.schedule[idx]
-        pf = self._get_pq_file(task_idx)
+        pf, cum_rows = self._get_pq_state(task_idx)
 
-        rg_idx      = start_row // self.max_batch_size
-        local_start = start_row %  self.max_batch_size
-
-        df  = pf.read_row_group(rg_idx, columns=["label", "event_ids"]).to_pandas()
-        sub = df.iloc[local_start : local_start + self.batch_size]
+        sub = _read_rows(pf, cum_rows, start_row, self.batch_size,
+                         columns=["label", "event_ids"])
 
         eids_list = [np.array(e, dtype=np.int32) for e in sub["event_ids"]]
         labels    = sub["label"].tolist()

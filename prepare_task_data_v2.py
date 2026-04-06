@@ -281,7 +281,7 @@ def process_file(input_path: str, max_batch_size: int, seed: int, num_workers: i
         },
         schema=OUTPUT_SCHEMA,
     )
-    pq.write_table(table, str(out_parquet), row_group_size=max_batch_size)
+    pq.write_table(table, str(out_parquet))
 
     # ── Write JSON metadata ───────────────────────────────────────────────────
     meta = {
