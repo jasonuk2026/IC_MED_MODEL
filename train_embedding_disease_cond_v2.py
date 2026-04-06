@@ -62,6 +62,50 @@ from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_tr
 from sentence_transformers.losses import BatchHardSoftMarginTripletLoss, BatchHardTripletLoss, BatchHardTripletLossDistanceFunction
 from model import DiseaseAwareEHREncoder
 
+
+def supervised_infonce_loss(embeddings: torch.Tensor, labels: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Supervised InfoNCE (SupCon) loss.
+
+    For each anchor i, positives = same-label samples (j != i),
+    negatives = all other samples (denominator = all j != i).
+
+    Loss = mean_i[ -log( sum_{j in pos(i)} exp(sim(i,j)/T)
+                        / sum_{j != i}     exp(sim(i,j)/T) ) ]
+
+    Embeddings must be L2-normalised (cosine similarity = dot product).
+    Gradient is well-defined even when embeddings collapse: the softmax
+    always spans multiple distinct vectors, preventing vanishing gradients.
+    """
+    B      = embeddings.size(0)
+    device = embeddings.device
+
+    # (B, B) cosine similarity matrix, scaled by temperature
+    sim = (embeddings @ embeddings.T) / temperature
+
+    # Masks
+    self_mask = torch.eye(B, dtype=torch.bool, device=device)
+    pos_mask  = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~self_mask  # (B, B)
+
+    # Exclude self from denominator via -inf before logsumexp
+    sim_no_self = sim.masked_fill(self_mask, float("-inf"))
+
+    # log denominator: logsumexp over all j != i  (handles -inf safely)
+    log_denom = torch.logsumexp(sim_no_self, dim=1)   # (B,)
+
+    # log p(j|i) = sim[i,j] - log_denom[i]  for j != i
+    log_probs = sim_no_self - log_denom.unsqueeze(1)   # (B, B), diag = -inf
+
+    # Sum log-probs over positives.
+    # Use masked_fill(~pos_mask, 0) instead of multiplying to avoid 0 * (-inf) = NaN.
+    n_pos = pos_mask.sum(dim=1).float()               # (B,)
+    valid = n_pos > 0
+    if not valid.any():
+        return embeddings.sum() * 0.0                 # differentiable zero
+
+    pos_log_probs   = log_probs.masked_fill(~pos_mask, 0.0)  # safe: only -inf at diag, which pos_mask already excludes
+    loss_per_anchor = -pos_log_probs.sum(dim=1) / n_pos.clamp(min=1)
+    return loss_per_anchor[valid].mean()
+
 hf_logging.set_verbosity_warning()
 
 logging.basicConfig(
@@ -705,8 +749,12 @@ def parse_args():
     p.add_argument("--log_steps",    type=int,   default=10)
 
     # Loss / Eval
+    p.add_argument("--loss",                     choices=["infonce", "triplet"], default="infonce",
+                   help="Loss function. infonce=SupCon (recommended), triplet=BatchHardTripletLoss.")
+    p.add_argument("--temperature",              type=float, default=0.07,
+                   help="Temperature for InfoNCE loss.")
     p.add_argument("--triplet_margin",           type=float, default=0.3,
-                   help="Margin for BatchHardTripletLoss. Use 0 to fall back to soft-margin loss.")
+                   help="Margin for BatchHardTripletLoss (only used when --loss triplet).")
     p.add_argument("--n_eval_triplets_per_task", type=int,   default=100)
     p.add_argument("--eval_batch_size",          type=int,   default=32)
     p.add_argument("--pad_to_num_events",        type=int,   default=None)
@@ -867,20 +915,23 @@ def main():
         return max(0.0, 1.0 - progress)
 
     scheduler   = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    if args.triplet_margin > 0:
+    if args.loss == "infonce":
+        _loss_fn  = lambda labels, emb: supervised_infonce_loss(emb, labels, args.temperature)
+        loss_desc = f"SupervisedInfoNCE (temperature={args.temperature})"
+    elif args.triplet_margin > 0:
         loss_module = BatchHardTripletLoss(
             model=None,
             distance_metric=BatchHardTripletLossDistanceFunction.cosine_distance,
             margin=args.triplet_margin,
         )
-        _loss_fn = lambda labels, emb: loss_module.batch_hard_triplet_loss(labels, emb)
+        _loss_fn  = lambda labels, emb: loss_module.batch_hard_triplet_loss(labels, emb)
         loss_desc = f"BatchHardTripletLoss (margin={args.triplet_margin})"
     else:
         loss_module = BatchHardSoftMarginTripletLoss(
             model=None,
             distance_metric=BatchHardTripletLossDistanceFunction.cosine_distance,
         )
-        _loss_fn = lambda labels, emb: loss_module.batch_hard_triplet_soft_margin_loss(labels, emb)
+        _loss_fn  = lambda labels, emb: loss_module.batch_hard_triplet_soft_margin_loss(labels, emb)
         loss_desc = "BatchHardSoftMarginTripletLoss (soft margin)"
 
     if rank == 0:
