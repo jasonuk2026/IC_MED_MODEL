@@ -76,6 +76,33 @@ from model import DiseaseAwareEHREncoder
 
 hf_logging.set_verbosity_warning()
 
+
+def supervised_infonce_loss(
+    embeddings: torch.Tensor,
+    labels:     torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """Supervised InfoNCE (SupCon) loss.
+
+    Unlike triplet loss, gradient is always non-zero even when embeddings
+    collapse to a single point, making it suitable for stage-1 warm-up.
+    """
+    B      = embeddings.size(0)
+    device = embeddings.device
+    sim         = (embeddings @ embeddings.T) / temperature
+    self_mask   = torch.eye(B, dtype=torch.bool, device=device)
+    pos_mask    = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~self_mask
+    sim_no_self = sim.masked_fill(self_mask, float("-inf"))
+    log_denom   = torch.logsumexp(sim_no_self, dim=1)
+    log_probs   = sim_no_self - log_denom.unsqueeze(1)
+    n_pos       = pos_mask.sum(dim=1).float()
+    valid       = n_pos > 0
+    if not valid.any():
+        return embeddings.sum() * 0.0
+    pos_log_probs   = log_probs.masked_fill(~pos_mask, 0.0)
+    loss_per_anchor = -pos_log_probs.sum(dim=1) / n_pos.clamp(min=1)
+    return loss_per_anchor[valid].mean()
+
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -731,6 +758,10 @@ def parse_args():
     p.add_argument("--stage1_steps", type=int, default=0,
                    help="Number of optimizer steps for stage 1 (bypass_qwen, only proj params). "
                         "0 = skip stage 1.")
+    p.add_argument("--stage1_temperature", type=float, default=0.07,
+                   help="InfoNCE temperature for stage 1. InfoNCE is used in stage 1 because "
+                        "triplet loss has zero gradient at collapse (n≈p), while InfoNCE always "
+                        "has non-zero gradient via the softmax.")
     p.add_argument("--lr_proj", type=float, default=2e-4,
                    help="LR for bert_proj_1, bert_proj_2, input_norm (higher).")
     p.add_argument("--lr_lora", type=float, default=5e-5,
@@ -924,11 +955,18 @@ def main():
         return ds, dl
 
     # ── Stage 1: train only projection layers, bypass Qwen ───────────────────
+    # Uses InfoNCE (not triplet) because triplet loss gradient = (n - p) ≈ 0
+    # when all embeddings collapse to the same point, causing a complete
+    # learning deadlock. InfoNCE's softmax always gives non-zero gradients.
+    _s1_loss_fn = lambda lbl, emb: supervised_infonce_loss(
+        emb, lbl, args.stage1_temperature
+    )
+
     if args.stage1_steps > 0:
         if rank == 0:
             logger.info(
-                f"Stage 1: {args.stage1_steps} steps — "
-                f"LoRA frozen, bypass_qwen=True, lr_proj={args.lr_proj}"
+                f"Stage 1: {args.stage1_steps} steps — LoRA frozen, bypass_qwen=True, "
+                f"loss=InfoNCE(T={args.stage1_temperature}), lr_proj={args.lr_proj}"
             )
 
         n_frozen = _set_lora_trainable(encoder, False)
@@ -967,7 +1005,7 @@ def main():
                 batch["task_idxs"].to(device),
                 bypass_qwen=True,
             )
-            loss = _loss_fn(labels_t.to(device), emb)
+            loss = _s1_loss_fn(labels_t.to(device), emb)
             loss.backward()
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
