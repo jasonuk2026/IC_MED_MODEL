@@ -389,22 +389,21 @@ def precompute_eval_triplets(
 ) -> int:
     """Sample anchor/positive/negative triplets from eval data and save to parquet.
 
-    Triplet constraints (same as before):
-      - anchor and positive from different patients
-      - anchor and negative from different patient than anchor
+    Randomly samples n_triplets_per_task triplets per task with replacement.
+    No patient-uniqueness constraint — eval only measures whether the model
+    ranks positives closer than negatives, patient identity is irrelevant.
 
     Returns the number of triplets saved.
     """
-    pos: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
-    neg: dict[int, list[tuple[int, list[int]]]] = defaultdict(list)
+    pos: dict[int, list[list[int]]] = defaultdict(list)
+    neg: dict[int, list[list[int]]] = defaultdict(list)
 
     for path in eval_data_paths:
-        df = pd.read_parquet(path, columns=["patient_id", "task_idx", "label", "event_ids"])
+        df = pd.read_parquet(path, columns=["task_idx", "label", "event_ids"])
         for row in df.itertuples(index=False):
             task_idx = int(row.task_idx)
-            pid      = int(row.patient_id)
             eids     = list(row.event_ids)
-            (pos if int(row.label) == 1 else neg)[task_idx].append((pid, eids))
+            (pos if int(row.label) == 1 else neg)[task_idx].append(eids)
         del df
 
     rng = random.Random(seed)
@@ -415,51 +414,21 @@ def precompute_eval_triplets(
         pos_list = pos.get(task_idx, [])
         neg_list = neg.get(task_idx, [])
 
-        if len(pos_list) < 2 or not neg_list:
+        if not pos_list or not neg_list:
             logger.warning(f"  [{idx_to_name.get(task_idx, task_idx)}] "
                            f"insufficient eval data for triplets — skipping")
             continue
 
-        pos_pool = list(range(len(pos_list)))
-        neg_pool = list(range(len(neg_list)))
-        rng.shuffle(pos_pool)
-        rng.shuffle(neg_pool)
-
-        n = min(n_triplets_per_task, len(pos_list))
-        ni_cursor = 0
         task_count = 0
-
-        for i in range(n):
-            ai          = pos_pool[i]
-            anchor_pid  = pos_list[ai][0]
-            anchor_eids = pos_list[ai][1]
-
-            # Positive: different patient
-            pi = None
-            for offset in range(1, len(pos_pool)):
-                cand = pos_pool[(i + offset) % len(pos_pool)]
-                if pos_list[cand][0] != anchor_pid:
-                    pi = cand
-                    break
-            if pi is None:
-                continue
-
-            # Negative: different patient from anchor
-            ni = None
-            for offset in range(len(neg_pool)):
-                cand = neg_pool[(ni_cursor + offset) % len(neg_pool)]
-                if neg_list[cand][0] != anchor_pid:
-                    ni = cand
-                    break
-            ni_cursor += 1
-            if ni is None:
-                continue
-
+        for _ in range(n_triplets_per_task):
+            anchor_eids   = rng.choice(pos_list)
+            positive_eids = rng.choice(pos_list)
+            negative_eids = rng.choice(neg_list)
             records.append({
                 "task_idx":      task_idx,
                 "anchor_eids":   anchor_eids,
-                "positive_eids": pos_list[pi][1],
-                "negative_eids": neg_list[ni][1],
+                "positive_eids": positive_eids,
+                "negative_eids": negative_eids,
             })
             task_count += 1
 

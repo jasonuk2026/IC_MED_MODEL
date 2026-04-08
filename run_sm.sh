@@ -30,12 +30,11 @@ done
 
 sbatch \
     --job-name="$JOB_NAME" \
-    --partition=workq \
     --nodes=1 \
     --ntasks=1 \
     --gres=gpu:"$N_GPUS" \
-    --cpus-per-gpu=72 \
-    --mem-per-gpu=100G \
+    --cpus-per-gpu=8 \
+    --mem-per-gpu=128G \
     --time=24:00:00 \
     --output=logs/%x_%j.out \
     --error=logs/%x_%j.err \
