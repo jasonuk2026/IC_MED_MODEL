@@ -99,18 +99,27 @@ class DiseaseAwareEHREncoder(nn.Module):
 
     def forward(
         self,
-        event_embs: torch.Tensor,   # (B, N, bert_dim)
-        event_mask: torch.Tensor,   # (B, N)            long
-        task_idx:   torch.Tensor,   # (B,)              long  — integer task indices
-    ) -> torch.Tensor:              # (B, qwen_dim)  L2-normalised embeddings
+        event_embs:  torch.Tensor,       # (B, N, bert_dim)
+        event_mask:  torch.Tensor,       # (B, N)  long
+        task_idx:    torch.Tensor,       # (B,)    long
+        bypass_qwen: bool = False,       # Stage-1: skip Qwen, mean-pool ev_proj directly
+    ) -> torch.Tensor:                   # (B, qwen_dim)  L2-normalised
         B      = event_embs.size(0)
         device = event_embs.device
 
         event_embs = event_embs.to(self.dtype)
 
-        # 1. RMSNorm → MLP projection for events (Qwen3-style: norm before linear)
+        # 1. RMSNorm → MLP projection for events
         ev_normed = self.input_norm(event_embs)                           # (B, N, bert_dim)
         ev_proj   = self.bert_proj_2(F.gelu(self.bert_proj_1(ev_normed)))# (B, N, qwen_dim)
+
+        if bypass_qwen:
+            # Stage-1 fast path: mean-pool directly over ev_proj, no Qwen.
+            # Gradient reaches bert_proj without traversing 28 frozen Qwen layers,
+            # preventing the vanishing-gradient problem in stage 1.
+            mask_f = event_mask.float().unsqueeze(-1)                      # (B, N, 1)
+            emb    = (ev_proj * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
+            return F.normalize(emb.float(), p=2, dim=-1)
 
         # 2. Per-task prefix embeddings and masks (looked up from buffers)
         prefix      = self.task_prefix_embeds[task_idx]   # (B, max_P, D)
