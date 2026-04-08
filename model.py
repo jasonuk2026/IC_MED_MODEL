@@ -103,14 +103,14 @@ class DiseaseAwareEHREncoder(nn.Module):
         event_mask:   torch.Tensor,         # (B, N)            long
         task_idx:     torch.Tensor,         # (B,)              long  — integer task indices
         bypass_qwen:  bool = False,         # Stage 1: skip Qwen, pool ev_proj directly
+        return_pre_emb: bool = False,       # Also return pooled embedding before L2 norm
     ):
         """
         Returns:
-            bypass_qwen=False  →  emb  (B, D)  L2-normalised
-            bypass_qwen=True   →  (emb, pre_emb)  where pre_emb (B, D) is the
-                                  mean-pooled projection *before* L2 normalisation,
-                                  so callers can compute var_reg with non-zero
-                                  gradient even at directional collapse.
+            return_pre_emb=False → emb  (B, D)  L2-normalised
+            return_pre_emb=True  → (emb, pre_emb) where pre_emb (B, D) is the
+                                   mean-pooled representation before L2
+                                   normalisation.
         """
         B      = event_embs.size(0)
         device = event_embs.device
@@ -127,7 +127,9 @@ class DiseaseAwareEHREncoder(nn.Module):
         if bypass_qwen:
             pre_emb = (ev_proj * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)  # (B, D)
             emb     = F.normalize(pre_emb.float(), p=2, dim=-1)
-            return emb, pre_emb.float()
+            if return_pre_emb:
+                return emb, pre_emb.float()
+            return emb
 
         # 2. Per-task prefix embeddings and masks (looked up from buffers)
         prefix      = self.task_prefix_embeds[task_idx]   # (B, max_P, D)
@@ -153,7 +155,10 @@ class DiseaseAwareEHREncoder(nn.Module):
         N        = event_embs.size(1)
         ev_hid   = hidden[:, P_len : P_len + N, :]            # (B, N, D)
         pre_emb  = (ev_hid * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)  # (B, D)
-        return F.normalize(pre_emb.float(), p=2, dim=-1)
+        emb = F.normalize(pre_emb.float(), p=2, dim=-1)
+        if return_pre_emb:
+            return emb, pre_emb.float()
+        return emb
 
     # ── Checkpoint helpers ────────────────────────────────────────────────────
 

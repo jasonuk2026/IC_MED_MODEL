@@ -20,9 +20,9 @@ Two-stage training
   Stage 1 (--stage1_steps N):
     • Only bert_proj_1, bert_proj_2, input_norm are trained.
     • LoRA params are frozen (requires_grad=False).
-    • Forward bypasses Qwen: mean-pool directly over ev_proj.
-    • Lets the projection layers learn a meaningful EHR embedding before
-      the full Qwen forward is engaged.
+    • Forward still runs through the frozen Qwen backbone, matching stage 2.
+    • This keeps the representation path consistent while warming up the
+      projection layers before LoRA is unfrozen.
 
   Stage 2 (remaining epochs):
     • LoRA params are unfrozen.
@@ -469,6 +469,38 @@ def _compute_batch_metrics(
     }
 
 
+def _supervised_contrastive_loss(
+    emb: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """Supervised contrastive loss over a batch with binary labels.
+
+    The loss uses all same-label examples as positives for each anchor and all
+    opposite-label examples as negatives. Features are normalised inside the
+    loss to focus learning on direction while keeping stage-1 diagnostics on the
+    raw pre-normalised representation available separately.
+    """
+    feat = torch.nn.functional.normalize(emb.float(), p=2, dim=-1)
+    labels = labels.view(-1)
+
+    logits = (feat @ feat.T) / temperature
+    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+
+    eye = torch.eye(labels.size(0), dtype=torch.bool, device=labels.device)
+    pos_mask = (labels[:, None] == labels[None, :]) & ~eye
+    valid = pos_mask.any(dim=1)
+    if not valid.any():
+        return feat.new_zeros(())
+
+    exp_logits = torch.exp(logits).masked_fill(eye, 0.0)
+    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True).clamp_min(1e-12))
+
+    pos_counts = pos_mask.sum(dim=1).clamp_min(1)
+    mean_log_prob_pos = (log_prob * pos_mask).sum(dim=1) / pos_counts
+    return -mean_log_prob_pos[valid].mean()
+
+
 # ── Model setup ───────────────────────────────────────────────────────────────
 
 def load_qwen(args):
@@ -729,7 +761,8 @@ def parse_args():
 
     # Two-stage training
     p.add_argument("--stage1_steps", type=int, default=0,
-                   help="Number of optimizer steps for stage 1 (LoRA+Qwen frozen, only proj params). "
+                   help="Number of optimizer steps for stage 1 (LoRA frozen, full frozen-Qwen forward, "
+                        "only proj params trainable). "
                         "0 = skip stage 1.")
     p.add_argument("--lr_proj", type=float, default=2e-4,
                    help="LR for bert_proj_1, bert_proj_2, input_norm (higher).")
@@ -744,6 +777,8 @@ def parse_args():
                         "collapse. Loss += var_reg_weight * relu(1 - std(pre_emb, dim=0)).mean() "
                         "where pre_emb is the mean-pooled projection before L2 normalisation. "
                         "Set to 0 to disable.")
+    p.add_argument("--stage1_temperature", type=float, default=0.1,
+                   help="Temperature for supervised contrastive loss in Stage 1.")
 
     # Eval
     p.add_argument("--n_eval_triplets_per_task", type=int,   default=256)
@@ -928,13 +963,13 @@ def main():
         )
         return ds, dl
 
-    # ── Stage 1: train only projection layers, Qwen+LoRA frozen ─────────────
+    # ── Stage 1: full frozen-Qwen forward, train only projection layers ─────
     s1_step = 0   # tracks steps completed; used as wandb offset for Stage 2
     if args.stage1_steps > 0:
         if rank == 0:
             logger.info(
                 f"Stage 1: {args.stage1_steps} steps — "
-                f"LoRA frozen, bypass_qwen=True (direct projection), lr_proj={args.lr_proj}"
+                f"LoRA frozen, full frozen-Qwen forward, lr_proj={args.lr_proj}"
             )
 
         n_frozen = _set_lora_trainable(encoder, False)
@@ -985,24 +1020,27 @@ def main():
 
             labels_t = batch["labels"]
 
-            emb, pre_emb = encoder(
+            enc_out = encoder(
                 batch["event_embs"].to(device),
                 batch["event_mask"].to(device),
                 batch["task_idxs"].to(device),
-                bypass_qwen=True,
+                return_pre_emb=True,
             )
-            triplet_loss = _loss_fn(labels_t.to(device), emb)
+            emb, pre_emb = enc_out
+            supcon_loss = _supervised_contrastive_loss(
+                pre_emb,
+                labels_t.to(device),
+                args.stage1_temperature,
+            )
 
-            # Variance regularisation applied to pre-normalisation embeddings (pre_emb).
-            # Using pre_emb (before F.normalize) ensures the gradient is non-zero even
-            # when all outputs have collapsed to the same direction: magnitude variation
-            # across patients keeps ∂var/∂pre_emb[i] non-zero.
+            # Variance regularisation is applied to the pre-normalisation pooled
+            # embedding from the same full-Qwen path used in stage 2.
             if args.var_reg_weight > 0.0:
                 std      = torch.sqrt(pre_emb.var(dim=0) + 1e-4)   # (D,)
                 var_loss = torch.relu(1.0 - std).mean()
-                loss     = triplet_loss + args.var_reg_weight * var_loss
+                loss     = supcon_loss + args.var_reg_weight * var_loss
             else:
-                loss = triplet_loss
+                loss = supcon_loss
             loss.backward()
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1022,13 +1060,20 @@ def main():
 
                 with torch.no_grad():
                     metrics = _compute_batch_metrics(emb.detach(), labels_t.to(device))
+                    pre_var_now = (
+                        pre_emb.detach().float().var(dim=0).mean().item()
+                    )
+                    loss_supcon_now = supcon_loss.item()
+                    var_loss_now = var_loss.item() if args.var_reg_weight > 0.0 else 0.0
 
                 pbar_s1.set_postfix(
                     loss=f"{loss_now:.4f}",
+                    lsup=f"{loss_supcon_now:.4f}",
                     cdist=f"{metrics['cdist']:.3f}",
                     dpp=f"{metrics['d_pp']:.3f}",
                     dpn=f"{metrics['d_pn']:.3f}",
                     var=f"{metrics['var_all']:.4f}",
+                    prevar=f"{pre_var_now:.4f}",
                     gnorm=f"{gnorm_now:.3f}",
                     lr=f"{lr_now:.2e}",
                 )
@@ -1037,12 +1082,15 @@ def main():
                     import wandb
                     wandb.log({
                         "stage1/loss":         loss_now,
+                        "stage1/loss_supcon":  loss_supcon_now,
+                        "stage1/loss_var":     var_loss_now,
                         "stage1/gnorm":        gnorm_now,
                         "stage1/lr":           lr_now,
                         "stage1/cdist":        metrics["cdist"],
                         "stage1/dist_pos_pos": metrics["d_pp"],
                         "stage1/dist_pos_neg": metrics["d_pn"],
                         "stage1/var_all":      metrics["var_all"],
+                        "stage1/pre_var_all":  pre_var_now,
                         "stage1/var_pos":      metrics["var_pos"],
                         "stage1/var_neg":      metrics["var_neg"],
                     }, step=s1_step)
@@ -1153,12 +1201,22 @@ def main():
                        else encoder.no_sync()
 
             with sync_ctx:
-                emb  = encoder(
+                emb, pre_emb = encoder(
                     batch["event_embs"].to(device),
                     batch["event_mask"].to(device),
                     batch["task_idxs"].to(device),
+                    return_pre_emb=True,
                 )
-                loss = _loss_fn(labels_t.to(device), emb)
+                supcon_loss = _supervised_contrastive_loss(
+                    pre_emb, labels_t.to(device), args.stage1_temperature
+                )
+                if args.var_reg_weight > 0.0:
+                    std = torch.sqrt(pre_emb.var(dim=0) + 1e-4)
+                    var_loss = torch.relu(1.0 - std).mean()
+                else:
+                    var_loss = supcon_loss.new_zeros(())
+
+                loss = supcon_loss + args.var_reg_weight * var_loss
                 loss = loss / args.grad_accum
                 loss.backward()
 
@@ -1181,13 +1239,18 @@ def main():
 
                     with torch.no_grad():
                         metrics = _compute_batch_metrics(emb.detach(), labels_t.to(device))
+                        pre_var_now = pre_emb.detach().float().var(dim=0).mean().item()
+                        supcon_now = supcon_loss.item()
+                        var_loss_now = var_loss.item() if args.var_reg_weight > 0.0 else 0.0
 
                     pbar.set_postfix(
                         loss=f"{loss_now:.4f}",
+                        lsup=f"{supcon_now:.4f}",
                         cdist=f"{metrics['cdist']:.3f}",
                         dpp=f"{metrics['d_pp']:.3f}",
                         dpn=f"{metrics['d_pn']:.3f}",
                         var=f"{metrics['var_all']:.4f}",
+                        prevar=f"{pre_var_now:.4f}",
                         gnorm=f"{gnorm_now:.3f}",
                         lr=f"{lr_now:.2e}",
                     )
@@ -1196,12 +1259,15 @@ def main():
                         import wandb
                         log_dict = {
                             "train/loss":         loss_now,
+                            "train/loss_supcon":  supcon_now,
+                            "train/loss_var":     var_loss_now,
                             "train/gnorm":        gnorm_now,
                             "train/lr_proj":      optimizer.param_groups[0]["lr"],
                             "train/cdist":        metrics["cdist"],
                             "train/dist_pos_pos": metrics["d_pp"],
                             "train/dist_pos_neg": metrics["d_pn"],
                             "train/var_all":      metrics["var_all"],
+                            "train/pre_var_all":  pre_var_now,
                             "train/var_pos":      metrics["var_pos"],
                             "train/var_neg":      metrics["var_neg"],
                             "epoch": epoch + (batch_idx + 1) / max(n_batches_this_epoch, 1),
