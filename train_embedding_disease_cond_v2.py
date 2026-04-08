@@ -965,7 +965,6 @@ def main():
                 batch["event_embs"].to(device),
                 batch["event_mask"].to(device),
                 batch["task_idxs"].to(device),
-                bypass_qwen=True,
             )
             loss = _loss_fn(labels_t.to(device), emb)
             loss.backward()
