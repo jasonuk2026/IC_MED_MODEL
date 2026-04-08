@@ -109,8 +109,8 @@ class DiseaseAwareEHREncoder(nn.Module):
         event_embs = event_embs.to(self.dtype)
 
         # 1. RMSNorm → MLP projection for events (Qwen3-style: norm before linear)
-        ev_normed = self.input_norm(event_embs)                                      # (B, N, bert_dim)
-        ev_proj   = self.bert_proj_2(F.gelu(self.bert_proj_1(ev_normed)))            # (B, N, qwen_dim)
+        ev_normed = self.input_norm(event_embs)                           # (B, N, bert_dim)
+        ev_proj   = self.bert_proj_2(F.gelu(self.bert_proj_1(ev_normed)))# (B, N, qwen_dim)
 
         # 2. Per-task prefix embeddings and masks (looked up from buffers)
         prefix      = self.task_prefix_embeds[task_idx]   # (B, max_P, D)
@@ -128,10 +128,15 @@ class DiseaseAwareEHREncoder(nn.Module):
         # 4. Forward through Qwen (inputs_embeds bypasses embed_tokens)
         out = self.qwen(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
 
-        # 5. Last-token pool (EOS position) → L2 normalise
-        # EOS is always appended as the very last token in inputs_embeds,
-        # so its hidden state is always at position [-1] regardless of padding.
-        emb = out.last_hidden_state[:, -1]
+        # 5. Mean pool over event hidden states → L2 normalise.
+        # Event tokens occupy positions [max_P + P2 : max_P + P2 + N] in the sequence.
+        hidden   = out.last_hidden_state                       # (B, T, D)
+        max_P    = prefix.size(1)
+        P_len    = max_P + P2                                  # sequence offset of first event
+        N        = event_embs.size(1)
+        ev_hid   = hidden[:, P_len : P_len + N, :]            # (B, N, D)
+        mask_f   = event_mask.float().unsqueeze(-1)            # (B, N, 1)
+        emb      = (ev_hid * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)  # (B, D)
         return F.normalize(emb.float(), p=2, dim=-1)
 
     # ── Checkpoint helpers ────────────────────────────────────────────────────

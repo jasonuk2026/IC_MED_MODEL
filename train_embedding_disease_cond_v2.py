@@ -15,22 +15,31 @@ Eval data: output of dataset/build_eval_task_data.py
       anchor and positive come from different patients,
       anchor and negative come from different patients.
 
-Architecture / training loop are unchanged from v1.
+Two-stage training
+──────────────────
+  Stage 1 (--stage1_steps N):
+    • Only bert_proj_1, bert_proj_2, input_norm are trained.
+    • LoRA params are frozen (requires_grad=False).
+    • Forward bypasses Qwen: mean-pool directly over ev_proj.
+    • Lets the projection layers learn a meaningful EHR embedding before
+      the full Qwen forward is engaged.
 
-Usage (single node, 4 GPUs)
-─────────────────────────────
-  torchrun --nproc_per_node=4 train_embedding_disease_cond_v2.py \\
-      --train_data_paths data/prepared/all/train/shard_*.parquet \\
-      --eval_data_paths  EHRSHOT_ASSETS/llm_eval_data/new_*/val.parquet \\
-      --bert_embeddings  data/biolinkbert_embeddings/embeddings.npy \\
-      --bf16 --flash_attn
+  Stage 2 (remaining epochs):
+    • LoRA params are unfrozen.
+    • Full forward: Qwen processes events; mean-pool over event hidden states.
+    • Separate LRs: --lr_proj (higher) for projection layers,
+                    --lr_lora (lower)  for LoRA.
 
-Single GPU
-──────────
+Loss: BatchHardTripletLoss (cosine distance) throughout both stages.
+
+Usage (single GPU)
+──────────────────
   python train_embedding_disease_cond_v2.py \\
-      --train_data_paths data/prepared/all/train/shard_0.parquet \\
-      --eval_data_paths  EHRSHOT_ASSETS/llm_eval_data/new_*/val.parquet \\
-      --bert_embeddings  data/biolinkbert_embeddings/embeddings.npy
+      --train_data_dir data/llm_data_v7 \\
+      --eval_data_paths EHRSHOT_ASSETS/llm_eval_data/new_*/val.parquet \\
+      --bert_embeddings data/biolinkbert_embeddings/embeddings.npy \\
+      --bf16 --flash_attn \\
+      --stage1_steps 1000 --lr_proj 2e-4 --lr_lora 5e-5
 
 NOTE: QLoRA (--qlora) is incompatible with multi-GPU DDP.
 """
@@ -58,52 +67,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig, logging as hf_logging
 from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training, PeftModel
-from sentence_transformers.losses import BatchHardSoftMarginTripletLoss, BatchHardTripletLoss, BatchHardTripletLossDistanceFunction
+from sentence_transformers.losses import (
+    BatchHardSoftMarginTripletLoss,
+    BatchHardTripletLoss,
+    BatchHardTripletLossDistanceFunction,
+)
 from model import DiseaseAwareEHREncoder
-
-
-def supervised_infonce_loss(embeddings: torch.Tensor, labels: torch.Tensor, temperature: float) -> torch.Tensor:
-    """Supervised InfoNCE (SupCon) loss.
-
-    For each anchor i, positives = same-label samples (j != i),
-    negatives = all other samples (denominator = all j != i).
-
-    Loss = mean_i[ -log( sum_{j in pos(i)} exp(sim(i,j)/T)
-                        / sum_{j != i}     exp(sim(i,j)/T) ) ]
-
-    Embeddings must be L2-normalised (cosine similarity = dot product).
-    Gradient is well-defined even when embeddings collapse: the softmax
-    always spans multiple distinct vectors, preventing vanishing gradients.
-    """
-    B      = embeddings.size(0)
-    device = embeddings.device
-
-    # (B, B) cosine similarity matrix, scaled by temperature
-    sim = (embeddings @ embeddings.T) / temperature
-
-    # Masks
-    self_mask = torch.eye(B, dtype=torch.bool, device=device)
-    pos_mask  = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~self_mask  # (B, B)
-
-    # Exclude self from denominator via -inf before logsumexp
-    sim_no_self = sim.masked_fill(self_mask, float("-inf"))
-
-    # log denominator: logsumexp over all j != i  (handles -inf safely)
-    log_denom = torch.logsumexp(sim_no_self, dim=1)   # (B,)
-
-    # log p(j|i) = sim[i,j] - log_denom[i]  for j != i
-    log_probs = sim_no_self - log_denom.unsqueeze(1)   # (B, B), diag = -inf
-
-    # Sum log-probs over positives.
-    # Use masked_fill(~pos_mask, 0) instead of multiplying to avoid 0 * (-inf) = NaN.
-    n_pos = pos_mask.sum(dim=1).float()               # (B,)
-    valid = n_pos > 0
-    if not valid.any():
-        return embeddings.sum() * 0.0                 # differentiable zero
-
-    pos_log_probs   = log_probs.masked_fill(~pos_mask, 0.0)  # safe: only -inf at diag, which pos_mask already excludes
-    loss_per_anchor = -pos_log_probs.sum(dim=1) / n_pos.clamp(min=1)
-    return loss_per_anchor[valid].mean()
 
 hf_logging.set_verbosity_warning()
 
@@ -143,11 +112,7 @@ PROMPT_MIDDLE = " based on the following events.\nStart of medical events:"
 # ── BioLinkBERT embeddings (read-only mmap) ───────────────────────────────────
 
 class EmbeddingStore:
-    """Memory-mapped BioLinkBERT event embeddings array.
-
-    Unlike v1's EventLookup, no key→index mapping is needed: the embedding_idx
-    is already stored in each event JSON inside the parquet timeline column.
-    """
+    """Memory-mapped BioLinkBERT event embeddings array."""
 
     def __init__(self, embeddings_path: str):
         logger.info(f"Loading embeddings (mmap) from {embeddings_path} …")
@@ -200,13 +165,11 @@ def _collate_event_embs(
 import bisect
 
 # Worker-local state: ParquetFile handles + cumulative row-group offsets.
-# Each DataLoader worker process has its own copy (populated by _epoch_worker_init).
 _worker_pq_files:    dict[int, pq.ParquetFile] = {}
 _worker_pq_cum_rows: dict[int, list[int]]       = {}   # task_idx → [0, rg0, rg0+rg1, ...]
 
 
 def _build_cum_rows(pf: pq.ParquetFile) -> list[int]:
-    """Build cumulative row-count list from parquet metadata (no data read)."""
     meta = pf.metadata
     cum  = [0]
     for i in range(meta.num_row_groups):
@@ -215,11 +178,6 @@ def _build_cum_rows(pf: pq.ParquetFile) -> list[int]:
 
 
 def _epoch_worker_init(worker_id: int) -> None:
-    """Called once per DataLoader worker process.
-
-    Opens one pq.ParquetFile per task and precomputes cumulative row counts
-    from metadata only (no data I/O) so __getitem__ can seek to any row.
-    """
     worker_info = torch.utils.data.get_worker_info()
     ds: EpochBatchDataset = worker_info.dataset
     global _worker_pq_files, _worker_pq_cum_rows
@@ -238,13 +196,7 @@ def _read_rows(
     length:   int,
     columns:  list[str],
 ) -> "pd.DataFrame":
-    """Read `length` rows starting at absolute row `start`.
-
-    Uses bisect on the precomputed cumulative row-group offsets — O(log G)
-    lookup then reads only the 1–2 row groups that cover the range.
-    Works regardless of row_group_size used when writing the parquet.
-    """
-    end     = start + length - 1
+    end      = start + length - 1
     rg_first = bisect.bisect_right(cum_rows, start) - 1
     rg_last  = bisect.bisect_right(cum_rows, end)   - 1
 
@@ -253,7 +205,6 @@ def _read_rows(
         local_start = start - cum_rows[rg_first]
         return df.iloc[local_start : local_start + length]
 
-    # Batch spans two (or more) row groups — concatenate then slice
     parts = [pf.read_row_group(rg, columns=columns).to_pandas()
              for rg in range(rg_first, rg_last + 1)]
     df          = pd.concat(parts, ignore_index=True)
@@ -262,17 +213,7 @@ def _read_rows(
 
 
 class EpochBatchDataset(Dataset):
-    """Schedule-based lazy-loading dataset for one training epoch.
-
-    Construction reads only JSON metadata files (milliseconds, no parquet I/O).
-    Each __getitem__ reads exactly batch_size rows by seeking directly to the
-    right row group(s) using PyArrow metadata — no full-file load, no
-    row_group_size constraint on the parquet.
-
-    Use with DataLoader(worker_init_fn=_epoch_worker_init, num_workers=N>=1)
-    to overlap parquet I/O with GPU computation.  Falls back to per-instance
-    lazy state when num_workers=0.
-    """
+    """Schedule-based lazy-loading dataset for one training epoch."""
 
     def __init__(
         self,
@@ -291,7 +232,6 @@ class EpochBatchDataset(Dataset):
         self.batch_size          = batch_size
         self.pad_to_num_events   = pad_to_num_events
         self.task_parquet_paths: dict[int, Path] = {}
-        # Lazy state for main process (num_workers=0)
         self._main_pq_files:    dict[int, pq.ParquetFile] = {}
         self._main_pq_cum_rows: dict[int, list[int]]       = {}
 
@@ -315,8 +255,7 @@ class EpochBatchDataset(Dataset):
                 max_batch_size = mbs
             elif max_batch_size != mbs:
                 raise ValueError(
-                    f"Inconsistent max_batch_size across tasks: "
-                    f"{max_batch_size} vs {mbs} for {task}"
+                    f"Inconsistent max_batch_size: {max_batch_size} vs {mbs} for {task}"
                 )
 
             self.task_parquet_paths[task_idx] = p_parquet
@@ -334,7 +273,6 @@ class EpochBatchDataset(Dataset):
         if not all_batches:
             raise ValueError("No valid prepared data found for any task.")
 
-        # Shuffle and DDP-balance; all ranks use the same shuffle then slice by rank
         rng = random.Random(seed + training_epoch * 1337)
         rng.shuffle(all_batches)
         n_total     = (len(all_batches) // world_size) * world_size
@@ -345,7 +283,6 @@ class EpochBatchDataset(Dataset):
         return len(self.schedule)
 
     def _get_pq_state(self, task_idx: int) -> tuple[pq.ParquetFile, list[int]]:
-        """Return (ParquetFile, cum_rows) — from worker state or lazy main-process init."""
         global _worker_pq_files, _worker_pq_cum_rows
         if _worker_pq_files:
             return _worker_pq_files[task_idx], _worker_pq_cum_rows[task_idx]
@@ -387,14 +324,6 @@ def precompute_eval_triplets(
     seed:                 int,
     output_path:          Path,
 ) -> int:
-    """Sample anchor/positive/negative triplets from eval data and save to parquet.
-
-    Randomly samples n_triplets_per_task triplets per task with replacement.
-    No patient-uniqueness constraint — eval only measures whether the model
-    ranks positives closer than negatives, patient identity is irrelevant.
-
-    Returns the number of triplets saved.
-    """
     pos: dict[int, list[list[int]]] = defaultdict(list)
     neg: dict[int, list[list[int]]] = defaultdict(list)
 
@@ -448,6 +377,96 @@ def precompute_eval_triplets(
     pq.write_table(table, str(output_path))
     logger.info(f"  Saved {len(records)} eval triplets → {output_path}")
     return len(records)
+
+
+# ── Optimisation helpers ───────────────────────────────────────────────────────
+
+def _set_lora_trainable(model: torch.nn.Module, trainable: bool) -> int:
+    """Set requires_grad on all LoRA parameters. Returns the count of affected params."""
+    n = 0
+    for name, param in model.named_parameters():
+        if "lora_" in name:
+            param.requires_grad_(trainable)
+            n += 1
+    return n
+
+
+def _make_param_groups(
+    encoder:  torch.nn.Module,
+    lr_proj:  float,
+    lr_lora:  float,
+) -> list[dict]:
+    """Return AdamW param-group list with separate LRs for projection vs LoRA layers."""
+    raw_enc = encoder.module if isinstance(encoder, DDP) else encoder
+    proj_ids = {
+        id(p)
+        for p in [
+            *raw_enc.input_norm.parameters(),
+            *raw_enc.bert_proj_1.parameters(),
+            *raw_enc.bert_proj_2.parameters(),
+        ]
+    }
+    proj_params, lora_params = [], []
+    for p in encoder.parameters():
+        if not p.requires_grad:
+            continue
+        if id(p) in proj_ids:
+            proj_params.append(p)
+        else:
+            lora_params.append(p)
+    groups: list[dict] = [{"params": proj_params, "lr": lr_proj}]
+    if lora_params:
+        groups.append({"params": lora_params, "lr": lr_lora})
+    return groups
+
+
+# ── Per-batch diagnostic metrics ──────────────────────────────────────────────
+
+def _compute_batch_metrics(
+    emb:    torch.Tensor,   # (B, D) L2-normalised float32
+    labels: torch.Tensor,   # (B,)   long, same device
+) -> dict[str, float]:
+    """Compute embedding diagnostics consistent with cosine-distance triplet loss."""
+    device = emb.device
+    e      = emb.float()
+    lbl    = labels
+    e_pos  = e[lbl == 1]
+    e_neg  = e[lbl == 0]
+    B      = e.size(0)
+
+    # Mean pairwise cosine distance over all (i<j) pairs
+    sim_mat  = e @ e.T                                          # (B, B)
+    tri_mask = torch.triu(
+        torch.ones(B, B, dtype=torch.bool, device=device), diagonal=1
+    )
+    cdist = (1.0 - sim_mat[tri_mask]).mean().item()
+
+    # Positive-positive cosine distance
+    d_pp = float("nan")
+    if e_pos.size(0) >= 2:
+        sim_pp = e_pos @ e_pos.T
+        np_    = e_pos.size(0)
+        tri_pp = torch.triu(torch.ones(np_, np_, dtype=torch.bool, device=device), diagonal=1)
+        d_pp   = (1.0 - sim_pp[tri_pp]).mean().item()
+
+    # Positive-negative cosine distance
+    d_pn = float("nan")
+    if e_pos.size(0) >= 1 and e_neg.size(0) >= 1:
+        d_pn = (1.0 - (e_pos @ e_neg.T)).mean().item()
+
+    # Per-dimension variance (mean over dims = trace(Cov) / D)
+    var_all = e.var(dim=0).mean().item()
+    var_pos = e_pos.var(dim=0).mean().item() if e_pos.size(0) >= 2 else float("nan")
+    var_neg = e_neg.var(dim=0).mean().item() if e_neg.size(0) >= 2 else float("nan")
+
+    return {
+        "cdist":   cdist,
+        "d_pp":    d_pp,
+        "d_pn":    d_pn,
+        "var_all": var_all,
+        "var_pos": var_pos,
+        "var_neg": var_neg,
+    }
 
 
 # ── Model setup ───────────────────────────────────────────────────────────────
@@ -506,18 +525,7 @@ def setup_lora(model, args):
 
 
 def build_task_prefix_ids(tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build left-padded prefix token ids and attention masks for all tasks.
-
-    Each task's prefix is  PROMPT_PREFIX + disease_name,
-    e.g. "Please predict disease hypertension".
-    All prefixes are left-padded to the same length (max across tasks) using
-    the tokenizer's pad_token_id so that torch.compile sees static shapes.
-
-    Returns:
-        task_prefix_ids  : (num_tasks, max_P)  long  — left-padded token ids
-        task_prefix_mask : (num_tasks, max_P)  long  — 0=pad, 1=real token
-    """
-    tasks_sorted  = sorted(TASK_2_DISEASE_NAME)  # stable order matching TASK_2_IDX
+    tasks_sorted  = sorted(TASK_2_DISEASE_NAME)
     pad_id        = tokenizer.pad_token_id
 
     all_ids: list[list[int]] = []
@@ -576,13 +584,6 @@ def build_encoder(qwen_model, tokenizer, args) -> DiseaseAwareEHREncoder:
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
 class EvalBatchDataset(Dataset):
-    """Batch-level Dataset for evaluation.
-
-    Receives a flat list of (event_ids_array, task_idx) entries (already split
-    into anchor / positive / negative segments by evaluate_ddp) and yields
-    collated CPU tensors batch-by-batch.
-    """
-
     def __init__(
         self,
         entries:           list[tuple[np.ndarray, int]],
@@ -618,11 +619,6 @@ def evaluate_rank0(
     device:            torch.device,
     args,
 ) -> tuple[float, dict[str, float]]:
-    """Rank-0-only triplet evaluation using pre-computed triplet parquet.
-
-    Loads triplets from eval_triplet_path (written by precompute_eval_triplets),
-    encodes anchor/positive/negative, computes accuracy per task and overall.
-    """
     raw_encoder = encoder.module if isinstance(encoder, DDP) else encoder
     raw_encoder.eval()
 
@@ -637,7 +633,6 @@ def evaluate_rank0(
         raw_encoder.train()
         return 0.0, {}
 
-    # Build interleaved entry list: [a0, p0, n0, a1, p1, n1, ...]
     entries: list[tuple[np.ndarray, int]] = []
     for row in df.itertuples(index=False):
         t = int(row.task_idx)
@@ -661,14 +656,14 @@ def evaluate_rank0(
             ).cpu()
         )
 
-    embs      = torch.cat(all_embs, dim=0)   # (3 * n_triplets, D)
-    anchors   = embs[0::3]                    # (n_triplets, D)
+    embs      = torch.cat(all_embs, dim=0)
+    anchors   = embs[0::3]
     positives = embs[1::3]
     negatives = embs[2::3]
 
     d_ap    = (anchors - positives).norm(dim=1)
     d_an    = (anchors - negatives).norm(dim=1)
-    correct = d_ap < d_an                    # (n_triplets,) bool
+    correct = d_ap < d_an
 
     task_idxs_arr = df["task_idx"].values
     idx_to_name   = {v: k for k, v in TASK_2_IDX.items()}
@@ -690,38 +685,29 @@ def evaluate_rank0(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Disease-aware EHR embedding (v2, v6 parquet format).",
+        description="Disease-aware EHR embedding (v2, mean-pool over event hidden states).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # Mode
     p.add_argument("--eval_only",  action="store_true")
-    p.add_argument("--debug_batches", type=int, default=None,
-                   help="If set, stop each epoch after this many batches (for DDP smoke-test).")
-    p.add_argument("--checkpoint", default=None,
-                   help="Path to a saved checkpoint dir (contains lora/ + extra_modules.pt).")
+    p.add_argument("--debug_batches", type=int, default=None)
+    p.add_argument("--checkpoint", default=None)
 
     # Data
-    p.add_argument("--train_data_dir", default=None,
-                   help="Base directory for prepared training data from prepare_task_data_v2.py "
-                        "(contains {task}/train_prepared_{epoch:03d}.parquet). "
-                        "Required unless --eval_only.")
-    p.add_argument("--tasks", nargs="+", default=list(sorted(TASK_2_DISEASE_NAME.keys())),
-                   help="Tasks to train on (default: all tasks in TASK_2_IDX).")
-    p.add_argument("--eval_data_paths",  nargs="+", default=None,
-                   help="Eval parquets (output of build_eval_task_data.py).")
+    p.add_argument("--train_data_dir", default=None)
+    p.add_argument("--tasks", nargs="+", default=list(sorted(TASK_2_DISEASE_NAME.keys())))
+    p.add_argument("--eval_data_paths",  nargs="+", default=None)
 
-    # BioLinkBERT event embeddings
-    p.add_argument("--bert_embeddings", required=True,
-                   help="embeddings.npy produced by extract_biolinkbert_embeddings.py.")
+    # BioLinkBERT embeddings
+    p.add_argument("--bert_embeddings", required=True)
 
     # Qwen model
     p.add_argument("--model_name",   default="Qwen/Qwen3-Embedding-0.6B")
     p.add_argument("--flash_attn",   action="store_true")
     p.add_argument("--bf16",         action="store_true")
     p.add_argument("--fp16",         action="store_true")
-    p.add_argument("--qlora",        action="store_true",
-                   help="4-bit NF4 QLoRA. Single GPU only.")
+    p.add_argument("--qlora",        action="store_true")
 
     # LoRA
     p.add_argument("--lora_r",              type=int,   default=4)
@@ -734,7 +720,6 @@ def parse_args():
     p.add_argument("--output_dir",   default="output/medical-embedding-disease-cond-v2")
     p.add_argument("--epochs",       type=int,   default=5)
     p.add_argument("--batch_size",   type=int,   default=32)
-    p.add_argument("--lr",           type=float, default=2e-4)
     p.add_argument("--warmup_ratio", type=float, default=0.1)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--grad_accum",   type=int,   default=1)
@@ -742,13 +727,20 @@ def parse_args():
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--log_steps",    type=int,   default=10)
 
-    # Loss / Eval
-    p.add_argument("--loss",                     choices=["infonce", "triplet"], default="infonce",
-                   help="Loss function. infonce=SupCon (recommended), triplet=BatchHardTripletLoss.")
-    p.add_argument("--temperature",              type=float, default=0.07,
-                   help="Temperature for InfoNCE loss.")
-    p.add_argument("--triplet_margin",           type=float, default=0.3,
-                   help="Margin for BatchHardTripletLoss (only used when --loss triplet).")
+    # Two-stage training
+    p.add_argument("--stage1_steps", type=int, default=0,
+                   help="Number of optimizer steps for stage 1 (bypass_qwen, only proj params). "
+                        "0 = skip stage 1.")
+    p.add_argument("--lr_proj", type=float, default=2e-4,
+                   help="LR for bert_proj_1, bert_proj_2, input_norm (higher).")
+    p.add_argument("--lr_lora", type=float, default=5e-5,
+                   help="LR for LoRA parameters (lower).")
+
+    # Loss
+    p.add_argument("--triplet_margin", type=float, default=0.3,
+                   help="Margin for BatchHardTripletLoss. Set to 0 for soft-margin variant.")
+
+    # Eval
     p.add_argument("--n_eval_triplets_per_task", type=int,   default=256)
     p.add_argument("--eval_batch_size",          type=int,   default=32)
     p.add_argument("--pad_to_num_events",        type=int,   default=None)
@@ -756,8 +748,7 @@ def parse_args():
     p.add_argument("--num_workers",      type=int, default=4)
     p.add_argument("--prefetch_factor",  type=int, default=4)
 
-    p.add_argument("--compile", action="store_true",
-                   help="torch.compile (requires --pad_to_num_events for static shapes).")
+    p.add_argument("--compile", action="store_true")
 
     # wandb
     p.add_argument("--wandb_project",  default=None)
@@ -790,7 +781,7 @@ def main():
         logging.getLogger().setLevel(logging.WARNING)
 
     if args.qlora and is_ddp:
-        raise RuntimeError("QLoRA is incompatible with multi-GPU DDP. Use single GPU.")
+        raise RuntimeError("QLoRA is incompatible with multi-GPU DDP.")
     if not args.eval_only and args.train_data_dir is None:
         raise ValueError("--train_data_dir is required unless --eval_only is set.")
 
@@ -801,7 +792,7 @@ def main():
         logger.info(f"Run dir: {run_dir}")
         logger.info(f"World size: {world_size}")
 
-    # ── wandb (rank 0 only) ───────────────────────────────────────────────────
+    # ── wandb ─────────────────────────────────────────────────────────────────
     use_wandb = (args.wandb_project is not None) and (rank == 0)
     wandb_run = None
     if use_wandb:
@@ -818,10 +809,10 @@ def main():
                    base_path=os.path.dirname(os.path.abspath(__file__)))
         logger.info(f"wandb run: {wandb_run.url}")
 
-    # ── BioLinkBERT event embeddings (shared read-only mmap) ─────────────────
+    # ── BioLinkBERT embeddings ────────────────────────────────────────────────
     store = EmbeddingStore(args.bert_embeddings)
 
-    # ── Build Qwen model + tokenizer ───────────────────────────────────────────
+    # ── Build Qwen model + tokenizer ─────────────────────────────────────────
     if rank == 0:
         logger.info(f"Loading Qwen: {args.model_name}")
     qwen_model, tokenizer = load_qwen(args)
@@ -851,9 +842,7 @@ def main():
         encoder = DDP(encoder, device_ids=[local_rank], output_device=local_rank,
                       find_unused_parameters=False, static_graph=True)
 
-    # ── Pre-compute eval triplets (rank 0 only, once before training) ─────────
-    # Stored in run_dir so rank 0 can reload per epoch. Other ranks do not need
-    # this path because eval is rank-0-only.
+    # ── Pre-compute eval triplets (rank 0 only) ───────────────────────────────
     eval_triplet_path: Path | None = None
     if args.eval_data_paths and rank == 0:
         eval_triplet_path = run_dir / "eval_triplets.parquet"
@@ -865,7 +854,7 @@ def main():
             eval_triplet_path,
         )
 
-    # ── Eval-only mode ─────────────────────────────────────────────────────────
+    # ── Eval-only mode ────────────────────────────────────────────────────────
     if args.eval_only:
         if eval_triplet_path is None:
             raise ValueError("--eval_only requires --eval_data_paths.")
@@ -885,7 +874,26 @@ def main():
             dist.destroy_process_group()
         return
 
-    # ── Count available data epochs ────────────────────────────────────────────
+    # ── Loss function (BatchHardTripletLoss) ─────────────────────────────────
+    if args.triplet_margin > 0:
+        _loss_module = BatchHardTripletLoss(
+            model=None,
+            distance_metric=BatchHardTripletLossDistanceFunction.cosine_distance,
+            margin=args.triplet_margin,
+        )
+        _loss_fn  = lambda labels, emb: _loss_module.batch_hard_triplet_loss(labels, emb)
+        loss_desc = f"BatchHardTripletLoss (margin={args.triplet_margin}, cosine_distance)"
+    else:
+        _loss_module = BatchHardSoftMarginTripletLoss(
+            model=None,
+            distance_metric=BatchHardTripletLossDistanceFunction.cosine_distance,
+        )
+        _loss_fn  = lambda labels, emb: _loss_module.batch_hard_triplet_soft_margin_loss(labels, emb)
+        loss_desc = "BatchHardSoftMarginTripletLoss (cosine_distance)"
+    if rank == 0:
+        logger.info(loss_desc)
+
+    # ── Count available data epochs ───────────────────────────────────────────
     first_task = sorted(args.tasks)[0]
     task_dir   = Path(args.train_data_dir) / first_task
     data_epoch_files = sorted(task_dir.glob("train_prepared_*.parquet"))
@@ -895,81 +903,15 @@ def main():
     if rank == 0:
         logger.info(f"Found {n_data_epochs} data epoch(s) (task dir: {task_dir})")
 
-    # ── Estimate schedule size for LR scheduler (reads JSON only, very fast) ──
-    est_ds = EpochBatchDataset(
-        args.train_data_dir, 0, args.tasks, store,
-        args.batch_size, 0, args.seed, world_size, rank,
-        args.pad_to_num_events,
-    )
-    n_batches_per_rank_0 = len(est_ds)
-    del est_ds
-
-    # ── Optimizer + LR scheduler ───────────────────────────────────────────────
-    optimizer = torch.optim.AdamW(
-        [p for p in encoder.parameters() if p.requires_grad],
-        lr=args.lr, weight_decay=args.weight_decay,
-        fused=True,
-    )
-
-    n_opt_steps_per_epoch = math.ceil(n_batches_per_rank_0 / args.grad_accum)
-    total_opt_steps       = n_opt_steps_per_epoch * args.epochs
-    warmup_steps          = int(total_opt_steps * args.warmup_ratio)
-
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return step / max(warmup_steps, 1)
-        progress = (step - warmup_steps) / max(total_opt_steps - warmup_steps, 1)
-        return max(0.0, 1.0 - progress)
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    if args.loss == "infonce":
-        _loss_fn  = lambda labels, emb: supervised_infonce_loss(emb, labels, args.temperature)
-        loss_desc = f"SupervisedInfoNCE (temperature={args.temperature})"
-    elif args.triplet_margin > 0:
-        loss_module = BatchHardTripletLoss(
-            model=None,
-            distance_metric=BatchHardTripletLossDistanceFunction.cosine_distance,
-            margin=args.triplet_margin,
-        )
-        _loss_fn  = lambda labels, emb: loss_module.batch_hard_triplet_loss(labels, emb)
-        loss_desc = f"BatchHardTripletLoss (margin={args.triplet_margin})"
-    else:
-        loss_module = BatchHardSoftMarginTripletLoss(
-            model=None,
-            distance_metric=BatchHardTripletLossDistanceFunction.cosine_distance,
-        )
-        _loss_fn  = lambda labels, emb: loss_module.batch_hard_triplet_soft_margin_loss(labels, emb)
-        loss_desc = "BatchHardSoftMarginTripletLoss (soft margin)"
-
-    if rank == 0:
-        logger.info(f"Training: {args.epochs} epochs, "
-                    f"~{n_batches_per_rank_0} batches/rank/epoch, "
-                    f"{total_opt_steps} optimizer steps total")
-        logger.info(loss_desc)
-
-    # ── Training loop ──────────────────────────────────────────────────────────
-    best_val_acc = 0.0
-    opt_step     = 0
-
-    for epoch in range(args.epochs):
-        if is_ddp:
-            dist.barrier()
-
-        # Map training epoch → data epoch (wraps around if fewer data epochs)
-        data_epoch = epoch % n_data_epochs
-        if rank == 0:
-            logger.info(f"Epoch {epoch+1}/{args.epochs}: data epoch {data_epoch} …")
-
-        epoch_ds = EpochBatchDataset(
+    # ── Helper: build DataLoader from a given data epoch ─────────────────────
+    def _make_loader(data_epoch: int, training_epoch: int) -> tuple[EpochBatchDataset, DataLoader]:
+        ds = EpochBatchDataset(
             args.train_data_dir, data_epoch, args.tasks, store,
-            args.batch_size, epoch, args.seed, world_size, rank,
+            args.batch_size, training_epoch, args.seed, world_size, rank,
             args.pad_to_num_events,
         )
-        n_batches_this_epoch = len(epoch_ds)
-
-        train_loader = DataLoader(
-            epoch_ds,
+        dl = DataLoader(
+            ds,
             batch_size=1,
             shuffle=False,
             collate_fn=lambda b: b[0],
@@ -979,6 +921,166 @@ def main():
             worker_init_fn=_epoch_worker_init,
             persistent_workers=False,
         )
+        return ds, dl
+
+    # ── Stage 1: train only projection layers, bypass Qwen ───────────────────
+    if args.stage1_steps > 0:
+        if rank == 0:
+            logger.info(
+                f"Stage 1: {args.stage1_steps} steps — "
+                f"LoRA frozen, bypass_qwen=True, lr_proj={args.lr_proj}"
+            )
+
+        n_frozen = _set_lora_trainable(encoder, False)
+        if rank == 0:
+            logger.info(f"  Froze {n_frozen} LoRA parameter tensors")
+
+        stage1_opt = torch.optim.AdamW(
+            [p for p in encoder.parameters() if p.requires_grad],
+            lr=args.lr_proj,
+            weight_decay=args.weight_decay,
+            fused=True,
+        )
+
+        stage1_ds, stage1_dl = _make_loader(data_epoch=0, training_epoch=0)
+        encoder.train()
+        stage1_opt.zero_grad()
+        s1_step = 0
+
+        pbar_s1 = tqdm(
+            stage1_dl,
+            desc="Stage 1",
+            disable=(rank != 0),
+            dynamic_ncols=True,
+            total=min(args.stage1_steps, len(stage1_ds)),
+        )
+
+        for batch in pbar_s1:
+            if s1_step >= args.stage1_steps:
+                break
+
+            labels_t = batch["labels"]
+
+            emb  = encoder(
+                batch["event_embs"].to(device),
+                batch["event_mask"].to(device),
+                batch["task_idxs"].to(device),
+            )
+            loss = _loss_fn(labels_t.to(device), emb)
+            loss.backward()
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                [p for p in encoder.parameters() if p.requires_grad],
+                args.grad_clip,
+            )
+            stage1_opt.step()
+            stage1_opt.zero_grad()
+            s1_step += 1
+
+            if rank == 0:
+                loss_now  = loss.item()
+                gnorm_now = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+
+                with torch.no_grad():
+                    metrics = _compute_batch_metrics(emb.detach(), labels_t.to(device))
+
+                pbar_s1.set_postfix(
+                    loss=f"{loss_now:.4f}",
+                    cdist=f"{metrics['cdist']:.3f}",
+                    dpp=f"{metrics['d_pp']:.3f}",
+                    dpn=f"{metrics['d_pn']:.3f}",
+                    var=f"{metrics['var_all']:.4f}",
+                    gnorm=f"{gnorm_now:.3f}",
+                )
+
+                if use_wandb and s1_step % args.log_steps == 0:
+                    import wandb
+                    wandb.log({
+                        "stage1/loss":         loss_now,
+                        "stage1/gnorm":        gnorm_now,
+                        "stage1/cdist":        metrics["cdist"],
+                        "stage1/dist_pos_pos": metrics["d_pp"],
+                        "stage1/dist_pos_neg": metrics["d_pn"],
+                        "stage1/var_all":      metrics["var_all"],
+                        "stage1/var_pos":      metrics["var_pos"],
+                        "stage1/var_neg":      metrics["var_neg"],
+                    }, step=s1_step)
+
+        pbar_s1.close()
+        if rank == 0:
+            logger.info(f"Stage 1 done ({s1_step} steps). Unfreezing LoRA for stage 2 …")
+
+        n_unfrozen = _set_lora_trainable(encoder, True)
+        if rank == 0:
+            logger.info(f"  Unfroze {n_unfrozen} LoRA parameter tensors")
+
+        # Eval after stage 1
+        if eval_triplet_path is not None and rank == 0:
+            val_acc, val_task_acc = evaluate_rank0(encoder, eval_triplet_path, store, device, args)
+            logger.info(f"  [post-stage1] val triplet accuracy: {val_acc:.4f}")
+            for task, acc in sorted(val_task_acc.items()):
+                logger.info(f"    {task}: {acc:.4f}")
+            if use_wandb:
+                import wandb
+                ld = {"stage1/val_triplet_acc": val_acc}
+                for task, acc in val_task_acc.items():
+                    ld[f"stage1/val/{task}/triplet_acc"] = acc
+                wandb.log(ld, step=s1_step)
+
+    # ── Stage 2 optimizer + LR scheduler ─────────────────────────────────────
+    # Estimate total steps from data epoch 0 (reused across all training epochs)
+    est_ds = EpochBatchDataset(
+        args.train_data_dir, 0, args.tasks, store,
+        args.batch_size, 0, args.seed, world_size, rank,
+        args.pad_to_num_events,
+    )
+    n_batches_per_rank_0 = len(est_ds)
+    del est_ds
+
+    n_opt_steps_per_epoch = math.ceil(n_batches_per_rank_0 / args.grad_accum)
+    total_opt_steps       = n_opt_steps_per_epoch * args.epochs
+    warmup_steps          = int(total_opt_steps * args.warmup_ratio)
+
+    param_groups = _make_param_groups(encoder, args.lr_proj, args.lr_lora)
+    if rank == 0:
+        for i, g in enumerate(param_groups):
+            logger.info(f"  Param group {i}: {len(g['params'])} tensors, lr={g['lr']}")
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        weight_decay=args.weight_decay,
+        fused=True,
+    )
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_opt_steps - warmup_steps, 1)
+        return max(0.0, 1.0 - progress)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    if rank == 0:
+        logger.info(f"Training: {args.epochs} epochs, "
+                    f"~{n_batches_per_rank_0} batches/rank/epoch, "
+                    f"{total_opt_steps} optimizer steps total")
+        logger.info(f"  lr_proj={args.lr_proj}, lr_lora={args.lr_lora}, "
+                    f"warmup={warmup_steps} steps")
+
+    # ── Training loop (stage 2) ───────────────────────────────────────────────
+    best_val_acc = 0.0
+    opt_step     = 0
+
+    for epoch in range(args.epochs):
+        if is_ddp:
+            dist.barrier()
+
+        data_epoch = epoch % n_data_epochs
+        if rank == 0:
+            logger.info(f"Epoch {epoch+1}/{args.epochs}: data epoch {data_epoch} …")
+
+        epoch_ds, train_loader = _make_loader(data_epoch, epoch)
+        n_batches_this_epoch   = len(epoch_ds)
 
         encoder.train()
         epoch_loss = 0.0
@@ -1007,7 +1109,7 @@ def main():
                        else encoder.no_sync()
 
             with sync_ctx:
-                emb = encoder(
+                emb  = encoder(
                     batch["event_embs"].to(device),
                     batch["event_mask"].to(device),
                     batch["task_idxs"].to(device),
@@ -1027,52 +1129,51 @@ def main():
                 opt_step += 1
 
                 if rank == 0:
-                    lr_now    = scheduler.get_last_lr()[0]
                     loss_now  = loss.item() * args.grad_accum
                     gnorm_now = grad_norm.item() if isinstance(grad_norm, torch.Tensor) \
                                 else grad_norm
+                    # Use proj-group LR as the displayed LR (group 0)
+                    lr_now = optimizer.param_groups[0]["lr"]
 
-                    # Pairwise distance diagnostics
-                    d_pp = d_pn = float("nan")
                     with torch.no_grad():
-                        e     = emb.detach().float()
-                        lbl   = labels_t.detach().to(device)
-                        e_pos = e[lbl == 1]
-                        e_neg = e[lbl == 0]
-                        if e_pos.size(0) >= 2:
-                            sim_pp = e_pos @ e_pos.T
-                            n_pos_ = e_pos.size(0)
-                            tri    = torch.triu(torch.ones(n_pos_, n_pos_, dtype=torch.bool, device=e.device), diagonal=1)
-                            d_pp   = (1 - sim_pp[tri]).mean().item()
-                        if e_pos.size(0) >= 1 and e_neg.size(0) >= 1:
-                            d_pn   = (1 - (e_pos @ e_neg.T)).mean().item()
+                        metrics = _compute_batch_metrics(emb.detach(), labels_t.to(device))
 
                     pbar.set_postfix(
                         loss=f"{loss_now:.4f}",
-                        dpp=f"{d_pp:.3f}",
-                        dpn=f"{d_pn:.3f}",
+                        cdist=f"{metrics['cdist']:.3f}",
+                        dpp=f"{metrics['d_pp']:.3f}",
+                        dpn=f"{metrics['d_pn']:.3f}",
+                        var=f"{metrics['var_all']:.4f}",
                         gnorm=f"{gnorm_now:.3f}",
                         lr=f"{lr_now:.2e}",
                     )
+
                     if use_wandb and opt_step % args.log_steps == 0:
                         import wandb
-                        wandb.log({
+                        log_dict = {
                             "train/loss":         loss_now,
                             "train/gnorm":        gnorm_now,
-                            "train/lr":           lr_now,
-                            "train/dist_pos_pos": d_pp,
-                            "train/dist_pos_neg": d_pn,
-                            "epoch":              epoch + (batch_idx + 1) / max(n_batches_this_epoch, 1),
-                        }, step=opt_step)
+                            "train/lr_proj":      optimizer.param_groups[0]["lr"],
+                            "train/cdist":        metrics["cdist"],
+                            "train/dist_pos_pos": metrics["d_pp"],
+                            "train/dist_pos_neg": metrics["d_pn"],
+                            "train/var_all":      metrics["var_all"],
+                            "train/var_pos":      metrics["var_pos"],
+                            "train/var_neg":      metrics["var_neg"],
+                            "epoch": epoch + (batch_idx + 1) / max(n_batches_this_epoch, 1),
+                        }
+                        if len(optimizer.param_groups) > 1:
+                            log_dict["train/lr_lora"] = optimizer.param_groups[1]["lr"]
+                        wandb.log(log_dict, step=opt_step)
 
             epoch_loss += loss.item() * args.grad_accum
 
-        n_batches_ran = batch_idx + 1   # 0 if no batches ran
+        n_batches_ran = batch_idx + 1
         avg_loss      = epoch_loss / max(n_batches_ran, 1)
         if rank == 0:
             logger.info(f"Epoch {epoch+1}/{args.epochs}  avg_loss={avg_loss:.4f}")
 
-        # ── Eval (rank 0 only — no barrier needed) ─────────────────────────────
+        # ── Eval ──────────────────────────────────────────────────────────────
         if eval_triplet_path is not None and rank == 0:
             val_acc, val_task_acc = evaluate_rank0(encoder, eval_triplet_path, store, device, args)
             logger.info(f"  val triplet accuracy: {val_acc:.4f}")
