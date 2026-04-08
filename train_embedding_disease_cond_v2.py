@@ -324,15 +324,16 @@ def precompute_eval_triplets(
     seed:                 int,
     output_path:          Path,
 ) -> int:
-    pos: dict[int, list[list[int]]] = defaultdict(list)
-    neg: dict[int, list[list[int]]] = defaultdict(list)
+    pos: dict[int, dict[int, list[list[int]]]] = defaultdict(lambda: defaultdict(list))
+    neg: dict[int, dict[int, list[list[int]]]] = defaultdict(lambda: defaultdict(list))
 
     for path in eval_data_paths:
-        df = pd.read_parquet(path, columns=["task_idx", "label", "event_ids"])
+        df = pd.read_parquet(path, columns=["patient_id", "task_idx", "label", "event_ids"])
         for row in df.itertuples(index=False):
+            patient_id = int(row.patient_id)
             task_idx = int(row.task_idx)
             eids     = list(row.event_ids)
-            (pos if int(row.label) == 1 else neg)[task_idx].append(eids)
+            (pos if int(row.label) == 1 else neg)[task_idx][patient_id].append(eids)
         del df
 
     rng = random.Random(seed)
@@ -340,19 +341,31 @@ def precompute_eval_triplets(
     records: list[dict] = []
 
     for task_idx in sorted(set(list(pos.keys()) + list(neg.keys()))):
-        pos_list = pos.get(task_idx, [])
-        neg_list = neg.get(task_idx, [])
+        pos_by_pid = pos.get(task_idx, {})
+        neg_by_pid = neg.get(task_idx, {})
+        pos_pids = list(pos_by_pid.keys())
+        neg_pids = list(neg_by_pid.keys())
 
-        if not pos_list or not neg_list:
+        if len(pos_pids) < 2 or len(neg_pids) < 1:
             logger.warning(f"  [{idx_to_name.get(task_idx, task_idx)}] "
                            f"insufficient eval data for triplets — skipping")
             continue
 
         task_count = 0
         for _ in range(n_triplets_per_task):
-            anchor_eids   = rng.choice(pos_list)
-            positive_eids = rng.choice(pos_list)
-            negative_eids = rng.choice(neg_list)
+            anchor_pid, positive_pid = rng.sample(pos_pids, 2)
+            candidate_neg_pids = [pid for pid in neg_pids if pid not in {anchor_pid, positive_pid}]
+            if not candidate_neg_pids:
+                logger.warning(
+                    f"  [{idx_to_name.get(task_idx, task_idx)}] insufficient distinct negative "
+                    f"patients for patient-level triplets — skipping remaining triplets"
+                )
+                break
+            negative_pid = rng.choice(candidate_neg_pids)
+
+            anchor_eids   = rng.choice(pos_by_pid[anchor_pid])
+            positive_eids = rng.choice(pos_by_pid[positive_pid])
+            negative_eids = rng.choice(neg_by_pid[negative_pid])
             records.append({
                 "task_idx":      task_idx,
                 "anchor_eids":   anchor_eids,
@@ -650,7 +663,7 @@ def evaluate_rank0(
     store:             EmbeddingStore,
     device:            torch.device,
     args,
-) -> tuple[float, dict[str, float]]:
+) -> tuple[float, dict[str, float], dict[str, float], dict[str, dict[str, float]]]:
     raw_encoder = encoder.module if isinstance(encoder, DDP) else encoder
     raw_encoder.eval()
 
@@ -663,7 +676,7 @@ def evaluate_rank0(
     if n_triplets == 0:
         logger.warning("eval_triplets.parquet is empty — skipping eval.")
         raw_encoder.train()
-        return 0.0, {}
+        return 0.0, {}, {}, {}
 
     entries: list[tuple[np.ndarray, int]] = []
     for row in df.itertuples(index=False):
@@ -679,38 +692,66 @@ def evaluate_rank0(
     )
 
     all_embs: list[torch.Tensor] = []
+    all_pre_embs: list[torch.Tensor] = []
     for batch in tqdm(eval_dl, desc="Evaluating", dynamic_ncols=True):
-        all_embs.append(
-            raw_encoder(
-                batch["event_embs"].to(device),
-                batch["event_mask"].to(device),
-                batch["task_idxs"].to(device),
-            ).cpu()
+        emb, pre_emb = raw_encoder(
+            batch["event_embs"].to(device),
+            batch["event_mask"].to(device),
+            batch["task_idxs"].to(device),
+            return_pre_emb=True,
         )
+        all_embs.append(emb.cpu())
+        all_pre_embs.append(pre_emb.cpu())
 
     embs      = torch.cat(all_embs, dim=0)
-    anchors   = embs[0::3]
-    positives = embs[1::3]
-    negatives = embs[2::3]
+    pre_embs = torch.cat(all_pre_embs, dim=0)
 
-    d_ap    = (anchors - positives).norm(dim=1)
-    d_an    = (anchors - negatives).norm(dim=1)
-    correct = d_ap < d_an
+    def _triplet_correct(
+        x: torch.Tensor,
+        metric: str,
+    ) -> torch.Tensor:
+        anchors   = x[0::3]
+        positives = x[1::3]
+        negatives = x[2::3]
+        if metric == "l2":
+            d_ap = (anchors - positives).norm(dim=1)
+            d_an = (anchors - negatives).norm(dim=1)
+            return d_ap < d_an
+        if metric == "cosine":
+            sim_ap = torch.nn.functional.cosine_similarity(anchors, positives, dim=1)
+            sim_an = torch.nn.functional.cosine_similarity(anchors, negatives, dim=1)
+            return sim_ap > sim_an
+        raise ValueError(f"Unknown metric: {metric}")
+
+    correct_main     = _triplet_correct(embs, "l2")
+    correct_pre_cos  = _triplet_correct(pre_embs, "cosine")
+    correct_pre_l2   = _triplet_correct(pre_embs, "l2")
 
     task_idxs_arr = df["task_idx"].values
     idx_to_name   = {v: k for k, v in TASK_2_IDX.items()}
     task_acc: dict[str, float] = {}
+    extra_overall = {
+        "pre_cosine_triplet_acc": correct_pre_cos.float().mean().item(),
+        "pre_l2_triplet_acc":     correct_pre_l2.float().mean().item(),
+    }
+    extra_task: dict[str, dict[str, float]] = {}
 
     for t_idx in sorted(set(task_idxs_arr.tolist())):
         mask = task_idxs_arr == t_idx
         n_t  = int(mask.sum())
         if n_t > 0:
-            acc = correct[torch.from_numpy(mask)].float().mean().item()
-            task_acc[idx_to_name.get(t_idx, str(t_idx))] = acc
+            torch_mask = torch.from_numpy(mask)
+            task_name = idx_to_name.get(t_idx, str(t_idx))
+            acc = correct_main[torch_mask].float().mean().item()
+            task_acc[task_name] = acc
+            extra_task[task_name] = {
+                "pre_cosine_triplet_acc": correct_pre_cos[torch_mask].float().mean().item(),
+                "pre_l2_triplet_acc":     correct_pre_l2[torch_mask].float().mean().item(),
+            }
 
-    overall_acc = correct.float().mean().item()
+    overall_acc = correct_main.float().mean().item()
     raw_encoder.train()
-    return overall_acc, task_acc
+    return overall_acc, task_acc, extra_overall, extra_task
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
@@ -779,6 +820,9 @@ def parse_args():
                         "Set to 0 to disable.")
     p.add_argument("--stage1_temperature", type=float, default=0.1,
                    help="Temperature for supervised contrastive loss in Stage 1.")
+    p.add_argument("--stage2_triplet_weight", type=float, default=0.1,
+                   help="Auxiliary weight for BatchHardTripletLoss on normalised embeddings "
+                        "during Stage 2.")
 
     # Eval
     p.add_argument("--n_eval_triplets_per_task", type=int,   default=256)
@@ -880,7 +924,7 @@ def main():
 
     if is_ddp and not args.eval_only:
         encoder = DDP(encoder, device_ids=[local_rank], output_device=local_rank,
-                      find_unused_parameters=False, static_graph=True)
+                      find_unused_parameters=True, static_graph=False)
 
     # ── Pre-compute eval triplets (rank 0 only) ───────────────────────────────
     eval_triplet_path: Path | None = None
@@ -898,16 +942,30 @@ def main():
     if args.eval_only:
         if eval_triplet_path is None:
             raise ValueError("--eval_only requires --eval_data_paths.")
-        val_acc, val_task_acc = evaluate_rank0(encoder, eval_triplet_path, store, device, args)
+        val_acc, val_task_acc, extra_overall, extra_task = evaluate_rank0(
+            encoder, eval_triplet_path, store, device, args
+        )
         if rank == 0:
             logger.info(f"Eval triplet accuracy: {val_acc:.4f}")
+            logger.info(f"  [pre_emb cosine] triplet accuracy: {extra_overall['pre_cosine_triplet_acc']:.4f}")
+            logger.info(f"  [pre_emb l2] triplet accuracy: {extra_overall['pre_l2_triplet_acc']:.4f}")
             for task, acc in sorted(val_task_acc.items()):
                 logger.info(f"  {task}: {acc:.4f}")
+                logger.info(
+                    f"    pre_cos={extra_task[task]['pre_cosine_triplet_acc']:.4f}  "
+                    f"pre_l2={extra_task[task]['pre_l2_triplet_acc']:.4f}"
+                )
         if use_wandb and wandb_run:
             import wandb
-            log_dict = {"eval/triplet_acc": val_acc}
+            log_dict = {
+                "eval/triplet_acc":             val_acc,
+                "eval/pre_cosine_triplet_acc":  extra_overall["pre_cosine_triplet_acc"],
+                "eval/pre_l2_triplet_acc":      extra_overall["pre_l2_triplet_acc"],
+            }
             for task, acc in val_task_acc.items():
                 log_dict[f"eval/{task}/triplet_acc"] = acc
+                log_dict[f"eval/{task}/pre_cosine_triplet_acc"] = extra_task[task]["pre_cosine_triplet_acc"]
+                log_dict[f"eval/{task}/pre_l2_triplet_acc"] = extra_task[task]["pre_l2_triplet_acc"]
             wandb.log(log_dict)
             wandb_run.finish()
         if is_ddp:
@@ -942,6 +1000,7 @@ def main():
         raise ValueError(f"No train_prepared_*.parquet found in {task_dir}")
     if rank == 0:
         logger.info(f"Found {n_data_epochs} data epoch(s) (task dir: {task_dir})")
+    stage1_data_epoch = n_data_epochs - 1
 
     # ── Helper: build DataLoader from a given data epoch ─────────────────────
     def _make_loader(data_epoch: int, training_epoch: int) -> tuple[EpochBatchDataset, DataLoader]:
@@ -1001,7 +1060,7 @@ def main():
         if rank == 0:
             logger.info(f"  Stage 1 warmup: {s1_warmup} steps (ratio={args.warmup_ratio})")
 
-        stage1_ds, stage1_dl = _make_loader(data_epoch=0, training_epoch=0)
+        stage1_ds, stage1_dl = _make_loader(data_epoch=stage1_data_epoch, training_epoch=0)
         encoder.train()
         stage1_opt.zero_grad()
         s1_step = 0
@@ -1105,15 +1164,29 @@ def main():
 
         # Eval after stage 1
         if eval_triplet_path is not None and rank == 0:
-            val_acc, val_task_acc = evaluate_rank0(encoder, eval_triplet_path, store, device, args)
+            val_acc, val_task_acc, extra_overall, extra_task = evaluate_rank0(
+                encoder, eval_triplet_path, store, device, args
+            )
             logger.info(f"  [post-stage1] val triplet accuracy: {val_acc:.4f}")
+            logger.info(f"    [pre_emb cosine] {extra_overall['pre_cosine_triplet_acc']:.4f}")
+            logger.info(f"    [pre_emb l2] {extra_overall['pre_l2_triplet_acc']:.4f}")
             for task, acc in sorted(val_task_acc.items()):
                 logger.info(f"    {task}: {acc:.4f}")
+                logger.info(
+                    f"      pre_cos={extra_task[task]['pre_cosine_triplet_acc']:.4f}  "
+                    f"pre_l2={extra_task[task]['pre_l2_triplet_acc']:.4f}"
+                )
             if use_wandb:
                 import wandb
-                ld = {"stage1/val_triplet_acc": val_acc}
+                ld = {
+                    "stage1/val_triplet_acc":            val_acc,
+                    "stage1/val_pre_cosine_triplet_acc": extra_overall["pre_cosine_triplet_acc"],
+                    "stage1/val_pre_l2_triplet_acc":     extra_overall["pre_l2_triplet_acc"],
+                }
                 for task, acc in val_task_acc.items():
                     ld[f"stage1/val/{task}/triplet_acc"] = acc
+                    ld[f"stage1/val/{task}/pre_cosine_triplet_acc"] = extra_task[task]["pre_cosine_triplet_acc"]
+                    ld[f"stage1/val/{task}/pre_l2_triplet_acc"] = extra_task[task]["pre_l2_triplet_acc"]
                 wandb.log(ld, step=s1_step)
 
     # Wandb step offset so Stage 2 steps are monotonically after Stage 1 steps.
@@ -1210,13 +1283,18 @@ def main():
                 supcon_loss = _supervised_contrastive_loss(
                     pre_emb, labels_t.to(device), args.stage1_temperature
                 )
+                triplet_loss = _loss_fn(labels_t.to(device), emb)
                 if args.var_reg_weight > 0.0:
                     std = torch.sqrt(pre_emb.var(dim=0) + 1e-4)
                     var_loss = torch.relu(1.0 - std).mean()
                 else:
                     var_loss = supcon_loss.new_zeros(())
 
-                loss = supcon_loss + args.var_reg_weight * var_loss
+                loss = (
+                    supcon_loss
+                    + args.var_reg_weight * var_loss
+                    + args.stage2_triplet_weight * triplet_loss
+                )
                 loss = loss / args.grad_accum
                 loss.backward()
 
@@ -1241,11 +1319,13 @@ def main():
                         metrics = _compute_batch_metrics(emb.detach(), labels_t.to(device))
                         pre_var_now = pre_emb.detach().float().var(dim=0).mean().item()
                         supcon_now = supcon_loss.item()
+                        triplet_now = triplet_loss.item()
                         var_loss_now = var_loss.item() if args.var_reg_weight > 0.0 else 0.0
 
                     pbar.set_postfix(
                         loss=f"{loss_now:.4f}",
                         lsup=f"{supcon_now:.4f}",
+                        ltri=f"{triplet_now:.4f}",
                         cdist=f"{metrics['cdist']:.3f}",
                         dpp=f"{metrics['d_pp']:.3f}",
                         dpn=f"{metrics['d_pn']:.3f}",
@@ -1260,6 +1340,7 @@ def main():
                         log_dict = {
                             "train/loss":         loss_now,
                             "train/loss_supcon":  supcon_now,
+                            "train/loss_triplet": triplet_now,
                             "train/loss_var":     var_loss_now,
                             "train/gnorm":        gnorm_now,
                             "train/lr_proj":      optimizer.param_groups[0]["lr"],
@@ -1285,19 +1366,31 @@ def main():
 
         # ── Eval ──────────────────────────────────────────────────────────────
         if eval_triplet_path is not None and rank == 0:
-            val_acc, val_task_acc = evaluate_rank0(encoder, eval_triplet_path, store, device, args)
+            val_acc, val_task_acc, extra_overall, extra_task = evaluate_rank0(
+                encoder, eval_triplet_path, store, device, args
+            )
             logger.info(f"  val triplet accuracy: {val_acc:.4f}")
+            logger.info(f"    [pre_emb cosine] {extra_overall['pre_cosine_triplet_acc']:.4f}")
+            logger.info(f"    [pre_emb l2] {extra_overall['pre_l2_triplet_acc']:.4f}")
             for task, acc in sorted(val_task_acc.items()):
                 logger.info(f"    {task}: {acc:.4f}")
+                logger.info(
+                    f"      pre_cos={extra_task[task]['pre_cosine_triplet_acc']:.4f}  "
+                    f"pre_l2={extra_task[task]['pre_l2_triplet_acc']:.4f}"
+                )
             if use_wandb:
                 import wandb
                 log_dict = {
-                    "val/triplet_acc":  val_acc,
-                    "train/epoch_loss": avg_loss,
-                    "epoch":            epoch + 1,
+                    "val/triplet_acc":            val_acc,
+                    "val/pre_cosine_triplet_acc": extra_overall["pre_cosine_triplet_acc"],
+                    "val/pre_l2_triplet_acc":     extra_overall["pre_l2_triplet_acc"],
+                    "train/epoch_loss":           avg_loss,
+                    "epoch":                      epoch + 1,
                 }
                 for task, acc in val_task_acc.items():
                     log_dict[f"val/{task}/triplet_acc"] = acc
+                    log_dict[f"val/{task}/pre_cosine_triplet_acc"] = extra_task[task]["pre_cosine_triplet_acc"]
+                    log_dict[f"val/{task}/pre_l2_triplet_acc"] = extra_task[task]["pre_l2_triplet_acc"]
                 wandb.log(log_dict, step=wandb_step_offset + opt_step)
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
