@@ -729,7 +729,7 @@ def parse_args():
 
     # Two-stage training
     p.add_argument("--stage1_steps", type=int, default=0,
-                   help="Number of optimizer steps for stage 1 (bypass_qwen, only proj params). "
+                   help="Number of optimizer steps for stage 1 (LoRA+Qwen frozen, only proj params). "
                         "0 = skip stage 1.")
     p.add_argument("--lr_proj", type=float, default=2e-4,
                    help="LR for bert_proj_1, bert_proj_2, input_norm (higher).")
@@ -739,6 +739,11 @@ def parse_args():
     # Loss
     p.add_argument("--triplet_margin", type=float, default=0.3,
                    help="Margin for BatchHardTripletLoss. Set to 0 for soft-margin variant.")
+    p.add_argument("--var_reg_weight", type=float, default=0.1,
+                   help="Weight for variance regularisation in Stage 1 to prevent embedding "
+                        "collapse. Loss += var_reg_weight * relu(1 - std(pre_emb, dim=0)).mean() "
+                        "where pre_emb is the mean-pooled projection before L2 normalisation. "
+                        "Set to 0 to disable.")
 
     # Eval
     p.add_argument("--n_eval_triplets_per_task", type=int,   default=256)
@@ -923,24 +928,43 @@ def main():
         )
         return ds, dl
 
-    # ── Stage 1: train only projection layers, bypass Qwen ───────────────────
+    # ── Stage 1: train only projection layers, Qwen+LoRA frozen ─────────────
+    s1_step = 0   # tracks steps completed; used as wandb offset for Stage 2
     if args.stage1_steps > 0:
         if rank == 0:
             logger.info(
                 f"Stage 1: {args.stage1_steps} steps — "
-                f"LoRA frozen, bypass_qwen=True, lr_proj={args.lr_proj}"
+                f"LoRA frozen, bypass_qwen=True (direct projection), lr_proj={args.lr_proj}"
             )
 
         n_frozen = _set_lora_trainable(encoder, False)
         if rank == 0:
             logger.info(f"  Froze {n_frozen} LoRA parameter tensors")
 
+        # Separate param groups so RMSNorm gamma is not weight-decayed.
+        raw_enc_s1 = encoder.module if isinstance(encoder, DDP) else encoder
+        s1_no_wd_ids = {id(p) for p in raw_enc_s1.input_norm.parameters()}
+        s1_wd_params    = [p for p in encoder.parameters()
+                           if p.requires_grad and id(p) not in s1_no_wd_ids]
+        s1_no_wd_params = [p for p in encoder.parameters()
+                           if p.requires_grad and id(p) in s1_no_wd_ids]
+        s1_param_groups = [{"params": s1_wd_params, "weight_decay": args.weight_decay}]
+        if s1_no_wd_params:
+            s1_param_groups.append({"params": s1_no_wd_params, "weight_decay": 0.0})
+
         stage1_opt = torch.optim.AdamW(
-            [p for p in encoder.parameters() if p.requires_grad],
+            s1_param_groups,
             lr=args.lr_proj,
-            weight_decay=args.weight_decay,
             fused=True,
         )
+
+        # Linear warmup for Stage 1 (same warmup_ratio as Stage 2).
+        s1_warmup = max(1, int(args.stage1_steps * args.warmup_ratio))
+        s1_sched  = torch.optim.lr_scheduler.LinearLR(
+            stage1_opt, start_factor=1e-3, end_factor=1.0, total_iters=s1_warmup
+        )
+        if rank == 0:
+            logger.info(f"  Stage 1 warmup: {s1_warmup} steps (ratio={args.warmup_ratio})")
 
         stage1_ds, stage1_dl = _make_loader(data_epoch=0, training_epoch=0)
         encoder.train()
@@ -961,12 +985,24 @@ def main():
 
             labels_t = batch["labels"]
 
-            emb  = encoder(
+            emb, pre_emb = encoder(
                 batch["event_embs"].to(device),
                 batch["event_mask"].to(device),
                 batch["task_idxs"].to(device),
+                bypass_qwen=True,
             )
-            loss = _loss_fn(labels_t.to(device), emb)
+            triplet_loss = _loss_fn(labels_t.to(device), emb)
+
+            # Variance regularisation applied to pre-normalisation embeddings (pre_emb).
+            # Using pre_emb (before F.normalize) ensures the gradient is non-zero even
+            # when all outputs have collapsed to the same direction: magnitude variation
+            # across patients keeps ∂var/∂pre_emb[i] non-zero.
+            if args.var_reg_weight > 0.0:
+                std      = torch.sqrt(pre_emb.var(dim=0) + 1e-4)   # (D,)
+                var_loss = torch.relu(1.0 - std).mean()
+                loss     = triplet_loss + args.var_reg_weight * var_loss
+            else:
+                loss = triplet_loss
             loss.backward()
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -974,12 +1010,15 @@ def main():
                 args.grad_clip,
             )
             stage1_opt.step()
+            if s1_step < s1_warmup:
+                s1_sched.step()
             stage1_opt.zero_grad()
             s1_step += 1
 
             if rank == 0:
                 loss_now  = loss.item()
                 gnorm_now = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                lr_now    = stage1_opt.param_groups[0]["lr"]
 
                 with torch.no_grad():
                     metrics = _compute_batch_metrics(emb.detach(), labels_t.to(device))
@@ -991,6 +1030,7 @@ def main():
                     dpn=f"{metrics['d_pn']:.3f}",
                     var=f"{metrics['var_all']:.4f}",
                     gnorm=f"{gnorm_now:.3f}",
+                    lr=f"{lr_now:.2e}",
                 )
 
                 if use_wandb and s1_step % args.log_steps == 0:
@@ -998,6 +1038,7 @@ def main():
                     wandb.log({
                         "stage1/loss":         loss_now,
                         "stage1/gnorm":        gnorm_now,
+                        "stage1/lr":           lr_now,
                         "stage1/cdist":        metrics["cdist"],
                         "stage1/dist_pos_pos": metrics["d_pp"],
                         "stage1/dist_pos_neg": metrics["d_pn"],
@@ -1026,6 +1067,9 @@ def main():
                 for task, acc in val_task_acc.items():
                     ld[f"stage1/val/{task}/triplet_acc"] = acc
                 wandb.log(ld, step=s1_step)
+
+    # Wandb step offset so Stage 2 steps are monotonically after Stage 1 steps.
+    wandb_step_offset = s1_step if args.stage1_steps > 0 else 0
 
     # ── Stage 2 optimizer + LR scheduler ─────────────────────────────────────
     # Estimate total steps from data epoch 0 (reused across all training epochs)
@@ -1164,7 +1208,7 @@ def main():
                         }
                         if len(optimizer.param_groups) > 1:
                             log_dict["train/lr_lora"] = optimizer.param_groups[1]["lr"]
-                        wandb.log(log_dict, step=opt_step)
+                        wandb.log(log_dict, step=wandb_step_offset + opt_step)
 
             epoch_loss += loss.item() * args.grad_accum
 
@@ -1188,7 +1232,7 @@ def main():
                 }
                 for task, acc in val_task_acc.items():
                     log_dict[f"val/{task}/triplet_acc"] = acc
-                wandb.log(log_dict, step=opt_step)
+                wandb.log(log_dict, step=wandb_step_offset + opt_step)
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 raw_enc = encoder.module if isinstance(encoder, DDP) else encoder

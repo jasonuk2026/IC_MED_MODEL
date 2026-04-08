@@ -99,18 +99,35 @@ class DiseaseAwareEHREncoder(nn.Module):
 
     def forward(
         self,
-        event_embs: torch.Tensor,   # (B, N, bert_dim)
-        event_mask: torch.Tensor,   # (B, N)            long
-        task_idx:   torch.Tensor,   # (B,)              long  — integer task indices
-    ) -> torch.Tensor:              # (B, qwen_dim)  L2-normalised embeddings
+        event_embs:   torch.Tensor,         # (B, N, bert_dim)
+        event_mask:   torch.Tensor,         # (B, N)            long
+        task_idx:     torch.Tensor,         # (B,)              long  — integer task indices
+        bypass_qwen:  bool = False,         # Stage 1: skip Qwen, pool ev_proj directly
+    ):
+        """
+        Returns:
+            bypass_qwen=False  →  emb  (B, D)  L2-normalised
+            bypass_qwen=True   →  (emb, pre_emb)  where pre_emb (B, D) is the
+                                  mean-pooled projection *before* L2 normalisation,
+                                  so callers can compute var_reg with non-zero
+                                  gradient even at directional collapse.
+        """
         B      = event_embs.size(0)
         device = event_embs.device
 
         event_embs = event_embs.to(self.dtype)
 
         # 1. RMSNorm → MLP projection for events (Qwen3-style: norm before linear)
-        ev_normed = self.input_norm(event_embs)                           # (B, N, bert_dim)
-        ev_proj   = self.bert_proj_2(F.gelu(self.bert_proj_1(ev_normed)))# (B, N, qwen_dim)
+        ev_normed = self.input_norm(event_embs)                            # (B, N, bert_dim)
+        ev_proj   = self.bert_proj_2(F.gelu(self.bert_proj_1(ev_normed))) # (B, N, qwen_dim)
+
+        mask_f = event_mask.float().unsqueeze(-1)   # (B, N, 1)
+
+        # ── Stage-1 bypass: skip Qwen, pool ev_proj directly ──────────────────
+        if bypass_qwen:
+            pre_emb = (ev_proj * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)  # (B, D)
+            emb     = F.normalize(pre_emb.float(), p=2, dim=-1)
+            return emb, pre_emb.float()
 
         # 2. Per-task prefix embeddings and masks (looked up from buffers)
         prefix      = self.task_prefix_embeds[task_idx]   # (B, max_P, D)
@@ -135,9 +152,8 @@ class DiseaseAwareEHREncoder(nn.Module):
         P_len    = max_P + P2                                  # sequence offset of first event
         N        = event_embs.size(1)
         ev_hid   = hidden[:, P_len : P_len + N, :]            # (B, N, D)
-        mask_f   = event_mask.float().unsqueeze(-1)            # (B, N, 1)
-        emb      = (ev_hid * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)  # (B, D)
-        return F.normalize(emb.float(), p=2, dim=-1)
+        pre_emb  = (ev_hid * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)  # (B, D)
+        return F.normalize(pre_emb.float(), p=2, dim=-1)
 
     # ── Checkpoint helpers ────────────────────────────────────────────────────
 
