@@ -1,6 +1,6 @@
 #!/bin/bash
-# my_list=("new_hypertension" "new_hyperlipidemia" "new_pancan" "new_celiac" "new_lupus" "new_acutemi")
-my_list=("new_hyperlipidemia" "new_pancan" "new_celiac" "new_lupus" "new_acutemi")
+my_list=("new_hypertension" "new_hyperlipidemia" "new_pancan" "new_celiac" "new_lupus" "new_acutemi")
+# my_list=("new_hyperlipidemia" "new_pancan" "new_celiac" "new_lupus" "new_acutemi")
 
 for item in "${my_list[@]}"; do
     echo "Processing: $item"
