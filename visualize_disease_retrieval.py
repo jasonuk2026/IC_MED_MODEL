@@ -68,6 +68,10 @@ def parse_args():
     p.add_argument("--encoder_mode", default="proj")
     p.add_argument("--model_name", default="Qwen/Qwen3-Embedding-0.6B")
     p.add_argument("--disease_model_name", default="michiyasunaga/BioLinkBERT-base")
+    p.add_argument("--shallow_encoder_type", choices=["simple", "mlp", "transformer"], default="transformer")
+    p.add_argument("--shallow_num_layers", type=int, default=2)
+    p.add_argument("--shallow_num_heads", type=int, default=4)
+    p.add_argument("--shallow_intermediate_size", type=int, default=None)
     p.add_argument("--flash_attn", action="store_true")
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--fp16", action="store_true")
@@ -95,6 +99,10 @@ def _build_model_args(args) -> SimpleNamespace:
         bf16=args.bf16,
         fp16=args.fp16,
         disease_model_name=args.disease_model_name,
+        shallow_encoder_type=args.shallow_encoder_type,
+        shallow_num_layers=args.shallow_num_layers,
+        shallow_num_heads=args.shallow_num_heads,
+        shallow_intermediate_size=args.shallow_intermediate_size,
     )
 
 
@@ -115,6 +123,8 @@ def load_encoder_for_viz(args, device: torch.device):
     encoder.bert_proj_2.load_state_dict(extra["bert_proj_2"])
     if "input_norm" in extra:
         encoder.input_norm.load_state_dict(extra["input_norm"])
+    if "shallow_layers" in extra:
+        encoder.shallow_layers.load_state_dict(extra["shallow_layers"])
     if "task_input_emb" in extra:
         encoder.task_input_emb.load_state_dict(extra["task_input_emb"])
     if "task_input_scale" in extra:

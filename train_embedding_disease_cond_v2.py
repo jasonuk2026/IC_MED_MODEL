@@ -1007,12 +1007,33 @@ def build_encoder(qwen_model, tokenizer, args, device: torch.device, rank: int, 
         task_prefix_mask = task_prefix_mask,
         middle_ids       = middle_ids,
         task_text_embs   = task_text_embs,
+        shallow_encoder_type = args.shallow_encoder_type,
+        shallow_num_layers = args.shallow_num_layers,
+        shallow_num_heads = args.shallow_num_heads,
+        shallow_intermediate_size = args.shallow_intermediate_size,
         dtype            = dtype,
     )
     logger.info(
         f"  Prompt template: [{repr(PROMPT_PREFIX)}<disease_name>]{repr(PROMPT_MIDDLE)}<events>"
     )
-    logger.info(f"  Projection MLP: Linear({BERT_DIM}→{BERT_DIM}) → GELU → Linear({BERT_DIM}→{qwen_dim})  dtype={dtype}")
+    if args.shallow_encoder_type == "transformer":
+        logger.info(f"  Event encoder: direct event embeddings → shallow Transformer ({BERT_DIM}-dim)  dtype={dtype}")
+        logger.info(f"  Qwen-only projection head: RMSNorm → Linear({BERT_DIM}→{BERT_DIM}) → GELU → Linear({BERT_DIM}→{qwen_dim})")
+        logger.info(
+            f"  Shallow Transformer: layers={args.shallow_num_layers}  heads={args.shallow_num_heads}  "
+            f"intermediate={args.shallow_intermediate_size or (BERT_DIM * 4)}  rotary=enabled  bidirectional_attention=True"
+        )
+    elif args.shallow_encoder_type == "mlp":
+        logger.info(f"  Event encoder: direct event embeddings → stacked residual Qwen-style MLP blocks ({BERT_DIM}-dim)  dtype={dtype}")
+        logger.info(f"  Qwen-only projection head: RMSNorm → Linear({BERT_DIM}→{BERT_DIM}) → GELU → Linear({BERT_DIM}→{qwen_dim})")
+        logger.info(
+            f"  Shallow MLP: layers={args.shallow_num_layers}  "
+            f"intermediate={args.shallow_intermediate_size or (BERT_DIM * 4)}  residual=enabled"
+        )
+    else:
+        logger.info(
+            f"  Event encoder: RMSNorm → Linear({BERT_DIM}→{BERT_DIM}) → GELU → Linear({BERT_DIM}→{qwen_dim})  dtype={dtype}"
+        )
 
     total     = sum(p.numel() for p in encoder.parameters())
     trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
@@ -1307,6 +1328,10 @@ def parse_args():
 
     # Data
     p.add_argument("--train_data_dir", default=None)
+    p.add_argument("--train_data_epochs", nargs="+", type=int, default=None,
+                   help="Optional subset of prepared train data epochs to use, e.g. "
+                        "--train_data_epochs 3 or --train_data_epochs 1 3 5. "
+                        "Values refer to train_prepared_XXX.parquet indices.")
     p.add_argument("--tasks", nargs="+", default=list(sorted(TASK_2_DISEASE_NAME.keys())))
     p.add_argument("--eval_data_paths",  nargs="+", default=None)
 
@@ -1315,6 +1340,17 @@ def parse_args():
 
     # Qwen model
     p.add_argument("--model_name",   default="Qwen/Qwen3-Embedding-0.6B")
+    p.add_argument("--shallow_encoder_type", choices=["simple", "mlp", "transformer"], default="transformer",
+                   help="Shallow event encoder used before optional Qwen processing. "
+                        "'simple' reproduces the original RMSNorm + projection + mean-pool path; "
+                        "'mlp' uses stacked Qwen-style residual MLP blocks over events; "
+                        "'transformer' uses the newer bidirectional Transformer encoder.")
+    p.add_argument("--shallow_num_layers", type=int, default=2,
+                   help="Number of lightweight bidirectional Transformer layers over projected events.")
+    p.add_argument("--shallow_num_heads", type=int, default=4,
+                   help="Number of attention heads in the lightweight event Transformer.")
+    p.add_argument("--shallow_intermediate_size", type=int, default=None,
+                   help="Intermediate size of the lightweight Transformer MLP. Defaults to 4 * qwen_dim.")
     p.add_argument("--encoder_mode", choices=["full", "proj", "proj_cond", "proj_cond_token_pre", "proj_cond_residual", "proj_cond_film", "proj_cond_xattn", "proj_cond_xattn_pool", "proj_cond_query_proto", "raw"], default="full",
                    help="Embedding path to optimise/evaluate. "
                         "'full' = proj + Qwen, 'proj' = bert_proj mean-pool, "
@@ -1358,6 +1394,10 @@ def parse_args():
     p.add_argument("--stage1_steps", type=int, default=0,
                    help="Deprecated. Stage 1 now runs over the full selected data epoch whenever "
                         "this value is > 0; use 0 to skip Stage 1.")
+    p.add_argument("--legacy_stage1_only", action="store_true",
+                   help="For shallow encoder modes, run only the legacy Stage 1 optimizer/scheduler "
+                        "over the selected training data epoch(s), then evaluate and stop. "
+                        "Useful for reproducing older retrieval results.")
     p.add_argument("--lr_proj", type=float, default=2e-4,
                    help="LR for bert_proj_1, bert_proj_2, input_norm (higher).")
     p.add_argument("--lr_lora", type=float, default=5e-5,
@@ -1471,10 +1511,18 @@ def main():
         qwen_lora = PeftModel.from_pretrained(qwen_model, str(Path(args.checkpoint) / "lora"))
         encoder = build_encoder(qwen_lora, tokenizer, args, device, rank, is_ddp)
         extra = torch.load(Path(args.checkpoint) / "extra_modules.pt", map_location="cpu")
+        saved_shallow_type = extra.get("shallow_encoder_type", "simple")
+        if saved_shallow_type != args.shallow_encoder_type:
+            logger.warning(
+                f"Checkpoint shallow_encoder_type={saved_shallow_type} but current args specify "
+                f"{args.shallow_encoder_type}; loading may fail or behave unexpectedly."
+            )
         encoder.bert_proj_1.load_state_dict(extra["bert_proj_1"])
         encoder.bert_proj_2.load_state_dict(extra["bert_proj_2"])
         if "input_norm" in extra:
             encoder.input_norm.load_state_dict(extra["input_norm"])
+        if "shallow_layers" in extra:
+            encoder.shallow_layers.load_state_dict(extra["shallow_layers"])
         if "task_input_emb" in extra:
             encoder.task_input_emb.load_state_dict(extra["task_input_emb"])
         if "task_input_scale" in extra:
@@ -1674,12 +1722,63 @@ def main():
     first_task = sorted(args.tasks)[0]
     task_dir   = Path(args.train_data_dir) / first_task
     data_epoch_files = sorted(task_dir.glob("train_prepared_*.parquet"))
-    n_data_epochs    = len(data_epoch_files)
+    available_data_epochs = sorted(
+        int(p.stem.split("_")[-1]) for p in data_epoch_files
+    )
+    n_data_epochs    = len(available_data_epochs)
     if n_data_epochs == 0:
         raise ValueError(f"No train_prepared_*.parquet found in {task_dir}")
     if rank == 0:
-        logger.info(f"Found {n_data_epochs} data epoch(s) (task dir: {task_dir})")
-    stage1_data_epoch = n_data_epochs - 1
+        logger.info(
+            f"Found {n_data_epochs} data epoch(s) (task dir: {task_dir}): "
+            f"{available_data_epochs}"
+        )
+
+    if args.train_data_epochs is not None:
+        requested_epochs = list(dict.fromkeys(args.train_data_epochs))
+        missing_epochs = [ep for ep in requested_epochs if ep not in available_data_epochs]
+        if missing_epochs:
+            raise ValueError(
+                f"Requested --train_data_epochs {missing_epochs}, but available prepared "
+                f"epochs are {available_data_epochs}"
+            )
+        selected_data_epochs = requested_epochs
+    else:
+        selected_data_epochs = available_data_epochs
+
+    if rank == 0:
+        logger.info(f"Selected train data epoch(s): {selected_data_epochs}")
+
+    stage1_data_epoch = selected_data_epochs[-1]
+
+    if uses_qwen_path:
+        train_schedule = [
+            selected_data_epochs[epoch % len(selected_data_epochs)]
+            for epoch in range(args.epochs)
+        ]
+        if rank == 0:
+            logger.info(
+                f"Qwen path: using staged training with {args.epochs} epoch(s) "
+                f"over selected prepared data epoch(s) {selected_data_epochs}"
+            )
+    else:
+        train_schedule = list(selected_data_epochs)
+        if rank == 0:
+            logger.info(
+                f"Shallow encoder path: using single-phase training over all "
+                f"selected prepared data epoch(s) {selected_data_epochs} exactly once"
+            )
+            if args.legacy_stage1_only:
+                logger.info(
+                    "  legacy_stage1_only enabled: will run only the old Stage 1 optimizer/scheduler "
+                    "over the final selected prepared epoch and then stop"
+                )
+            if args.stage1_steps > 0 and not args.legacy_stage1_only:
+                logger.info("  Ignoring --stage1_steps for shallow encoder mode")
+            if args.epochs != len(selected_data_epochs):
+                logger.info(
+                    f"  Ignoring --epochs={args.epochs}; effective training passes = {len(selected_data_epochs)}"
+                )
 
     # ── Helper: build DataLoader from a given data epoch ─────────────────────
     def _make_loader(data_epoch: int, training_epoch: int) -> tuple[EpochBatchDataset, DataLoader]:
@@ -1703,7 +1802,7 @@ def main():
 
     # ── Stage 1: full frozen-Qwen forward, train only projection layers ─────
     s1_step = 0   # tracks steps completed; used as wandb offset for Stage 2
-    if args.stage1_steps > 0:
+    if args.stage1_steps > 0 and (uses_qwen_path or args.legacy_stage1_only):
         if rank == 0:
             logger.info(
                 f"Stage 1: full data epoch {stage1_data_epoch} — "
@@ -2020,21 +2119,39 @@ def main():
             raw_enc.save_checkpoint(run_dir / "stage1")
             logger.info(f"  Saved post-stage1 checkpoint → {run_dir / 'stage1'}")
 
+        if args.legacy_stage1_only and not uses_qwen_path:
+            if rank == 0:
+                raw_enc = encoder.module if isinstance(encoder, DDP) else encoder
+                raw_enc.save_checkpoint(run_dir / "final")
+                tokenizer.save_pretrained(str(run_dir / "tokenizer"))
+                logger.info("legacy_stage1_only: stopping after post-stage1 evaluation")
+                logger.info(f"Done. Best val triplet accuracy: {val_acc:.4f}")
+
+            if use_wandb and wandb_run:
+                import wandb
+                wandb_run.finish()
+
+            if is_ddp:
+                dist.destroy_process_group()
+            return
+
     # Wandb step offset so Stage 2 steps are monotonically after Stage 1 steps.
-    wandb_step_offset = s1_step if args.stage1_steps > 0 else 0
+    wandb_step_offset = s1_step if (args.stage1_steps > 0 and uses_qwen_path) else 0
 
     # ── Stage 2 optimizer + LR scheduler ─────────────────────────────────────
-    # Estimate total steps from data epoch 0 (reused across all training epochs)
-    est_ds = EpochBatchDataset(
-        args.train_data_dir, 0, args.tasks, store,
-        args.batch_size, 0, args.seed, world_size, rank,
-        args.pad_to_num_events,
-    )
-    n_batches_per_rank_0 = len(est_ds)
-    del est_ds
+    scheduled_batches_per_pass: list[int] = []
+    for schedule_idx, data_epoch in enumerate(train_schedule):
+        est_ds = EpochBatchDataset(
+            args.train_data_dir, data_epoch, args.tasks, store,
+            args.batch_size, schedule_idx, args.seed, world_size, rank,
+            args.pad_to_num_events,
+        )
+        scheduled_batches_per_pass.append(len(est_ds))
+        del est_ds
 
-    n_opt_steps_per_epoch = math.ceil(n_batches_per_rank_0 / args.grad_accum)
-    total_opt_steps       = n_opt_steps_per_epoch * args.epochs
+    total_opt_steps = sum(
+        math.ceil(n_batches / args.grad_accum) for n_batches in scheduled_batches_per_pass
+    )
     warmup_steps          = int(total_opt_steps * args.warmup_ratio)
 
     param_groups = _make_param_groups(encoder, args.lr_proj, args.lr_lora)
@@ -2057,9 +2174,18 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     if rank == 0:
-        logger.info(f"Training: {args.epochs} epochs, "
-                    f"~{n_batches_per_rank_0} batches/rank/epoch, "
-                    f"{total_opt_steps} optimizer steps total")
+        if uses_qwen_path:
+            logger.info(
+                f"Training: {len(train_schedule)} epochs, "
+                f"~{scheduled_batches_per_pass[0]} batches/rank/epoch, "
+                f"{total_opt_steps} optimizer steps total"
+            )
+        else:
+            logger.info(
+                f"Training: single phase, {len(train_schedule)} prepared data epoch(s), "
+                f"{sum(scheduled_batches_per_pass)} batches/rank total, "
+                f"{total_opt_steps} optimizer steps total"
+            )
         logger.info(f"  lr_proj={args.lr_proj}, lr_lora={args.lr_lora}, "
                     f"warmup={warmup_steps} steps")
 
@@ -2067,13 +2193,17 @@ def main():
     best_val_acc = 0.0
     opt_step     = 0
 
-    for epoch in range(args.epochs):
+    for epoch, data_epoch in enumerate(train_schedule):
         if is_ddp:
             dist.barrier()
 
-        data_epoch = epoch % n_data_epochs
         if rank == 0:
-            logger.info(f"Epoch {epoch+1}/{args.epochs}: data epoch {data_epoch} …")
+            if uses_qwen_path:
+                logger.info(f"Epoch {epoch+1}/{len(train_schedule)}: data epoch {data_epoch} …")
+            else:
+                logger.info(
+                    f"Pass {epoch+1}/{len(train_schedule)}: prepared data epoch {data_epoch} …"
+                )
 
         epoch_ds, train_loader = _make_loader(data_epoch, epoch)
         n_batches_this_epoch   = len(epoch_ds)
@@ -2300,7 +2430,10 @@ def main():
         n_batches_ran = batch_idx + 1
         avg_loss      = epoch_loss / max(n_batches_ran, 1)
         if rank == 0:
-            logger.info(f"Epoch {epoch+1}/{args.epochs}  avg_loss={avg_loss:.4f}")
+            if uses_qwen_path:
+                logger.info(f"Epoch {epoch+1}/{len(train_schedule)}  avg_loss={avg_loss:.4f}")
+            else:
+                logger.info(f"Pass {epoch+1}/{len(train_schedule)}  avg_loss={avg_loss:.4f}")
 
         # ── Eval ──────────────────────────────────────────────────────────────
         if eval_triplet_path is not None and rank == 0:

@@ -4,7 +4,11 @@ model.py
 DiseaseAwareEHREncoder — Qwen3-style disease-conditioned patient encoder.
 
 Architecture per sample:
-  event_embs  (B, N, 768)  ──► input_norm ──► bert_proj_1(768→768) ──► GELU ──► bert_proj_2(768→D) ──► ev_proj (B, N, D)
+  simple:
+    event_embs  (B, N, 768)  ──► input_norm ──► bert_proj_1(768→768) ──► GELU ──► bert_proj_2(768→D) ──► ev_proj (B, N, D)
+
+  transformer:
+    event_embs  (B, N, 768)  ──► shallow Transformer ──► ev_hidden (B, N, 768)
 
   Per-task prefix string: "Please predict disease <name>"
   Tokenised with the Qwen tokenizer, left-padded to a uniform length across all
@@ -28,6 +32,7 @@ Trainable modules beyond Qwen LoRA:
 """
 
 import logging
+import math
 from pathlib import Path
 
 import torch
@@ -36,9 +41,184 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from peft import PeftModel
 
+try:
+    from flash_attn import flash_attn_varlen_func
+    from flash_attn.bert_padding import pad_input, unpad_input
+    _HAS_FLASH_ATTN = True
+except Exception:
+    flash_attn_varlen_func = None
+    pad_input = None
+    unpad_input = None
+    _HAS_FLASH_ATTN = False
+
 logger = logging.getLogger(__name__)
 
 EOS_TOKEN_ID = 151643  # Qwen3 <|endoftext|>
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q = (q * cos) + (rotate_half(q) * sin)
+    k = (k * cos) + (rotate_half(k) * sin)
+    return q, k
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim: int, base: float = 10000.0):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"RotaryEmbedding requires an even dim, got {dim}")
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        pos = torch.arange(seq_len, device=device, dtype=torch.float32)
+        freqs = torch.outer(pos, self.inv_freq.to(device=device))
+        emb = torch.cat([freqs, freqs], dim=-1)
+        cos = emb.cos()[None, None, :, :].to(dtype=dtype)
+        sin = emb.sin()[None, None, :, :].to(dtype=dtype)
+        return cos, sin
+
+
+class QwenStyleMLP(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int, dtype: torch.dtype):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False).to(dtype)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False).to(dtype)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False).to(dtype)
+        nn.init.xavier_uniform_(self.gate_proj.weight)
+        nn.init.xavier_uniform_(self.up_proj.weight)
+        # Zero-init the residual branch output so each block starts near identity.
+        nn.init.zeros_(self.down_proj.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class ShallowSelfAttention(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, dtype: torch.dtype):
+        super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError(f"hidden_size={hidden_size} must be divisible by num_heads={num_heads}")
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError(f"head_dim={self.head_dim} must be even for rotary embeddings")
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False).to(dtype)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False).to(dtype)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False).to(dtype)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False).to(dtype)
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        # Zero-init the residual branch output so attention starts as a no-op.
+        nn.init.zeros_(self.o_proj.weight)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        bsz, seq_len, _ = hidden_states.shape
+        cos, sin = position_embeddings
+        cos = cos.squeeze(0).squeeze(0)[None, :, None, :]
+        sin = sin.squeeze(0).squeeze(0)[None, :, None, :]
+
+        q = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim)
+
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        if _HAS_FLASH_ATTN:
+            attention_mask_bool = attention_mask.bool()
+            q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(q, attention_mask_bool)
+            k_unpad, _, cu_seqlens_k, max_seqlen_k, _ = unpad_input(k, attention_mask_bool)
+            v_unpad, _, _, _, _ = unpad_input(v, attention_mask_bool)
+            attn_out_unpad = flash_attn_varlen_func(
+                q_unpad,
+                k_unpad,
+                v_unpad,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p=0.0,
+                softmax_scale=None,
+                causal=False,
+            )
+            attn_out = pad_input(attn_out_unpad, indices_q, bsz, seq_len)
+        else:
+            q_t = q.transpose(1, 2)
+            k_t = k.transpose(1, 2)
+            v_t = v.transpose(1, 2)
+            attn_scores = torch.matmul(q_t, k_t.transpose(-1, -2)) / math.sqrt(self.head_dim)
+            key_mask = ~attention_mask.bool()[:, None, None, :]
+            attn_scores = attn_scores.masked_fill(key_mask, torch.finfo(attn_scores.dtype).min)
+            attn_probs = torch.softmax(attn_scores.float(), dim=-1).to(dtype=hidden_states.dtype)
+            attn_out = torch.matmul(attn_probs, v_t).transpose(1, 2)
+
+        attn_out = attn_out * attention_mask[:, :, None, None].to(dtype=hidden_states.dtype)
+        attn_out = attn_out.contiguous().view(bsz, seq_len, self.hidden_size)
+        return self.o_proj(attn_out)
+
+
+class ShallowTransformerLayer(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int, dtype: torch.dtype):
+        super().__init__()
+        self.self_attn = ShallowSelfAttention(hidden_size, num_heads, dtype)
+        self.mlp = QwenStyleMLP(hidden_size, intermediate_size, dtype)
+        self.input_layernorm = nn.RMSNorm(hidden_size).to(dtype)
+        self.post_attention_layernorm = nn.RMSNorm(hidden_size).to(dtype)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, attention_mask, position_embeddings)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        hidden_states = hidden_states * attention_mask.unsqueeze(-1).to(hidden_states.dtype)
+        return hidden_states
+
+
+class ShallowMLPLayer(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int, dtype: torch.dtype):
+        super().__init__()
+        self.mlp = QwenStyleMLP(hidden_size, intermediate_size, dtype)
+        self.post_attention_layernorm = nn.RMSNorm(hidden_size).to(dtype)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        hidden_states = hidden_states * attention_mask.unsqueeze(-1).to(hidden_states.dtype)
+        return hidden_states
 
 
 class DiseaseAwareEHREncoder(nn.Module):
@@ -70,32 +250,62 @@ class DiseaseAwareEHREncoder(nn.Module):
         task_prefix_mask: torch.Tensor,   # (num_tasks, max_P)  0=pad, 1=real
         middle_ids:       torch.Tensor,   # (1, P2)
         task_text_embs:   torch.Tensor,   # (num_tasks, bert_dim) BioLinkBERT disease text embeddings
+        shallow_encoder_type: str = "transformer",
+        shallow_num_layers: int = 2,
+        shallow_num_heads: int = 4,
+        shallow_intermediate_size: int | None = None,
         dtype:            torch.dtype = torch.float32,
     ):
         super().__init__()
         self.qwen        = qwen_model
         self.dtype       = dtype
+        self.shallow_encoder_type = shallow_encoder_type
+        self.shallow_num_layers = shallow_num_layers
         self.input_norm  = nn.RMSNorm(bert_dim).to(dtype)
         self.bert_proj_1 = nn.Linear(bert_dim, bert_dim, bias=False).to(dtype)
         self.bert_proj_2 = nn.Linear(bert_dim, qwen_dim, bias=False).to(dtype)
+        shallow_intermediate_size = shallow_intermediate_size or (bert_dim * 4)
+        self.shallow_rotary = RotaryEmbedding(bert_dim // shallow_num_heads)
+        if shallow_encoder_type == "transformer":
+            self.shallow_layers = nn.ModuleList([
+                ShallowTransformerLayer(
+                    hidden_size=bert_dim,
+                    intermediate_size=shallow_intermediate_size,
+                    num_heads=shallow_num_heads,
+                    dtype=dtype,
+                )
+                for _ in range(shallow_num_layers)
+            ])
+        elif shallow_encoder_type == "mlp":
+            self.shallow_layers = nn.ModuleList([
+                ShallowMLPLayer(
+                    hidden_size=bert_dim,
+                    intermediate_size=shallow_intermediate_size,
+                    dtype=dtype,
+                )
+                for _ in range(shallow_num_layers)
+            ])
+        else:
+            self.shallow_layers = nn.ModuleList()
+        shallow_out_dim = bert_dim if shallow_encoder_type in {"transformer", "mlp"} else qwen_dim
         num_tasks        = task_prefix_ids.size(0)
         self.task_input_emb = nn.Embedding(num_tasks, bert_dim).to(dtype)
         self.task_input_scale = nn.Parameter(torch.tensor(1e-3, dtype=dtype))
-        self.task_cond_emb = nn.Embedding(num_tasks, qwen_dim).to(dtype)
-        self.cond_fuse_1   = nn.Linear(qwen_dim * 2, qwen_dim, bias=False).to(dtype)
-        self.cond_fuse_2   = nn.Linear(qwen_dim, qwen_dim, bias=False).to(dtype)
+        self.task_cond_emb = nn.Embedding(num_tasks, shallow_out_dim).to(dtype)
+        self.cond_fuse_1   = nn.Linear(shallow_out_dim * 2, shallow_out_dim, bias=False).to(dtype)
+        self.cond_fuse_2   = nn.Linear(shallow_out_dim, shallow_out_dim, bias=False).to(dtype)
         self.task_res_scale = nn.Parameter(torch.tensor(1e-3, dtype=dtype))
-        self.film_gamma = nn.Embedding(num_tasks, qwen_dim).to(dtype)
-        self.film_beta  = nn.Embedding(num_tasks, qwen_dim).to(dtype)
-        self.task_query_proj = nn.Linear(bert_dim, qwen_dim, bias=False).to(dtype)
+        self.film_gamma = nn.Embedding(num_tasks, shallow_out_dim).to(dtype)
+        self.film_beta  = nn.Embedding(num_tasks, shallow_out_dim).to(dtype)
+        self.task_query_proj = nn.Linear(bert_dim, shallow_out_dim, bias=False).to(dtype)
         self.task_cross_attn = nn.MultiheadAttention(
-            embed_dim=qwen_dim,
+            embed_dim=shallow_out_dim,
             num_heads=4,
             batch_first=True,
         ).to(dtype)
         self.task_xattn_scale = nn.Parameter(torch.tensor(1e-3, dtype=dtype))
-        self.task_proto_emb = nn.Embedding(num_tasks, qwen_dim).to(dtype)
-        self.query_fuse = nn.Linear(qwen_dim * 2, qwen_dim, bias=False).to(dtype)
+        self.task_proto_emb = nn.Embedding(num_tasks, shallow_out_dim).to(dtype)
+        self.query_fuse = nn.Linear(shallow_out_dim * 2, shallow_out_dim, bias=False).to(dtype)
 
         nn.init.xavier_uniform_(self.bert_proj_1.weight)
         nn.init.xavier_uniform_(self.bert_proj_2.weight)
@@ -152,15 +362,32 @@ class DiseaseAwareEHREncoder(nn.Module):
             task_input = self.task_input_emb(task_idx).to(event_embs.dtype).unsqueeze(1)
             event_embs = event_embs + self.task_input_scale * task_input
 
-        # 1. RMSNorm → MLP projection for events (Qwen3-style: norm before linear)
-        ev_normed = self.input_norm(event_embs)                            # (B, N, bert_dim)
-        ev_proj   = self.bert_proj_2(F.gelu(self.bert_proj_1(ev_normed))) # (B, N, qwen_dim)
+        # 1. Shallow event encoder.
+        if self.shallow_encoder_type == "transformer":
+            ev_hidden = event_embs
+            if self.shallow_num_layers > 0:
+                pos_emb = self.shallow_rotary(ev_hidden.size(1), ev_hidden.device, ev_hidden.dtype)
+                for layer in self.shallow_layers:
+                    ev_hidden = layer(ev_hidden, event_mask, pos_emb)
+            shallow_tokens = ev_hidden
+        elif self.shallow_encoder_type == "mlp":
+            ev_hidden = event_embs
+            if self.shallow_num_layers > 0:
+                for layer in self.shallow_layers:
+                    ev_hidden = layer(ev_hidden, event_mask)
+            shallow_tokens = ev_hidden
+        elif self.shallow_encoder_type == "simple":
+            ev_normed = self.input_norm(event_embs)
+            ev_proj = self.bert_proj_2(F.gelu(self.bert_proj_1(ev_normed)))
+            shallow_tokens = ev_proj
+        else:
+            raise ValueError(f"Unknown shallow_encoder_type: {self.shallow_encoder_type}")
 
         mask_f = event_mask.float().unsqueeze(-1)   # (B, N, 1)
 
         # ── Stage-1 bypass / shallow modes ────────────────────────────────────
         if bypass_qwen:
-            pre_emb = (ev_proj * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)  # (B, D)
+            pre_emb = (shallow_tokens * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)  # (B, D)
             if condition_on_task:
                 pre_emb = pre_emb.to(self.dtype)
                 if condition_mode == "token_preproj":
@@ -180,8 +407,8 @@ class DiseaseAwareEHREncoder(nn.Module):
                     task_query = self.task_query_proj(self.task_text_embs[task_idx]).to(pre_emb.dtype)
                     attn_out, _ = self.task_cross_attn(
                         query=task_query.unsqueeze(1),
-                        key=ev_proj,
-                        value=ev_proj,
+                        key=shallow_tokens,
+                        value=shallow_tokens,
                         key_padding_mask=~event_mask.bool(),
                         need_weights=False,
                     )
@@ -190,8 +417,8 @@ class DiseaseAwareEHREncoder(nn.Module):
                     task_query = self.task_query_proj(self.task_text_embs[task_idx]).to(pre_emb.dtype)
                     attn_out, _ = self.task_cross_attn(
                         query=task_query.unsqueeze(1),
-                        key=ev_proj,
-                        value=ev_proj,
+                        key=shallow_tokens,
+                        value=shallow_tokens,
                         key_padding_mask=~event_mask.bool(),
                         need_weights=False,
                     )
@@ -202,8 +429,8 @@ class DiseaseAwareEHREncoder(nn.Module):
                     fused_query = self.query_fuse(torch.cat([text_query, proto_query], dim=-1))
                     attn_out, _ = self.task_cross_attn(
                         query=fused_query.unsqueeze(1),
-                        key=ev_proj,
-                        value=ev_proj,
+                        key=shallow_tokens,
+                        value=shallow_tokens,
                         key_padding_mask=~event_mask.bool(),
                         need_weights=False,
                     )
@@ -215,7 +442,14 @@ class DiseaseAwareEHREncoder(nn.Module):
                 return emb, pre_emb.float()
             return emb
 
-        # 2. Per-task prefix embeddings and masks (looked up from buffers)
+        # 2. Only the Qwen path needs qwen_dim tokens.
+        if self.shallow_encoder_type in {"transformer", "mlp"}:
+            ev_normed = self.input_norm(shallow_tokens)
+            ev_proj   = self.bert_proj_2(F.gelu(self.bert_proj_1(ev_normed))) # (B, N, qwen_dim)
+        else:
+            ev_proj = shallow_tokens
+
+        # 3. Per-task prefix embeddings and masks (looked up from buffers)
         prefix      = self.task_prefix_embeds[task_idx]   # (B, max_P, D)
         prefix_mask = self.task_prefix_mask[task_idx]     # (B, max_P)
         middle      = self.middle_embeds.expand(B, -1, -1)
@@ -255,6 +489,8 @@ class DiseaseAwareEHREncoder(nn.Module):
                 "bert_proj_1": self.bert_proj_1.state_dict(),
                 "bert_proj_2": self.bert_proj_2.state_dict(),
                 "input_norm":  self.input_norm.state_dict(),
+                "shallow_layers": self.shallow_layers.state_dict(),
+                "shallow_encoder_type": self.shallow_encoder_type,
                 "task_input_emb": self.task_input_emb.state_dict(),
                 "task_input_scale": self.task_input_scale.detach().cpu(),
                 "task_cond_emb": self.task_cond_emb.state_dict(),
@@ -284,12 +520,18 @@ class DiseaseAwareEHREncoder(nn.Module):
         task_prefix_mask: torch.Tensor,
         middle_ids:       torch.Tensor,
         task_text_embs:   torch.Tensor,
+        shallow_num_layers: int = 2,
+        shallow_num_heads: int = 4,
+        shallow_intermediate_size: int | None = None,
         dtype:            torch.dtype = torch.float32,
     ) -> "DiseaseAwareEHREncoder":
         qwen_lora = PeftModel.from_pretrained(qwen_base, str(save_dir / "lora"))
         encoder   = cls(
             qwen_lora, bert_dim, qwen_dim,
             task_prefix_ids, task_prefix_mask, middle_ids, task_text_embs,
+            shallow_num_layers=shallow_num_layers,
+            shallow_num_heads=shallow_num_heads,
+            shallow_intermediate_size=shallow_intermediate_size,
             dtype=dtype,
         )
         extra = torch.load(save_dir / "extra_modules.pt", map_location="cpu")
@@ -297,6 +539,8 @@ class DiseaseAwareEHREncoder(nn.Module):
         encoder.bert_proj_2.load_state_dict(extra["bert_proj_2"])
         if "input_norm" in extra:
             encoder.input_norm.load_state_dict(extra["input_norm"])
+        if "shallow_layers" in extra:
+            encoder.shallow_layers.load_state_dict(extra["shallow_layers"])
         if "task_input_emb" in extra:
             encoder.task_input_emb.load_state_dict(extra["task_input_emb"])
         if "task_input_scale" in extra:
