@@ -30,6 +30,3 @@ core
 logs/
 toy*.*
 output/
-extract_bio_emb.py
-*.sh
-figures/retrieval_viz/
