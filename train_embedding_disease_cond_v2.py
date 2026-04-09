@@ -85,6 +85,40 @@ logger = logging.getLogger(__name__)
 
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
+
+def _wrap_ddp_for_stage(
+    model: torch.nn.Module,
+    *,
+    is_ddp: bool,
+    local_rank: int,
+    stage: str,
+) -> torch.nn.Module:
+    """Wrap the model in DDP with stage-specific settings.
+
+    Stage 1 freezes LoRA, so many parameters are intentionally unused and DDP
+    must tolerate that. Stage 2 uses a fixed full graph and can use the faster
+    no-unused-params reducer path.
+    """
+    if not is_ddp:
+        return model
+    if stage == "stage1":
+        return DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+            static_graph=True,
+        )
+    if stage == "stage2":
+        return DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+            static_graph=True,
+        )
+    raise ValueError(f"Unknown DDP stage: {stage}")
+
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 TASK_2_DISEASE_NAME = {
@@ -94,6 +128,55 @@ TASK_2_DISEASE_NAME = {
     "new_celiac":         "celiac disease",
     "new_lupus":          "systemic lupus erythematosus",
     "new_acutemi":        "acute myocardial infarction",
+}
+
+# Richer disease descriptions for text-query conditioning. These are used only
+# on the disease/query side (for example in proj_cond_xattn), so we can make the
+# query more informative without changing the patient/event encoder itself.
+TASK_2_DISEASE_QUERY_TEXT = {
+    "new_hypertension": (
+        "Disease query: hypertension, also called high blood pressure. "
+        "Relevant clinical clues include persistently elevated systolic or "
+        "diastolic blood pressure, antihypertensive medications, chronic "
+        "cardiovascular risk, kidney disease, and repeated outpatient blood "
+        "pressure measurements above the normal range."
+    ),
+    "new_hyperlipidemia": (
+        "Disease query: hyperlipidemia, including high cholesterol, elevated "
+        "LDL, elevated triglycerides, and dyslipidemia. Relevant clues include "
+        "abnormal lipid panel results, statin or other lipid-lowering therapy, "
+        "atherosclerotic cardiovascular risk, and follow-up laboratory testing "
+        "for cholesterol and triglycerides."
+    ),
+    "new_pancan": (
+        "Disease query: pancreatic cancer, pancreatic adenocarcinoma, or "
+        "malignancy of the pancreas. Relevant clues include pancreatic mass or "
+        "neoplasm, biliary obstruction or jaundice, weight loss, abdominal or "
+        "back pain, elevated tumor markers, imaging findings, oncologic "
+        "evaluation, surgery, chemotherapy, and hospital care related to "
+        "pancreatic malignancy."
+    ),
+    "new_celiac": (
+        "Disease query: celiac disease, gluten-sensitive enteropathy, or immune "
+        "mediated small bowel disease triggered by gluten. Relevant clues include "
+        "malabsorption, chronic diarrhea, abdominal pain, nutritional deficiency, "
+        "positive serology such as tissue transglutaminase antibodies, small bowel "
+        "biopsy findings, and dietary management with gluten restriction."
+    ),
+    "new_lupus": (
+        "Disease query: systemic lupus erythematosus, also called lupus or SLE. "
+        "Relevant clues include autoimmune disease, rash, arthritis, nephritis, "
+        "hematologic abnormalities, positive ANA or double-stranded DNA tests, "
+        "complement abnormalities, immunosuppressive therapy, and multisystem "
+        "inflammatory manifestations."
+    ),
+    "new_acutemi": (
+        "Disease query: acute myocardial infarction, heart attack, STEMI, NSTEMI, "
+        "or acute coronary syndrome with myocardial injury. Relevant clues include "
+        "chest pain, ischemia, elevated troponin, ECG changes, coronary "
+        "catheterization or revascularization, antiplatelet or anticoagulant "
+        "therapy, and hospitalization for acute cardiac ischemia."
+    ),
 }
 
 # Stable integer index for each task — used as input to the model instead of
@@ -317,6 +400,12 @@ EVAL_TRIPLET_SCHEMA = pa.schema([
     pa.field("negative_eids", pa.list_(pa.int32())),
 ])
 
+EVAL_QUERY_PAIR_SCHEMA = pa.schema([
+    pa.field("task_idx", pa.int16()),
+    pa.field("positive_eids", pa.list_(pa.int32())),
+    pa.field("negative_eids", pa.list_(pa.int32())),
+])
+
 
 def precompute_eval_triplets(
     eval_data_paths:      list[str],
@@ -392,6 +481,65 @@ def precompute_eval_triplets(
     return len(records)
 
 
+def precompute_eval_query_pairs(
+    eval_data_paths: list[str],
+    n_pairs_per_task: int,
+    seed: int,
+    output_path: Path,
+) -> int:
+    pos: dict[int, dict[int, list[list[int]]]] = defaultdict(lambda: defaultdict(list))
+    neg: dict[int, dict[int, list[list[int]]]] = defaultdict(lambda: defaultdict(list))
+
+    for path in eval_data_paths:
+        df = pd.read_parquet(path, columns=["patient_id", "task_idx", "label", "event_ids"])
+        for row in df.itertuples(index=False):
+            patient_id = int(row.patient_id)
+            task_idx = int(row.task_idx)
+            eids = list(row.event_ids)
+            (pos if int(row.label) == 1 else neg)[task_idx][patient_id].append(eids)
+        del df
+
+    rng = random.Random(seed + 17)
+    idx_to_name = {v: k for k, v in TASK_2_IDX.items()}
+    records: list[dict] = []
+
+    for task_idx in sorted(set(list(pos.keys()) + list(neg.keys()))):
+        pos_by_pid = pos.get(task_idx, {})
+        neg_by_pid = neg.get(task_idx, {})
+        pos_pids = list(pos_by_pid.keys())
+        neg_pids = list(neg_by_pid.keys())
+
+        if len(pos_pids) < 1 or len(neg_pids) < 1:
+            logger.warning(f"  [{idx_to_name.get(task_idx, task_idx)}] insufficient eval data for query pairs — skipping")
+            continue
+
+        task_count = 0
+        for _ in range(n_pairs_per_task):
+            pos_pid = rng.choice(pos_pids)
+            neg_pid = rng.choice(neg_pids)
+            records.append({
+                "task_idx": task_idx,
+                "positive_eids": rng.choice(pos_by_pid[pos_pid]),
+                "negative_eids": rng.choice(neg_by_pid[neg_pid]),
+            })
+            task_count += 1
+
+        logger.info(f"  [{idx_to_name.get(task_idx, task_idx)}] {task_count} eval query pairs")
+
+    rng.shuffle(records)
+    table = pa.table(
+        {
+            "task_idx": pa.array([r["task_idx"] for r in records], type=pa.int16()),
+            "positive_eids": pa.array([r["positive_eids"] for r in records], type=pa.list_(pa.int32())),
+            "negative_eids": pa.array([r["negative_eids"] for r in records], type=pa.list_(pa.int32())),
+        },
+        schema=EVAL_QUERY_PAIR_SCHEMA,
+    )
+    pq.write_table(table, str(output_path))
+    logger.info(f"  Saved {len(records)} eval query pairs → {output_path}")
+    return len(records)
+
+
 # ── Optimisation helpers ───────────────────────────────────────────────────────
 
 def _set_lora_trainable(model: torch.nn.Module, trainable: bool) -> int:
@@ -417,6 +565,19 @@ def _make_param_groups(
             *raw_enc.input_norm.parameters(),
             *raw_enc.bert_proj_1.parameters(),
             *raw_enc.bert_proj_2.parameters(),
+            *raw_enc.task_input_emb.parameters(),
+            raw_enc.task_input_scale,
+            *raw_enc.task_cond_emb.parameters(),
+            *raw_enc.cond_fuse_1.parameters(),
+            *raw_enc.cond_fuse_2.parameters(),
+            raw_enc.task_res_scale,
+            *raw_enc.film_gamma.parameters(),
+            *raw_enc.film_beta.parameters(),
+            *raw_enc.task_query_proj.parameters(),
+            *raw_enc.task_cross_attn.parameters(),
+            raw_enc.task_xattn_scale,
+            *raw_enc.task_proto_emb.parameters(),
+            *raw_enc.query_fuse.parameters(),
         ]
     }
     proj_params, lora_params = [], []
@@ -514,6 +675,192 @@ def _supervised_contrastive_loss(
     return -mean_log_prob_pos[valid].mean()
 
 
+def _disease_retrieval_loss(
+    encoder: torch.nn.Module,
+    patient_emb: torch.Tensor,
+    task_idxs: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Listwise disease-query ↔ patient retrieval loss for a single-task batch.
+
+    Each training batch is prepared from a single task. We embed the disease text
+    query for that task, score all patients in the batch against the query, and
+    optimise a multi-positive InfoNCE objective where positives are label=1
+    patients and negatives are label=0 patients.
+    """
+    raw_enc = encoder.module if isinstance(encoder, DDP) else encoder
+    feat = torch.nn.functional.normalize(patient_emb.float(), p=2, dim=-1)
+
+    if task_idxs.numel() == 0:
+        return feat.new_zeros(()), {"q_pos": float("nan"), "q_neg": float("nan")}
+
+    # Prepared training batches are single-task; use the batch task query.
+    task_id = task_idxs[0]
+    query = raw_enc.task_query_proj(raw_enc.task_text_embs[task_id].unsqueeze(0).to(feat.device))
+    query = torch.nn.functional.normalize(query.float(), p=2, dim=-1).squeeze(0)  # (D,)
+
+    scores = (feat @ query) / temperature  # (B,)
+    pos_mask = labels == 1
+    if not pos_mask.any():
+        return feat.new_zeros(()), {
+            "q_pos": float("nan"),
+            "q_neg": scores[~pos_mask].mean().item() if (~pos_mask).any() else float("nan"),
+        }
+
+    loss = -torch.logsumexp(scores[pos_mask], dim=0) + torch.logsumexp(scores, dim=0)
+    stats = {
+        "q_pos": scores[pos_mask].mean().item(),
+        "q_neg": scores[~pos_mask].mean().item() if (~pos_mask).any() else float("nan"),
+    }
+    return loss, stats
+
+
+def _binary_roc_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    """ROC-AUC from scores/labels without sklearn.
+
+    Interpretable as the probability that a random positive receives a higher
+    score than a random negative, with ties counting as 0.5.
+    """
+    scores = scores.float().cpu()
+    labels = labels.long().cpu()
+    pos = scores[labels == 1]
+    neg = scores[labels == 0]
+    if pos.numel() == 0 or neg.numel() == 0:
+        return float("nan")
+    cmp = pos[:, None] - neg[None, :]
+    auc = (cmp > 0).float().mean() + 0.5 * (cmp == 0).float().mean()
+    return auc.item()
+
+
+def _precision_recall_at_k(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    k: int,
+) -> tuple[float, float]:
+    scores = scores.float().cpu()
+    labels = labels.long().cpu()
+    n = labels.numel()
+    if n == 0:
+        return float("nan"), float("nan")
+    k = min(k, n)
+    topk_idx = torch.topk(scores, k=k, largest=True).indices
+    topk_labels = labels[topk_idx]
+    hits = topk_labels.sum().item()
+    total_pos = labels.sum().item()
+    precision = hits / max(k, 1)
+    recall = hits / max(total_pos, 1) if total_pos > 0 else float("nan")
+    return precision, recall
+
+
+def _forward_embeddings(
+    encoder: torch.nn.Module,
+    batch: dict[str, torch.Tensor],
+    device: torch.device,
+    encoder_mode: str,
+    *,
+    return_pre_emb: bool = False,
+):
+    """Unified embedding forward for full/proj/raw modes."""
+    event_embs = batch["event_embs"].to(device)
+    event_mask = batch["event_mask"].to(device)
+    task_idxs  = batch["task_idxs"].to(device)
+
+    if encoder_mode == "full":
+        return encoder(
+            event_embs,
+            event_mask,
+            task_idxs,
+            return_pre_emb=return_pre_emb,
+        )
+    if encoder_mode == "proj":
+        return encoder(
+            event_embs,
+            event_mask,
+            task_idxs,
+            bypass_qwen=True,
+            return_pre_emb=return_pre_emb,
+        )
+    if encoder_mode == "proj_cond":
+        return encoder(
+            event_embs,
+            event_mask,
+            task_idxs,
+            bypass_qwen=True,
+            condition_on_task=True,
+            condition_mode="concat",
+            return_pre_emb=return_pre_emb,
+        )
+    if encoder_mode == "proj_cond_token_pre":
+        return encoder(
+            event_embs,
+            event_mask,
+            task_idxs,
+            bypass_qwen=True,
+            condition_on_task=True,
+            condition_mode="token_preproj",
+            return_pre_emb=return_pre_emb,
+        )
+    if encoder_mode == "proj_cond_residual":
+        return encoder(
+            event_embs,
+            event_mask,
+            task_idxs,
+            bypass_qwen=True,
+            condition_on_task=True,
+            condition_mode="residual",
+            return_pre_emb=return_pre_emb,
+        )
+    if encoder_mode == "proj_cond_film":
+        return encoder(
+            event_embs,
+            event_mask,
+            task_idxs,
+            bypass_qwen=True,
+            condition_on_task=True,
+            condition_mode="film",
+            return_pre_emb=return_pre_emb,
+        )
+    if encoder_mode == "proj_cond_xattn":
+        return encoder(
+            event_embs,
+            event_mask,
+            task_idxs,
+            bypass_qwen=True,
+            condition_on_task=True,
+            condition_mode="xattn",
+            return_pre_emb=return_pre_emb,
+        )
+    if encoder_mode == "proj_cond_xattn_pool":
+        return encoder(
+            event_embs,
+            event_mask,
+            task_idxs,
+            bypass_qwen=True,
+            condition_on_task=True,
+            condition_mode="xattn_pool",
+            return_pre_emb=return_pre_emb,
+        )
+    if encoder_mode == "proj_cond_query_proto":
+        return encoder(
+            event_embs,
+            event_mask,
+            task_idxs,
+            bypass_qwen=True,
+            condition_on_task=True,
+            condition_mode="query_proto",
+            return_pre_emb=return_pre_emb,
+        )
+    if encoder_mode == "raw":
+        mask_f = event_mask.float().unsqueeze(-1)
+        pre_emb = (event_embs.float() * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
+        emb = torch.nn.functional.normalize(pre_emb, p=2, dim=-1)
+        if return_pre_emb:
+            return emb, pre_emb
+        return emb
+    raise ValueError(f"Unknown encoder_mode: {encoder_mode}")
+
+
 # ── Model setup ───────────────────────────────────────────────────────────────
 
 def load_qwen(args):
@@ -540,6 +887,46 @@ def load_qwen(args):
         print(f"Pad token undetected, set to eos token")
 
     return model, tokenizer
+
+
+@torch.inference_mode()
+def build_task_text_embs(args, device: torch.device, rank: int, is_ddp: bool) -> torch.Tensor:
+    tasks_sorted = sorted(TASK_2_DISEASE_NAME)
+    task_text_embs = torch.zeros(len(tasks_sorted), BERT_DIM, dtype=torch.float32, device=device)
+
+    if rank == 0:
+        disease_model_name = getattr(args, "disease_model_name", "michiyasunaga/BioLinkBERT-base")
+        logger.info(f"Loading disease text encoder: {disease_model_name}")
+        disease_tokenizer = AutoTokenizer.from_pretrained(disease_model_name, local_files_only=True)
+        disease_model = AutoModel.from_pretrained(disease_model_name, local_files_only=True).to(device)
+        disease_model.eval()
+
+        texts = [TASK_2_DISEASE_QUERY_TEXT[t] for t in tasks_sorted]
+        enc = disease_tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=128,
+            return_tensors="pt",
+        ).to(device)
+        out = disease_model(**enc)
+        special_ids = set(disease_tokenizer.all_special_ids)
+        special = torch.zeros_like(enc["attention_mask"], dtype=torch.bool)
+        for sid in special_ids:
+            special |= enc["input_ids"] == sid
+        pool_mask = enc["attention_mask"].bool() & ~special
+        pool_mask_f = pool_mask.float().unsqueeze(-1)
+        task_text_embs = (
+            (out.last_hidden_state.float() * pool_mask_f).sum(dim=1)
+            / pool_mask_f.sum(dim=1).clamp(min=1e-9)
+        )
+        logger.info("  Built BioLinkBERT disease embeddings for task queries")
+        for task, text in zip(tasks_sorted, texts):
+            logger.info(f"  Query text [{task}]: {text}")
+
+    if is_ddp:
+        dist.broadcast(task_text_embs, src=0)
+    return task_text_embs.cpu()
 
 
 def setup_lora(model, args):
@@ -592,7 +979,7 @@ def build_task_prefix_ids(tokenizer) -> tuple[torch.Tensor, torch.Tensor]:
     return task_prefix_ids, task_prefix_mask
 
 
-def build_encoder(qwen_model, tokenizer, args) -> DiseaseAwareEHREncoder:
+def build_encoder(qwen_model, tokenizer, args, device: torch.device, rank: int, is_ddp: bool) -> DiseaseAwareEHREncoder:
     qwen_dim = qwen_model.config.hidden_size
 
     task_prefix_ids, task_prefix_mask = build_task_prefix_ids(tokenizer)
@@ -605,6 +992,13 @@ def build_encoder(qwen_model, tokenizer, args) -> DiseaseAwareEHREncoder:
         torch.float16  if args.fp16 else
         torch.float32
     )
+    task_text_embs = build_task_text_embs(
+        args,
+        device,
+        rank,
+        is_ddp,
+    )
+
     encoder = DiseaseAwareEHREncoder(
         qwen_model       = qwen_model,
         bert_dim         = BERT_DIM,
@@ -612,6 +1006,7 @@ def build_encoder(qwen_model, tokenizer, args) -> DiseaseAwareEHREncoder:
         task_prefix_ids  = task_prefix_ids,
         task_prefix_mask = task_prefix_mask,
         middle_ids       = middle_ids,
+        task_text_embs   = task_text_embs,
         dtype            = dtype,
     )
     logger.info(
@@ -660,6 +1055,8 @@ class EvalBatchDataset(Dataset):
 def evaluate_rank0(
     encoder:           DiseaseAwareEHREncoder,
     eval_triplet_path: Path,
+    eval_query_pair_path: Path | None,
+    eval_data_paths: list[str] | None,
     store:             EmbeddingStore,
     device:            torch.device,
     args,
@@ -693,18 +1090,38 @@ def evaluate_rank0(
 
     all_embs: list[torch.Tensor] = []
     all_pre_embs: list[torch.Tensor] = []
+    all_proj_embs: list[torch.Tensor] = []
+    all_proj_pre_embs: list[torch.Tensor] = []
+    all_raw_pre_embs: list[torch.Tensor] = []
     for batch in tqdm(eval_dl, desc="Evaluating", dynamic_ncols=True):
-        emb, pre_emb = raw_encoder(
-            batch["event_embs"].to(device),
-            batch["event_mask"].to(device),
-            batch["task_idxs"].to(device),
-            return_pre_emb=True,
+        event_embs = batch["event_embs"].to(device)
+        event_mask = batch["event_mask"].to(device)
+        task_idxs  = batch["task_idxs"].to(device)
+
+        mode_batch = {
+            "event_embs": event_embs,
+            "event_mask": event_mask,
+            "task_idxs":  task_idxs,
+        }
+        emb, pre_emb = _forward_embeddings(
+            raw_encoder, mode_batch, device, args.encoder_mode, return_pre_emb=True
         )
+        proj_emb, proj_pre_emb = _forward_embeddings(
+            raw_encoder, mode_batch, device, "proj", return_pre_emb=True
+        )
+        mask_f = event_mask.float().unsqueeze(-1)
+        raw_pre_emb = (event_embs.float() * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
         all_embs.append(emb.cpu())
         all_pre_embs.append(pre_emb.cpu())
+        all_proj_embs.append(proj_emb.cpu())
+        all_proj_pre_embs.append(proj_pre_emb.cpu())
+        all_raw_pre_embs.append(raw_pre_emb.cpu())
 
     embs      = torch.cat(all_embs, dim=0)
-    pre_embs = torch.cat(all_pre_embs, dim=0)
+    pre_embs  = torch.cat(all_pre_embs, dim=0)
+    proj_embs = torch.cat(all_proj_embs, dim=0)
+    proj_pre_embs = torch.cat(all_proj_pre_embs, dim=0)
+    raw_pre_embs = torch.cat(all_raw_pre_embs, dim=0)
 
     def _triplet_correct(
         x: torch.Tensor,
@@ -726,6 +1143,10 @@ def evaluate_rank0(
     correct_main     = _triplet_correct(embs, "l2")
     correct_pre_cos  = _triplet_correct(pre_embs, "cosine")
     correct_pre_l2   = _triplet_correct(pre_embs, "l2")
+    correct_proj_cos = _triplet_correct(proj_pre_embs, "cosine")
+    correct_proj_l2  = _triplet_correct(proj_pre_embs, "l2")
+    correct_raw_cos  = _triplet_correct(raw_pre_embs, "cosine")
+    correct_raw_l2   = _triplet_correct(raw_pre_embs, "l2")
 
     task_idxs_arr = df["task_idx"].values
     idx_to_name   = {v: k for k, v in TASK_2_IDX.items()}
@@ -733,6 +1154,10 @@ def evaluate_rank0(
     extra_overall = {
         "pre_cosine_triplet_acc": correct_pre_cos.float().mean().item(),
         "pre_l2_triplet_acc":     correct_pre_l2.float().mean().item(),
+        "proj_cosine_triplet_acc": correct_proj_cos.float().mean().item(),
+        "proj_l2_triplet_acc":     correct_proj_l2.float().mean().item(),
+        "raw_cosine_triplet_acc":  correct_raw_cos.float().mean().item(),
+        "raw_l2_triplet_acc":      correct_raw_l2.float().mean().item(),
     }
     extra_task: dict[str, dict[str, float]] = {}
 
@@ -747,7 +1172,120 @@ def evaluate_rank0(
             extra_task[task_name] = {
                 "pre_cosine_triplet_acc": correct_pre_cos[torch_mask].float().mean().item(),
                 "pre_l2_triplet_acc":     correct_pre_l2[torch_mask].float().mean().item(),
+                "proj_cosine_triplet_acc": correct_proj_cos[torch_mask].float().mean().item(),
+                "proj_l2_triplet_acc":     correct_proj_l2[torch_mask].float().mean().item(),
+                "raw_cosine_triplet_acc":  correct_raw_cos[torch_mask].float().mean().item(),
+                "raw_l2_triplet_acc":      correct_raw_l2[torch_mask].float().mean().item(),
             }
+
+    if eval_query_pair_path is not None and eval_query_pair_path.exists():
+        qdf = pd.read_parquet(
+            str(eval_query_pair_path),
+            columns=["task_idx", "positive_eids", "negative_eids"],
+        )
+        q_entries: list[tuple[np.ndarray, int]] = []
+        for row in qdf.itertuples(index=False):
+            t = int(row.task_idx)
+            q_entries.append((np.array(row.positive_eids, dtype=np.int32), t))
+            q_entries.append((np.array(row.negative_eids, dtype=np.int32), t))
+
+        q_ds = EvalBatchDataset(q_entries, store, args.eval_batch_size, args.pad_to_num_events)
+        q_dl = DataLoader(q_ds, batch_size=1, shuffle=False, collate_fn=lambda b: b[0], num_workers=0)
+
+        q_pre_embs: list[torch.Tensor] = []
+        q_task_idxs: list[torch.Tensor] = []
+        for batch in q_dl:
+            _, pre_emb = _forward_embeddings(
+                raw_encoder, batch, device, args.encoder_mode, return_pre_emb=True
+            )
+            q_pre_embs.append(pre_emb.cpu())
+            q_task_idxs.append(batch["task_idxs"].cpu())
+
+        pair_pre = torch.cat(q_pre_embs, dim=0)          # (2M, D)
+        pair_task_idxs = torch.cat(q_task_idxs, dim=0)   # (2M,)
+        pos_pre = pair_pre[0::2]
+        neg_pre = pair_pre[1::2]
+        pair_tasks = pair_task_idxs[0::2]
+
+        raw_query = raw_encoder.task_query_proj(raw_encoder.task_text_embs.to(device)).float().cpu()
+        q_vecs = raw_query[pair_tasks]
+
+        sim_pos = torch.nn.functional.cosine_similarity(q_vecs, pos_pre, dim=1)
+        sim_neg = torch.nn.functional.cosine_similarity(q_vecs, neg_pre, dim=1)
+        q_cos_correct = sim_pos > sim_neg
+
+        d_pos = (q_vecs - pos_pre).norm(dim=1)
+        d_neg = (q_vecs - neg_pre).norm(dim=1)
+        q_l2_correct = d_pos < d_neg
+
+        extra_overall["query_cosine_pair_acc"] = q_cos_correct.float().mean().item()
+        extra_overall["query_l2_pair_acc"] = q_l2_correct.float().mean().item()
+
+        for t_idx in sorted(set(pair_tasks.tolist())):
+            mask = pair_tasks == t_idx
+            task_name = idx_to_name.get(int(t_idx), str(int(t_idx)))
+            extra_task.setdefault(task_name, {})
+            extra_task[task_name]["query_cosine_pair_acc"] = q_cos_correct[mask].float().mean().item()
+            extra_task[task_name]["query_l2_pair_acc"] = q_l2_correct[mask].float().mean().item()
+
+    if eval_data_paths:
+        val_rows: list[tuple[np.ndarray, int, int]] = []
+        for path in eval_data_paths:
+            vdf = pd.read_parquet(path, columns=["task_idx", "label", "event_ids"])
+            for row in vdf.itertuples(index=False):
+                val_rows.append((
+                    np.array(row.event_ids, dtype=np.int32),
+                    int(row.task_idx),
+                    int(row.label),
+                ))
+
+        if val_rows:
+            val_entries = [(eids, task_idx) for eids, task_idx, _ in val_rows]
+            val_labels = torch.tensor([label for _, _, label in val_rows], dtype=torch.long)
+            val_task_idxs = torch.tensor([task_idx for _, task_idx, _ in val_rows], dtype=torch.long)
+            val_ds = EvalBatchDataset(val_entries, store, args.eval_batch_size, args.pad_to_num_events)
+            val_dl = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=lambda b: b[0], num_workers=0)
+
+            all_val_pre: list[torch.Tensor] = []
+            for batch in val_dl:
+                _, pre_emb = _forward_embeddings(
+                    raw_encoder, batch, device, args.encoder_mode, return_pre_emb=True
+                )
+                all_val_pre.append(pre_emb.cpu())
+            val_pre_embs = torch.cat(all_val_pre, dim=0)
+
+            query_bank = raw_encoder.task_query_proj(raw_encoder.task_text_embs.to(device)).float().cpu()
+            query_vecs = query_bank[val_task_idxs]
+            query_scores = torch.nn.functional.cosine_similarity(query_vecs, val_pre_embs, dim=1)
+
+            extra_overall["query_auc"] = _binary_roc_auc(query_scores, val_labels)
+            extra_overall["query_num_samples"] = float(val_labels.numel())
+            extra_overall["query_num_pos"] = float((val_labels == 1).sum().item())
+            extra_overall["query_num_neg"] = float((val_labels == 0).sum().item())
+            p10, r10 = _precision_recall_at_k(query_scores, val_labels, 10)
+            p50, r50 = _precision_recall_at_k(query_scores, val_labels, 50)
+            extra_overall["query_precision_at_10"] = p10
+            extra_overall["query_recall_at_10"] = r10
+            extra_overall["query_precision_at_50"] = p50
+            extra_overall["query_recall_at_50"] = r50
+            for t_idx in sorted(set(val_task_idxs.tolist())):
+                mask = val_task_idxs == t_idx
+                task_name = idx_to_name.get(int(t_idx), str(int(t_idx)))
+                extra_task.setdefault(task_name, {})
+                task_scores = query_scores[mask]
+                task_labels = val_labels[mask]
+                extra_task[task_name]["query_num_samples"] = float(task_labels.numel())
+                extra_task[task_name]["query_num_pos"] = float((task_labels == 1).sum().item())
+                extra_task[task_name]["query_num_neg"] = float((task_labels == 0).sum().item())
+                extra_task[task_name]["query_auc"] = _binary_roc_auc(
+                    task_scores, task_labels
+                )
+                tp10, tr10 = _precision_recall_at_k(task_scores, task_labels, 10)
+                tp50, tr50 = _precision_recall_at_k(task_scores, task_labels, 50)
+                extra_task[task_name]["query_precision_at_10"] = tp10
+                extra_task[task_name]["query_recall_at_10"] = tr10
+                extra_task[task_name]["query_precision_at_50"] = tp50
+                extra_task[task_name]["query_recall_at_50"] = tr50
 
     overall_acc = correct_main.float().mean().item()
     raw_encoder.train()
@@ -777,6 +1315,22 @@ def parse_args():
 
     # Qwen model
     p.add_argument("--model_name",   default="Qwen/Qwen3-Embedding-0.6B")
+    p.add_argument("--encoder_mode", choices=["full", "proj", "proj_cond", "proj_cond_token_pre", "proj_cond_residual", "proj_cond_film", "proj_cond_xattn", "proj_cond_xattn_pool", "proj_cond_query_proto", "raw"], default="full",
+                   help="Embedding path to optimise/evaluate. "
+                        "'full' = proj + Qwen, 'proj' = bert_proj mean-pool, "
+                        "'proj_cond' = bert_proj mean-pool + lightweight task conditioning, "
+                        "'proj_cond_token_pre' = add disease type embedding to each event before bert_proj, "
+                        "'proj_cond_residual' = proj + residual task embedding, "
+                        "'proj_cond_film' = proj + FiLM task conditioning, "
+                        "'proj_cond_xattn' = BioLinkBERT disease-query cross-attention over event projections, "
+                        "'proj_cond_xattn_pool' = use disease-query cross-attention pooled vector as output, "
+                        "'proj_cond_query_proto' = fuse disease text query with a learned disease prototype before attention pooling, "
+                        "'raw' = mean-pool original event embeddings (eval-only).")
+    p.add_argument("--disease_model_name", default="michiyasunaga/BioLinkBERT-base",
+                   help="BioLinkBERT model used to encode disease text queries for cross-attention.")
+    p.add_argument("--train_objective", choices=["patient_metric", "disease_retrieval"], default="patient_metric",
+                   help="Training objective. 'patient_metric' keeps the current patient-patient metric learning "
+                        "objective; 'disease_retrieval' aligns disease text queries with patient embeddings.")
     p.add_argument("--flash_attn",   action="store_true")
     p.add_argument("--bf16",         action="store_true")
     p.add_argument("--fp16",         action="store_true")
@@ -802,9 +1356,8 @@ def parse_args():
 
     # Two-stage training
     p.add_argument("--stage1_steps", type=int, default=0,
-                   help="Number of optimizer steps for stage 1 (LoRA frozen, full frozen-Qwen forward, "
-                        "only proj params trainable). "
-                        "0 = skip stage 1.")
+                   help="Deprecated. Stage 1 now runs over the full selected data epoch whenever "
+                        "this value is > 0; use 0 to skip Stage 1.")
     p.add_argument("--lr_proj", type=float, default=2e-4,
                    help="LR for bert_proj_1, bert_proj_2, input_norm (higher).")
     p.add_argument("--lr_lora", type=float, default=5e-5,
@@ -823,11 +1376,19 @@ def parse_args():
     p.add_argument("--stage2_triplet_weight", type=float, default=0.1,
                    help="Auxiliary weight for BatchHardTripletLoss on normalised embeddings "
                         "during Stage 2.")
+    p.add_argument("--retrieval_temperature", type=float, default=0.1,
+                   help="Temperature for disease-query retrieval loss.")
+    p.add_argument("--retrieval_supcon_weight", type=float, default=0.2,
+                   help="Auxiliary weight for patient-side SupCon when train_objective=disease_retrieval.")
 
     # Eval
     p.add_argument("--n_eval_triplets_per_task", type=int,   default=256)
     p.add_argument("--eval_batch_size",          type=int,   default=32)
     p.add_argument("--pad_to_num_events",        type=int,   default=None)
+    p.add_argument("--stage1_eval_steps",        type=int,   default=0,
+                   help="If > 0, run eval every N Stage 1 optimizer steps.")
+    p.add_argument("--eval_steps",               type=int,   default=0,
+                   help="If > 0, run eval every N Stage 2 optimizer steps.")
 
     p.add_argument("--num_workers",      type=int, default=4)
     p.add_argument("--prefetch_factor",  type=int, default=4)
@@ -868,6 +1429,9 @@ def main():
         raise RuntimeError("QLoRA is incompatible with multi-GPU DDP.")
     if not args.eval_only and args.train_data_dir is None:
         raise ValueError("--train_data_dir is required unless --eval_only is set.")
+    if args.encoder_mode == "raw" and not args.eval_only:
+        raise ValueError("--encoder_mode raw is eval-only; use --eval_only or choose full/proj.")
+    uses_qwen_path = args.encoder_mode == "full"
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir   = Path(args.output_dir) / timestamp
@@ -905,15 +1469,41 @@ def main():
         logger.info(f"Loading checkpoint from {args.checkpoint}")
         qwen_model.config.use_cache = False
         qwen_lora = PeftModel.from_pretrained(qwen_model, str(Path(args.checkpoint) / "lora"))
-        encoder = build_encoder(qwen_lora, tokenizer, args)
+        encoder = build_encoder(qwen_lora, tokenizer, args, device, rank, is_ddp)
         extra = torch.load(Path(args.checkpoint) / "extra_modules.pt", map_location="cpu")
         encoder.bert_proj_1.load_state_dict(extra["bert_proj_1"])
         encoder.bert_proj_2.load_state_dict(extra["bert_proj_2"])
         if "input_norm" in extra:
             encoder.input_norm.load_state_dict(extra["input_norm"])
+        if "task_input_emb" in extra:
+            encoder.task_input_emb.load_state_dict(extra["task_input_emb"])
+        if "task_input_scale" in extra:
+            encoder.task_input_scale.data.copy_(extra["task_input_scale"].to(encoder.task_input_scale.dtype))
+        if "task_cond_emb" in extra:
+            encoder.task_cond_emb.load_state_dict(extra["task_cond_emb"])
+        if "cond_fuse_1" in extra:
+            encoder.cond_fuse_1.load_state_dict(extra["cond_fuse_1"])
+        if "cond_fuse_2" in extra:
+            encoder.cond_fuse_2.load_state_dict(extra["cond_fuse_2"])
+        if "task_res_scale" in extra:
+            encoder.task_res_scale.data.copy_(extra["task_res_scale"].to(encoder.task_res_scale.dtype))
+        if "film_gamma" in extra:
+            encoder.film_gamma.load_state_dict(extra["film_gamma"])
+        if "film_beta" in extra:
+            encoder.film_beta.load_state_dict(extra["film_beta"])
+        if "task_query_proj" in extra:
+            encoder.task_query_proj.load_state_dict(extra["task_query_proj"])
+        if "task_cross_attn" in extra:
+            encoder.task_cross_attn.load_state_dict(extra["task_cross_attn"])
+        if "task_xattn_scale" in extra:
+            encoder.task_xattn_scale.data.copy_(extra["task_xattn_scale"].to(encoder.task_xattn_scale.dtype))
+        if "task_proto_emb" in extra:
+            encoder.task_proto_emb.load_state_dict(extra["task_proto_emb"])
+        if "query_fuse" in extra:
+            encoder.query_fuse.load_state_dict(extra["query_fuse"])
     else:
         qwen_lora = setup_lora(qwen_model, args)
-        encoder = build_encoder(qwen_lora, tokenizer, args)
+        encoder = build_encoder(qwen_lora, tokenizer, args, device, rank, is_ddp)
 
     encoder = encoder.to(device)
 
@@ -922,14 +1512,25 @@ def main():
         torch._dynamo.config.allow_unspec_int_on_nn_module = True
         encoder = torch.compile(encoder)
 
+    if not uses_qwen_path and not args.eval_only:
+        n_frozen = _set_lora_trainable(encoder, False)
+        if rank == 0 and n_frozen > 0:
+            logger.info(
+                f"encoder_mode={args.encoder_mode}: keeping {n_frozen} LoRA parameter tensors frozen"
+            )
+
     if is_ddp and not args.eval_only:
-        encoder = DDP(encoder, device_ids=[local_rank], output_device=local_rank,
-                      find_unused_parameters=True, static_graph=False)
+        initial_stage = "stage1" if args.stage1_steps > 0 else "stage2"
+        encoder = _wrap_ddp_for_stage(
+            encoder, is_ddp=True, local_rank=local_rank, stage=initial_stage
+        )
 
     # ── Pre-compute eval triplets (rank 0 only) ───────────────────────────────
     eval_triplet_path: Path | None = None
+    eval_query_pair_path: Path | None = None
     if args.eval_data_paths and rank == 0:
         eval_triplet_path = run_dir / "eval_triplets.parquet"
+        eval_query_pair_path = run_dir / "eval_query_pairs.parquet"
         logger.info("Pre-computing eval triplets …")
         precompute_eval_triplets(
             args.eval_data_paths,
@@ -937,35 +1538,113 @@ def main():
             args.seed,
             eval_triplet_path,
         )
+        logger.info("Pre-computing eval disease-query pairs …")
+        precompute_eval_query_pairs(
+            args.eval_data_paths,
+            args.n_eval_triplets_per_task,
+            args.seed,
+            eval_query_pair_path,
+        )
 
     # ── Eval-only mode ────────────────────────────────────────────────────────
     if args.eval_only:
         if eval_triplet_path is None:
             raise ValueError("--eval_only requires --eval_data_paths.")
         val_acc, val_task_acc, extra_overall, extra_task = evaluate_rank0(
-            encoder, eval_triplet_path, store, device, args
+            encoder, eval_triplet_path, eval_query_pair_path, args.eval_data_paths, store, device, args
         )
         if rank == 0:
             logger.info(f"Eval triplet accuracy: {val_acc:.4f}")
             logger.info(f"  [pre_emb cosine] triplet accuracy: {extra_overall['pre_cosine_triplet_acc']:.4f}")
             logger.info(f"  [pre_emb l2] triplet accuracy: {extra_overall['pre_l2_triplet_acc']:.4f}")
+            logger.info(f"  [bert_proj cosine] triplet accuracy: {extra_overall['proj_cosine_triplet_acc']:.4f}")
+            logger.info(f"  [bert_proj l2] triplet accuracy: {extra_overall['proj_l2_triplet_acc']:.4f}")
+            logger.info(f"  [raw_event cosine] triplet accuracy: {extra_overall['raw_cosine_triplet_acc']:.4f}")
+            logger.info(f"  [raw_event l2] triplet accuracy: {extra_overall['raw_l2_triplet_acc']:.4f}")
+            if "query_cosine_pair_acc" in extra_overall:
+                logger.info(f"  [disease_query cosine] pair accuracy: {extra_overall['query_cosine_pair_acc']:.4f}")
+                logger.info(f"  [disease_query l2] pair accuracy: {extra_overall['query_l2_pair_acc']:.4f}")
+            if "query_auc" in extra_overall:
+                logger.info(f"  [disease_query auc] {extra_overall['query_auc']:.4f}")
+                logger.info(
+                    f"  [disease_query counts] "
+                    f"n={int(extra_overall.get('query_num_samples', float('nan')))}  "
+                    f"pos={int(extra_overall.get('query_num_pos', float('nan')))}  "
+                    f"neg={int(extra_overall.get('query_num_neg', float('nan')))}"
+                )
+                logger.info(
+                    f"  [disease_query p@10/r@10] "
+                    f"{extra_overall.get('query_precision_at_10', float('nan')):.4f}/"
+                    f"{extra_overall.get('query_recall_at_10', float('nan')):.4f}"
+                )
+                logger.info(
+                    f"  [disease_query p@50/r@50] "
+                    f"{extra_overall.get('query_precision_at_50', float('nan')):.4f}/"
+                    f"{extra_overall.get('query_recall_at_50', float('nan')):.4f}"
+                )
             for task, acc in sorted(val_task_acc.items()):
                 logger.info(f"  {task}: {acc:.4f}")
                 logger.info(
                     f"    pre_cos={extra_task[task]['pre_cosine_triplet_acc']:.4f}  "
-                    f"pre_l2={extra_task[task]['pre_l2_triplet_acc']:.4f}"
+                    f"pre_l2={extra_task[task]['pre_l2_triplet_acc']:.4f}  "
+                    f"proj_cos={extra_task[task]['proj_cosine_triplet_acc']:.4f}  "
+                    f"proj_l2={extra_task[task]['proj_l2_triplet_acc']:.4f}  "
+                    f"raw_cos={extra_task[task]['raw_cosine_triplet_acc']:.4f}  "
+                    f"raw_l2={extra_task[task]['raw_l2_triplet_acc']:.4f}"
                 )
+                if "query_cosine_pair_acc" in extra_task[task]:
+                    logger.info(
+                        f"    query_cos={extra_task[task]['query_cosine_pair_acc']:.4f}  "
+                        f"query_l2={extra_task[task]['query_l2_pair_acc']:.4f}"
+                    )
+                if "query_auc" in extra_task[task]:
+                    logger.info(
+                        f"    query_auc={extra_task[task]['query_auc']:.4f}  "
+                        f"n={int(extra_task[task].get('query_num_samples', float('nan')))}  "
+                        f"pos={int(extra_task[task].get('query_num_pos', float('nan')))}  "
+                        f"neg={int(extra_task[task].get('query_num_neg', float('nan')))}  "
+                        f"p@10={extra_task[task].get('query_precision_at_10', float('nan')):.4f}  "
+                        f"r@10={extra_task[task].get('query_recall_at_10', float('nan')):.4f}  "
+                        f"p@50={extra_task[task].get('query_precision_at_50', float('nan')):.4f}  "
+                        f"r@50={extra_task[task].get('query_recall_at_50', float('nan')):.4f}"
+                    )
         if use_wandb and wandb_run:
             import wandb
             log_dict = {
                 "eval/triplet_acc":             val_acc,
                 "eval/pre_cosine_triplet_acc":  extra_overall["pre_cosine_triplet_acc"],
                 "eval/pre_l2_triplet_acc":      extra_overall["pre_l2_triplet_acc"],
+                "eval/proj_cosine_triplet_acc": extra_overall["proj_cosine_triplet_acc"],
+                "eval/proj_l2_triplet_acc":     extra_overall["proj_l2_triplet_acc"],
+                "eval/raw_cosine_triplet_acc":  extra_overall["raw_cosine_triplet_acc"],
+                "eval/raw_l2_triplet_acc":      extra_overall["raw_l2_triplet_acc"],
             }
+            if "query_cosine_pair_acc" in extra_overall:
+                log_dict["eval/query_cosine_pair_acc"] = extra_overall["query_cosine_pair_acc"]
+                log_dict["eval/query_l2_pair_acc"] = extra_overall["query_l2_pair_acc"]
+            if "query_auc" in extra_overall:
+                log_dict["eval/query_auc"] = extra_overall["query_auc"]
+                log_dict["eval/query_precision_at_10"] = extra_overall.get("query_precision_at_10", float("nan"))
+                log_dict["eval/query_recall_at_10"] = extra_overall.get("query_recall_at_10", float("nan"))
+                log_dict["eval/query_precision_at_50"] = extra_overall.get("query_precision_at_50", float("nan"))
+                log_dict["eval/query_recall_at_50"] = extra_overall.get("query_recall_at_50", float("nan"))
             for task, acc in val_task_acc.items():
                 log_dict[f"eval/{task}/triplet_acc"] = acc
                 log_dict[f"eval/{task}/pre_cosine_triplet_acc"] = extra_task[task]["pre_cosine_triplet_acc"]
                 log_dict[f"eval/{task}/pre_l2_triplet_acc"] = extra_task[task]["pre_l2_triplet_acc"]
+                log_dict[f"eval/{task}/proj_cosine_triplet_acc"] = extra_task[task]["proj_cosine_triplet_acc"]
+                log_dict[f"eval/{task}/proj_l2_triplet_acc"] = extra_task[task]["proj_l2_triplet_acc"]
+                log_dict[f"eval/{task}/raw_cosine_triplet_acc"] = extra_task[task]["raw_cosine_triplet_acc"]
+                log_dict[f"eval/{task}/raw_l2_triplet_acc"] = extra_task[task]["raw_l2_triplet_acc"]
+                if "query_cosine_pair_acc" in extra_task[task]:
+                    log_dict[f"eval/{task}/query_cosine_pair_acc"] = extra_task[task]["query_cosine_pair_acc"]
+                    log_dict[f"eval/{task}/query_l2_pair_acc"] = extra_task[task]["query_l2_pair_acc"]
+                if "query_auc" in extra_task[task]:
+                    log_dict[f"eval/{task}/query_auc"] = extra_task[task]["query_auc"]
+                    log_dict[f"eval/{task}/query_precision_at_10"] = extra_task[task].get("query_precision_at_10", float("nan"))
+                    log_dict[f"eval/{task}/query_recall_at_10"] = extra_task[task].get("query_recall_at_10", float("nan"))
+                    log_dict[f"eval/{task}/query_precision_at_50"] = extra_task[task].get("query_precision_at_50", float("nan"))
+                    log_dict[f"eval/{task}/query_recall_at_50"] = extra_task[task].get("query_recall_at_50", float("nan"))
             wandb.log(log_dict)
             wandb_run.finish()
         if is_ddp:
@@ -1027,8 +1706,9 @@ def main():
     if args.stage1_steps > 0:
         if rank == 0:
             logger.info(
-                f"Stage 1: {args.stage1_steps} steps — "
-                f"LoRA frozen, full frozen-Qwen forward, lr_proj={args.lr_proj}"
+                f"Stage 1: full data epoch {stage1_data_epoch} — "
+                f"{'LoRA frozen, full frozen-Qwen forward' if uses_qwen_path else 'shallow encoder mode'}"
+                f", lr_proj={args.lr_proj}"
             )
 
         n_frozen = _set_lora_trainable(encoder, False)
@@ -1052,15 +1732,18 @@ def main():
             fused=True,
         )
 
-        # Linear warmup for Stage 1 (same warmup_ratio as Stage 2).
-        s1_warmup = max(1, int(args.stage1_steps * args.warmup_ratio))
+        # Linear warmup for Stage 1 over the full selected data epoch.
+        stage1_ds, stage1_dl = _make_loader(data_epoch=stage1_data_epoch, training_epoch=0)
+        s1_total_steps = len(stage1_ds)
+        s1_warmup = max(1, int(s1_total_steps * args.warmup_ratio))
         s1_sched  = torch.optim.lr_scheduler.LinearLR(
             stage1_opt, start_factor=1e-3, end_factor=1.0, total_iters=s1_warmup
         )
         if rank == 0:
-            logger.info(f"  Stage 1 warmup: {s1_warmup} steps (ratio={args.warmup_ratio})")
-
-        stage1_ds, stage1_dl = _make_loader(data_epoch=stage1_data_epoch, training_epoch=0)
+            logger.info(
+                f"  Stage 1 total steps: {s1_total_steps}  "
+                f"warmup: {s1_warmup} steps (ratio={args.warmup_ratio})"
+            )
         encoder.train()
         stage1_opt.zero_grad()
         s1_step = 0
@@ -1070,36 +1753,49 @@ def main():
             desc="Stage 1",
             disable=(rank != 0),
             dynamic_ncols=True,
-            total=min(args.stage1_steps, len(stage1_ds)),
+            total=len(stage1_ds),
         )
 
         for batch in pbar_s1:
-            if s1_step >= args.stage1_steps:
-                break
-
             labels_t = batch["labels"]
+            task_idxs_t = batch["task_idxs"].to(device)
 
-            enc_out = encoder(
-                batch["event_embs"].to(device),
-                batch["event_mask"].to(device),
-                batch["task_idxs"].to(device),
-                return_pre_emb=True,
+            emb, pre_emb = _forward_embeddings(
+                encoder, batch, device, args.encoder_mode, return_pre_emb=True
             )
-            emb, pre_emb = enc_out
-            supcon_loss = _supervised_contrastive_loss(
-                pre_emb,
-                labels_t.to(device),
-                args.stage1_temperature,
-            )
+            if args.train_objective == "disease_retrieval":
+                retrieval_loss, retrieval_stats = _disease_retrieval_loss(
+                    encoder,
+                    pre_emb,
+                    task_idxs_t,
+                    labels_t.to(device),
+                    args.retrieval_temperature,
+                )
+                supcon_aux = _supervised_contrastive_loss(
+                    pre_emb,
+                    labels_t.to(device),
+                    args.stage1_temperature,
+                )
+                main_loss = retrieval_loss + args.retrieval_supcon_weight * supcon_aux
+                main_loss_name = "lret"
+                loss_supcon_now = None
+            else:
+                main_loss = _supervised_contrastive_loss(
+                    pre_emb,
+                    labels_t.to(device),
+                    args.stage1_temperature,
+                )
+                retrieval_stats = {"q_pos": float("nan"), "q_neg": float("nan")}
+                main_loss_name = "lsup"
 
             # Variance regularisation is applied to the pre-normalisation pooled
             # embedding from the same full-Qwen path used in stage 2.
             if args.var_reg_weight > 0.0:
                 std      = torch.sqrt(pre_emb.var(dim=0) + 1e-4)   # (D,)
                 var_loss = torch.relu(1.0 - std).mean()
-                loss     = supcon_loss + args.var_reg_weight * var_loss
+                loss     = main_loss + args.var_reg_weight * var_loss
             else:
-                loss = supcon_loss
+                loss = main_loss
             loss.backward()
 
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1122,26 +1818,36 @@ def main():
                     pre_var_now = (
                         pre_emb.detach().float().var(dim=0).mean().item()
                     )
-                    loss_supcon_now = supcon_loss.item()
+                    if args.train_objective == "disease_retrieval":
+                        loss_retrieval_now = retrieval_loss.item()
+                        loss_supcon_aux_now = supcon_aux.item()
+                        loss_main_now = main_loss.item()
+                    else:
+                        loss_supcon_now = main_loss.item()
+                        loss_main_now = loss_supcon_now
                     var_loss_now = var_loss.item() if args.var_reg_weight > 0.0 else 0.0
 
-                pbar_s1.set_postfix(
-                    loss=f"{loss_now:.4f}",
-                    lsup=f"{loss_supcon_now:.4f}",
-                    cdist=f"{metrics['cdist']:.3f}",
-                    dpp=f"{metrics['d_pp']:.3f}",
-                    dpn=f"{metrics['d_pn']:.3f}",
-                    var=f"{metrics['var_all']:.4f}",
-                    prevar=f"{pre_var_now:.4f}",
-                    gnorm=f"{gnorm_now:.3f}",
-                    lr=f"{lr_now:.2e}",
-                )
+                postfix = {
+                    "loss": f"{loss_now:.4f}",
+                    main_loss_name: f"{loss_main_now:.4f}",
+                    "cdist": f"{metrics['cdist']:.3f}",
+                    "dpp": f"{metrics['d_pp']:.3f}",
+                    "dpn": f"{metrics['d_pn']:.3f}",
+                    "var": f"{metrics['var_all']:.4f}",
+                    "prevar": f"{pre_var_now:.4f}",
+                    "gnorm": f"{gnorm_now:.3f}",
+                    "lr": f"{lr_now:.2e}",
+                }
+                if args.train_objective == "disease_retrieval":
+                    postfix["qpos"] = f"{retrieval_stats['q_pos']:.3f}"
+                    postfix["qneg"] = f"{retrieval_stats['q_neg']:.3f}"
+                    postfix["lsup"] = f"{loss_supcon_aux_now:.4f}"
+                pbar_s1.set_postfix(**postfix)
 
                 if use_wandb and s1_step % args.log_steps == 0:
                     import wandb
-                    wandb.log({
+                    log_dict = {
                         "stage1/loss":         loss_now,
-                        "stage1/loss_supcon":  loss_supcon_now,
                         "stage1/loss_var":     var_loss_now,
                         "stage1/gnorm":        gnorm_now,
                         "stage1/lr":           lr_now,
@@ -1152,42 +1858,167 @@ def main():
                         "stage1/pre_var_all":  pre_var_now,
                         "stage1/var_pos":      metrics["var_pos"],
                         "stage1/var_neg":      metrics["var_neg"],
-                    }, step=s1_step)
+                    }
+                    if args.train_objective == "disease_retrieval":
+                        log_dict["stage1/loss_retrieval"] = loss_retrieval_now
+                        log_dict["stage1/loss_supcon_aux"] = loss_supcon_aux_now
+                        log_dict["stage1/query_pos_score"] = retrieval_stats["q_pos"]
+                        log_dict["stage1/query_neg_score"] = retrieval_stats["q_neg"]
+                    else:
+                        log_dict["stage1/loss_supcon"] = loss_supcon_now
+                    wandb.log(log_dict, step=s1_step)
+
+                if (
+                    eval_triplet_path is not None
+                    and rank == 0
+                    and args.stage1_eval_steps > 0
+                    and s1_step % args.stage1_eval_steps == 0
+                ):
+                    val_acc, val_task_acc, extra_overall, extra_task = evaluate_rank0(
+                        encoder, eval_triplet_path, eval_query_pair_path, args.eval_data_paths, store, device, args
+                    )
+                    logger.info(f"  [stage1 step {s1_step}] val triplet accuracy: {val_acc:.4f}")
+                    logger.info(f"    [pre_emb cosine] {extra_overall['pre_cosine_triplet_acc']:.4f}")
+                    logger.info(f"    [pre_emb l2] {extra_overall['pre_l2_triplet_acc']:.4f}")
+                    if "query_cosine_pair_acc" in extra_overall:
+                        logger.info(f"    [disease_query cosine] {extra_overall['query_cosine_pair_acc']:.4f}")
+                        logger.info(f"    [disease_query l2] {extra_overall['query_l2_pair_acc']:.4f}")
+                    if "query_auc" in extra_overall:
+                        logger.info(f"    [disease_query auc] {extra_overall['query_auc']:.4f}")
+                        logger.info(
+                            f"    [disease_query counts] "
+                            f"n={int(extra_overall.get('query_num_samples', float('nan')))}  "
+                            f"pos={int(extra_overall.get('query_num_pos', float('nan')))}  "
+                            f"neg={int(extra_overall.get('query_num_neg', float('nan')))}"
+                        )
+                    for task, acc in sorted(val_task_acc.items()):
+                        logger.info(f"    {task}: {acc:.4f}")
+                        logger.info(
+                            f"      pre_cos={extra_task[task]['pre_cosine_triplet_acc']:.4f}  "
+                            f"pre_l2={extra_task[task]['pre_l2_triplet_acc']:.4f}"
+                        )
+                    if use_wandb:
+                        import wandb
+                        ld = {
+                            "stage1/step_val_triplet_acc":            val_acc,
+                            "stage1/step_val_pre_cosine_triplet_acc": extra_overall["pre_cosine_triplet_acc"],
+                            "stage1/step_val_pre_l2_triplet_acc":     extra_overall["pre_l2_triplet_acc"],
+                        }
+                        for task, acc in val_task_acc.items():
+                            ld[f"stage1/step_val/{task}/triplet_acc"] = acc
+                            ld[f"stage1/step_val/{task}/pre_cosine_triplet_acc"] = extra_task[task]["pre_cosine_triplet_acc"]
+                            ld[f"stage1/step_val/{task}/pre_l2_triplet_acc"] = extra_task[task]["pre_l2_triplet_acc"]
+                        wandb.log(ld, step=s1_step)
 
         pbar_s1.close()
         if rank == 0:
             logger.info(f"Stage 1 done ({s1_step} steps). Unfreezing LoRA for stage 2 …")
 
-        n_unfrozen = _set_lora_trainable(encoder, True)
-        if rank == 0:
-            logger.info(f"  Unfroze {n_unfrozen} LoRA parameter tensors")
+        if is_ddp:
+            encoder = encoder.module
+            dist.barrier()
+        if uses_qwen_path:
+            n_unfrozen = _set_lora_trainable(encoder, True)
+            if rank == 0:
+                logger.info(f"  Unfroze {n_unfrozen} LoRA parameter tensors")
+        else:
+            if rank == 0:
+                logger.info("  encoder_mode does not use Qwen; keeping LoRA frozen")
+        if is_ddp:
+            encoder = _wrap_ddp_for_stage(
+                encoder, is_ddp=True, local_rank=local_rank, stage="stage2"
+            )
+            dist.barrier()
 
         # Eval after stage 1
         if eval_triplet_path is not None and rank == 0:
             val_acc, val_task_acc, extra_overall, extra_task = evaluate_rank0(
-                encoder, eval_triplet_path, store, device, args
+                encoder, eval_triplet_path, eval_query_pair_path, args.eval_data_paths, store, device, args
             )
             logger.info(f"  [post-stage1] val triplet accuracy: {val_acc:.4f}")
             logger.info(f"    [pre_emb cosine] {extra_overall['pre_cosine_triplet_acc']:.4f}")
             logger.info(f"    [pre_emb l2] {extra_overall['pre_l2_triplet_acc']:.4f}")
+            logger.info(f"    [bert_proj cosine] {extra_overall['proj_cosine_triplet_acc']:.4f}")
+            logger.info(f"    [bert_proj l2] {extra_overall['proj_l2_triplet_acc']:.4f}")
+            logger.info(f"    [raw_event cosine] {extra_overall['raw_cosine_triplet_acc']:.4f}")
+            logger.info(f"    [raw_event l2] {extra_overall['raw_l2_triplet_acc']:.4f}")
+            if "query_cosine_pair_acc" in extra_overall:
+                logger.info(f"    [disease_query cosine] {extra_overall['query_cosine_pair_acc']:.4f}")
+                logger.info(f"    [disease_query l2] {extra_overall['query_l2_pair_acc']:.4f}")
+                if "query_auc" in extra_overall:
+                    logger.info(f"    [disease_query auc] {extra_overall['query_auc']:.4f}")
+                    logger.info(
+                        f"    [disease_query counts] "
+                        f"n={int(extra_overall.get('query_num_samples', float('nan')))}  "
+                        f"pos={int(extra_overall.get('query_num_pos', float('nan')))}  "
+                        f"neg={int(extra_overall.get('query_num_neg', float('nan')))}"
+                    )
+                logger.info(
+                    f"    [disease_query p@10/r@10] "
+                    f"{extra_overall.get('query_precision_at_10', float('nan')):.4f}/"
+                    f"{extra_overall.get('query_recall_at_10', float('nan')):.4f}"
+                )
+                logger.info(
+                    f"    [disease_query p@50/r@50] "
+                    f"{extra_overall.get('query_precision_at_50', float('nan')):.4f}/"
+                    f"{extra_overall.get('query_recall_at_50', float('nan')):.4f}"
+                )
             for task, acc in sorted(val_task_acc.items()):
                 logger.info(f"    {task}: {acc:.4f}")
                 logger.info(
                     f"      pre_cos={extra_task[task]['pre_cosine_triplet_acc']:.4f}  "
-                    f"pre_l2={extra_task[task]['pre_l2_triplet_acc']:.4f}"
+                    f"pre_l2={extra_task[task]['pre_l2_triplet_acc']:.4f}  "
+                    f"proj_cos={extra_task[task]['proj_cosine_triplet_acc']:.4f}  "
+                    f"proj_l2={extra_task[task]['proj_l2_triplet_acc']:.4f}  "
+                    f"raw_cos={extra_task[task]['raw_cosine_triplet_acc']:.4f}  "
+                    f"raw_l2={extra_task[task]['raw_l2_triplet_acc']:.4f}"
                 )
+                if "query_cosine_pair_acc" in extra_task[task] or "query_auc" in extra_task[task]:
+                    logger.info(
+                        f"      query_cos={extra_task[task].get('query_cosine_pair_acc', float('nan')):.4f}  "
+                        f"query_l2={extra_task[task].get('query_l2_pair_acc', float('nan')):.4f}  "
+                        f"query_auc={extra_task[task].get('query_auc', float('nan')):.4f}  "
+                        f"n={int(extra_task[task].get('query_num_samples', float('nan')))}  "
+                        f"pos={int(extra_task[task].get('query_num_pos', float('nan')))}  "
+                        f"neg={int(extra_task[task].get('query_num_neg', float('nan')))}  "
+                        f"p@10={extra_task[task].get('query_precision_at_10', float('nan')):.4f}  "
+                        f"r@10={extra_task[task].get('query_recall_at_10', float('nan')):.4f}  "
+                        f"p@50={extra_task[task].get('query_precision_at_50', float('nan')):.4f}  "
+                        f"r@50={extra_task[task].get('query_recall_at_50', float('nan')):.4f}"
+                    )
             if use_wandb:
                 import wandb
                 ld = {
                     "stage1/val_triplet_acc":            val_acc,
                     "stage1/val_pre_cosine_triplet_acc": extra_overall["pre_cosine_triplet_acc"],
                     "stage1/val_pre_l2_triplet_acc":     extra_overall["pre_l2_triplet_acc"],
+                    "stage1/val_proj_cosine_triplet_acc": extra_overall["proj_cosine_triplet_acc"],
+                    "stage1/val_proj_l2_triplet_acc":     extra_overall["proj_l2_triplet_acc"],
+                    "stage1/val_raw_cosine_triplet_acc":  extra_overall["raw_cosine_triplet_acc"],
+                    "stage1/val_raw_l2_triplet_acc":      extra_overall["raw_l2_triplet_acc"],
                 }
                 for task, acc in val_task_acc.items():
                     ld[f"stage1/val/{task}/triplet_acc"] = acc
                     ld[f"stage1/val/{task}/pre_cosine_triplet_acc"] = extra_task[task]["pre_cosine_triplet_acc"]
                     ld[f"stage1/val/{task}/pre_l2_triplet_acc"] = extra_task[task]["pre_l2_triplet_acc"]
+                    ld[f"stage1/val/{task}/proj_cosine_triplet_acc"] = extra_task[task]["proj_cosine_triplet_acc"]
+                    ld[f"stage1/val/{task}/proj_l2_triplet_acc"] = extra_task[task]["proj_l2_triplet_acc"]
+                    ld[f"stage1/val/{task}/raw_cosine_triplet_acc"] = extra_task[task]["raw_cosine_triplet_acc"]
+                    ld[f"stage1/val/{task}/raw_l2_triplet_acc"] = extra_task[task]["raw_l2_triplet_acc"]
+                    if "query_cosine_pair_acc" in extra_task[task]:
+                        ld[f"stage1/val/{task}/query_cosine_pair_acc"] = extra_task[task]["query_cosine_pair_acc"]
+                        ld[f"stage1/val/{task}/query_l2_pair_acc"] = extra_task[task]["query_l2_pair_acc"]
+                    if "query_auc" in extra_task[task]:
+                        ld[f"stage1/val/{task}/query_auc"] = extra_task[task]["query_auc"]
+                        ld[f"stage1/val/{task}/query_precision_at_10"] = extra_task[task].get("query_precision_at_10", float("nan"))
+                        ld[f"stage1/val/{task}/query_recall_at_10"] = extra_task[task].get("query_recall_at_10", float("nan"))
+                        ld[f"stage1/val/{task}/query_precision_at_50"] = extra_task[task].get("query_precision_at_50", float("nan"))
+                        ld[f"stage1/val/{task}/query_recall_at_50"] = extra_task[task].get("query_recall_at_50", float("nan"))
                 wandb.log(ld, step=s1_step)
+
+            raw_enc = encoder.module if isinstance(encoder, DDP) else encoder
+            raw_enc.save_checkpoint(run_dir / "stage1")
+            logger.info(f"  Saved post-stage1 checkpoint → {run_dir / 'stage1'}")
 
     # Wandb step offset so Stage 2 steps are monotonically after Stage 1 steps.
     wandb_step_offset = s1_step if args.stage1_steps > 0 else 0
@@ -1265,6 +2096,7 @@ def main():
                 break
 
             labels_t = batch["labels"]
+            task_idxs_t = batch["task_idxs"].to(device)
 
             is_update_step = (
                 (batch_idx + 1) % args.grad_accum == 0
@@ -1274,27 +2106,43 @@ def main():
                        else encoder.no_sync()
 
             with sync_ctx:
-                emb, pre_emb = encoder(
-                    batch["event_embs"].to(device),
-                    batch["event_mask"].to(device),
-                    batch["task_idxs"].to(device),
-                    return_pre_emb=True,
+                emb, pre_emb = _forward_embeddings(
+                    encoder, batch, device, args.encoder_mode, return_pre_emb=True
                 )
-                supcon_loss = _supervised_contrastive_loss(
-                    pre_emb, labels_t.to(device), args.stage1_temperature
-                )
-                triplet_loss = _loss_fn(labels_t.to(device), emb)
+                if args.train_objective == "disease_retrieval":
+                    retrieval_loss, retrieval_stats = _disease_retrieval_loss(
+                        encoder,
+                        pre_emb,
+                        task_idxs_t,
+                        labels_t.to(device),
+                        args.retrieval_temperature,
+                    )
+                    supcon_aux = _supervised_contrastive_loss(
+                        pre_emb, labels_t.to(device), args.stage1_temperature
+                    )
+                    main_loss = retrieval_loss + args.retrieval_supcon_weight * supcon_aux
+                    triplet_loss = main_loss.new_zeros(())
+                    supcon_loss = supcon_aux
+                else:
+                    supcon_loss = _supervised_contrastive_loss(
+                        pre_emb, labels_t.to(device), args.stage1_temperature
+                    )
+                    triplet_loss = _loss_fn(labels_t.to(device), emb)
+                    retrieval_stats = {"q_pos": float("nan"), "q_neg": float("nan")}
                 if args.var_reg_weight > 0.0:
                     std = torch.sqrt(pre_emb.var(dim=0) + 1e-4)
                     var_loss = torch.relu(1.0 - std).mean()
                 else:
-                    var_loss = supcon_loss.new_zeros(())
+                    var_loss = pre_emb.new_zeros(())
 
-                loss = (
-                    supcon_loss
-                    + args.var_reg_weight * var_loss
-                    + args.stage2_triplet_weight * triplet_loss
-                )
+                if args.train_objective == "disease_retrieval":
+                    loss = main_loss + args.var_reg_weight * var_loss
+                else:
+                    loss = (
+                        supcon_loss
+                        + args.var_reg_weight * var_loss
+                        + args.stage2_triplet_weight * triplet_loss
+                    )
                 loss = loss / args.grad_accum
                 loss.backward()
 
@@ -1318,29 +2166,39 @@ def main():
                     with torch.no_grad():
                         metrics = _compute_batch_metrics(emb.detach(), labels_t.to(device))
                         pre_var_now = pre_emb.detach().float().var(dim=0).mean().item()
-                        supcon_now = supcon_loss.item()
-                        triplet_now = triplet_loss.item()
+                        if args.train_objective == "disease_retrieval":
+                            retrieval_now = retrieval_loss.item()
+                            supcon_now = supcon_aux.item()
+                            triplet_now = float("nan")
+                        else:
+                            supcon_now = supcon_loss.item()
+                            triplet_now = triplet_loss.item()
                         var_loss_now = var_loss.item() if args.var_reg_weight > 0.0 else 0.0
 
-                    pbar.set_postfix(
-                        loss=f"{loss_now:.4f}",
-                        lsup=f"{supcon_now:.4f}",
-                        ltri=f"{triplet_now:.4f}",
-                        cdist=f"{metrics['cdist']:.3f}",
-                        dpp=f"{metrics['d_pp']:.3f}",
-                        dpn=f"{metrics['d_pn']:.3f}",
-                        var=f"{metrics['var_all']:.4f}",
-                        prevar=f"{pre_var_now:.4f}",
-                        gnorm=f"{gnorm_now:.3f}",
-                        lr=f"{lr_now:.2e}",
-                    )
+                    postfix = {
+                        "loss": f"{loss_now:.4f}",
+                        "cdist": f"{metrics['cdist']:.3f}",
+                        "dpp": f"{metrics['d_pp']:.3f}",
+                        "dpn": f"{metrics['d_pn']:.3f}",
+                        "var": f"{metrics['var_all']:.4f}",
+                        "prevar": f"{pre_var_now:.4f}",
+                        "gnorm": f"{gnorm_now:.3f}",
+                        "lr": f"{lr_now:.2e}",
+                    }
+                    if args.train_objective == "disease_retrieval":
+                        postfix["lret"] = f"{retrieval_now:.4f}"
+                        postfix["lsup"] = f"{supcon_now:.4f}"
+                        postfix["qpos"] = f"{retrieval_stats['q_pos']:.3f}"
+                        postfix["qneg"] = f"{retrieval_stats['q_neg']:.3f}"
+                    else:
+                        postfix["lsup"] = f"{supcon_now:.4f}"
+                        postfix["ltri"] = f"{triplet_now:.4f}"
+                    pbar.set_postfix(**postfix)
 
                     if use_wandb and opt_step % args.log_steps == 0:
                         import wandb
                         log_dict = {
                             "train/loss":         loss_now,
-                            "train/loss_supcon":  supcon_now,
-                            "train/loss_triplet": triplet_now,
                             "train/loss_var":     var_loss_now,
                             "train/gnorm":        gnorm_now,
                             "train/lr_proj":      optimizer.param_groups[0]["lr"],
@@ -1353,9 +2211,89 @@ def main():
                             "train/var_neg":      metrics["var_neg"],
                             "epoch": epoch + (batch_idx + 1) / max(n_batches_this_epoch, 1),
                         }
+                        if args.train_objective == "disease_retrieval":
+                            log_dict["train/loss_retrieval"] = retrieval_now
+                            log_dict["train/loss_supcon_aux"] = supcon_now
+                            log_dict["train/query_pos_score"] = retrieval_stats["q_pos"]
+                            log_dict["train/query_neg_score"] = retrieval_stats["q_neg"]
+                        else:
+                            log_dict["train/loss_supcon"] = supcon_now
+                            log_dict["train/loss_triplet"] = triplet_now
                         if len(optimizer.param_groups) > 1:
                             log_dict["train/lr_lora"] = optimizer.param_groups[1]["lr"]
                         wandb.log(log_dict, step=wandb_step_offset + opt_step)
+
+                    if (
+                        eval_triplet_path is not None
+                        and rank == 0
+                        and args.eval_steps > 0
+                        and opt_step % args.eval_steps == 0
+                    ):
+                        val_acc, val_task_acc, extra_overall, extra_task = evaluate_rank0(
+                            encoder, eval_triplet_path, eval_query_pair_path, args.eval_data_paths, store, device, args
+                        )
+                        logger.info(
+                            f"  [step {opt_step}] val triplet accuracy: {val_acc:.4f}"
+                        )
+                        logger.info(f"    [pre_emb cosine] {extra_overall['pre_cosine_triplet_acc']:.4f}")
+                        logger.info(f"    [pre_emb l2] {extra_overall['pre_l2_triplet_acc']:.4f}")
+                        if "query_cosine_pair_acc" in extra_overall:
+                            logger.info(f"    [disease_query cosine] {extra_overall['query_cosine_pair_acc']:.4f}")
+                            logger.info(f"    [disease_query l2] {extra_overall['query_l2_pair_acc']:.4f}")
+                        if "query_auc" in extra_overall:
+                            logger.info(f"    [disease_query auc] {extra_overall['query_auc']:.4f}")
+                            logger.info(
+                                f"    [disease_query counts] "
+                                f"n={int(extra_overall.get('query_num_samples', float('nan')))}  "
+                                f"pos={int(extra_overall.get('query_num_pos', float('nan')))}  "
+                                f"neg={int(extra_overall.get('query_num_neg', float('nan')))}"
+                            )
+                            logger.info(
+                                f"    [disease_query p@10/r@10] "
+                                f"{extra_overall.get('query_precision_at_10', float('nan')):.4f}/"
+                                f"{extra_overall.get('query_recall_at_10', float('nan')):.4f}"
+                            )
+                        for task, acc in sorted(val_task_acc.items()):
+                            logger.info(f"    {task}: {acc:.4f}")
+                            logger.info(
+                                f"      pre_cos={extra_task[task]['pre_cosine_triplet_acc']:.4f}  "
+                                f"pre_l2={extra_task[task]['pre_l2_triplet_acc']:.4f}"
+                            )
+                            if "query_cosine_pair_acc" in extra_task[task] or "query_auc" in extra_task[task]:
+                                logger.info(
+                                    f"      query_cos={extra_task[task].get('query_cosine_pair_acc', float('nan')):.4f}  "
+                                    f"query_l2={extra_task[task].get('query_l2_pair_acc', float('nan')):.4f}  "
+                                    f"query_auc={extra_task[task].get('query_auc', float('nan')):.4f}  "
+                                    f"n={int(extra_task[task].get('query_num_samples', float('nan')))}  "
+                                    f"pos={int(extra_task[task].get('query_num_pos', float('nan')))}  "
+                                    f"neg={int(extra_task[task].get('query_num_neg', float('nan')))}  "
+                                    f"p@10={extra_task[task].get('query_precision_at_10', float('nan')):.4f}  "
+                                    f"r@10={extra_task[task].get('query_recall_at_10', float('nan')):.4f}  "
+                                    f"p@50={extra_task[task].get('query_precision_at_50', float('nan')):.4f}  "
+                                    f"r@50={extra_task[task].get('query_recall_at_50', float('nan')):.4f}"
+                                )
+                        if use_wandb:
+                            import wandb
+                            log_dict = {
+                                "val/step_triplet_acc":            val_acc,
+                                "val/step_pre_cosine_triplet_acc": extra_overall["pre_cosine_triplet_acc"],
+                                "val/step_pre_l2_triplet_acc":     extra_overall["pre_l2_triplet_acc"],
+                                "epoch": epoch + (batch_idx + 1) / max(n_batches_this_epoch, 1),
+                            }
+                            for task, acc in val_task_acc.items():
+                                log_dict[f"val/step/{task}/triplet_acc"] = acc
+                                log_dict[f"val/step/{task}/pre_cosine_triplet_acc"] = extra_task[task]["pre_cosine_triplet_acc"]
+                                log_dict[f"val/step/{task}/pre_l2_triplet_acc"] = extra_task[task]["pre_l2_triplet_acc"]
+                                if "query_cosine_pair_acc" in extra_task[task]:
+                                    log_dict[f"val/step/{task}/query_cosine_pair_acc"] = extra_task[task]["query_cosine_pair_acc"]
+                                    log_dict[f"val/step/{task}/query_l2_pair_acc"] = extra_task[task]["query_l2_pair_acc"]
+                                if "query_auc" in extra_task[task]:
+                                    log_dict[f"val/step/{task}/query_auc"] = extra_task[task]["query_auc"]
+                                    log_dict[f"val/step/{task}/query_precision_at_10"] = extra_task[task].get("query_precision_at_10", float("nan"))
+                                    log_dict[f"val/step/{task}/query_recall_at_10"] = extra_task[task].get("query_recall_at_10", float("nan"))
+                                    log_dict[f"val/step/{task}/query_precision_at_50"] = extra_task[task].get("query_precision_at_50", float("nan"))
+                                    log_dict[f"val/step/{task}/query_recall_at_50"] = extra_task[task].get("query_recall_at_50", float("nan"))
+                            wandb.log(log_dict, step=wandb_step_offset + opt_step)
 
             epoch_loss += loss.item() * args.grad_accum
 
@@ -1367,23 +2305,69 @@ def main():
         # ── Eval ──────────────────────────────────────────────────────────────
         if eval_triplet_path is not None and rank == 0:
             val_acc, val_task_acc, extra_overall, extra_task = evaluate_rank0(
-                encoder, eval_triplet_path, store, device, args
+                encoder, eval_triplet_path, eval_query_pair_path, args.eval_data_paths, store, device, args
             )
             logger.info(f"  val triplet accuracy: {val_acc:.4f}")
             logger.info(f"    [pre_emb cosine] {extra_overall['pre_cosine_triplet_acc']:.4f}")
             logger.info(f"    [pre_emb l2] {extra_overall['pre_l2_triplet_acc']:.4f}")
+            logger.info(f"    [bert_proj cosine] {extra_overall['proj_cosine_triplet_acc']:.4f}")
+            logger.info(f"    [bert_proj l2] {extra_overall['proj_l2_triplet_acc']:.4f}")
+            logger.info(f"    [raw_event cosine] {extra_overall['raw_cosine_triplet_acc']:.4f}")
+            logger.info(f"    [raw_event l2] {extra_overall['raw_l2_triplet_acc']:.4f}")
+            if "query_cosine_pair_acc" in extra_overall:
+                logger.info(f"    [disease_query cosine] {extra_overall['query_cosine_pair_acc']:.4f}")
+                logger.info(f"    [disease_query l2] {extra_overall['query_l2_pair_acc']:.4f}")
+            if "query_auc" in extra_overall:
+                logger.info(f"    [disease_query auc] {extra_overall['query_auc']:.4f}")
+                logger.info(
+                    f"    [disease_query counts] "
+                    f"n={int(extra_overall.get('query_num_samples', float('nan')))}  "
+                    f"pos={int(extra_overall.get('query_num_pos', float('nan')))}  "
+                    f"neg={int(extra_overall.get('query_num_neg', float('nan')))}"
+                )
+                logger.info(
+                    f"    [disease_query p@10/r@10] "
+                    f"{extra_overall.get('query_precision_at_10', float('nan')):.4f}/"
+                    f"{extra_overall.get('query_recall_at_10', float('nan')):.4f}"
+                )
+                logger.info(
+                    f"    [disease_query p@50/r@50] "
+                    f"{extra_overall.get('query_precision_at_50', float('nan')):.4f}/"
+                    f"{extra_overall.get('query_recall_at_50', float('nan')):.4f}"
+                )
             for task, acc in sorted(val_task_acc.items()):
                 logger.info(f"    {task}: {acc:.4f}")
                 logger.info(
                     f"      pre_cos={extra_task[task]['pre_cosine_triplet_acc']:.4f}  "
-                    f"pre_l2={extra_task[task]['pre_l2_triplet_acc']:.4f}"
+                    f"pre_l2={extra_task[task]['pre_l2_triplet_acc']:.4f}  "
+                    f"proj_cos={extra_task[task]['proj_cosine_triplet_acc']:.4f}  "
+                    f"proj_l2={extra_task[task]['proj_l2_triplet_acc']:.4f}  "
+                    f"raw_cos={extra_task[task]['raw_cosine_triplet_acc']:.4f}  "
+                    f"raw_l2={extra_task[task]['raw_l2_triplet_acc']:.4f}"
                 )
+                if "query_cosine_pair_acc" in extra_task[task] or "query_auc" in extra_task[task]:
+                    logger.info(
+                        f"      query_cos={extra_task[task].get('query_cosine_pair_acc', float('nan')):.4f}  "
+                        f"query_l2={extra_task[task].get('query_l2_pair_acc', float('nan')):.4f}  "
+                        f"query_auc={extra_task[task].get('query_auc', float('nan')):.4f}  "
+                        f"n={int(extra_task[task].get('query_num_samples', float('nan')))}  "
+                        f"pos={int(extra_task[task].get('query_num_pos', float('nan')))}  "
+                        f"neg={int(extra_task[task].get('query_num_neg', float('nan')))}  "
+                        f"p@10={extra_task[task].get('query_precision_at_10', float('nan')):.4f}  "
+                        f"r@10={extra_task[task].get('query_recall_at_10', float('nan')):.4f}  "
+                        f"p@50={extra_task[task].get('query_precision_at_50', float('nan')):.4f}  "
+                        f"r@50={extra_task[task].get('query_recall_at_50', float('nan')):.4f}"
+                    )
             if use_wandb:
                 import wandb
                 log_dict = {
                     "val/triplet_acc":            val_acc,
                     "val/pre_cosine_triplet_acc": extra_overall["pre_cosine_triplet_acc"],
                     "val/pre_l2_triplet_acc":     extra_overall["pre_l2_triplet_acc"],
+                    "val/proj_cosine_triplet_acc": extra_overall["proj_cosine_triplet_acc"],
+                    "val/proj_l2_triplet_acc":     extra_overall["proj_l2_triplet_acc"],
+                    "val/raw_cosine_triplet_acc":  extra_overall["raw_cosine_triplet_acc"],
+                    "val/raw_l2_triplet_acc":      extra_overall["raw_l2_triplet_acc"],
                     "train/epoch_loss":           avg_loss,
                     "epoch":                      epoch + 1,
                 }
@@ -1391,6 +2375,19 @@ def main():
                     log_dict[f"val/{task}/triplet_acc"] = acc
                     log_dict[f"val/{task}/pre_cosine_triplet_acc"] = extra_task[task]["pre_cosine_triplet_acc"]
                     log_dict[f"val/{task}/pre_l2_triplet_acc"] = extra_task[task]["pre_l2_triplet_acc"]
+                    log_dict[f"val/{task}/proj_cosine_triplet_acc"] = extra_task[task]["proj_cosine_triplet_acc"]
+                    log_dict[f"val/{task}/proj_l2_triplet_acc"] = extra_task[task]["proj_l2_triplet_acc"]
+                    log_dict[f"val/{task}/raw_cosine_triplet_acc"] = extra_task[task]["raw_cosine_triplet_acc"]
+                    log_dict[f"val/{task}/raw_l2_triplet_acc"] = extra_task[task]["raw_l2_triplet_acc"]
+                    if "query_cosine_pair_acc" in extra_task[task]:
+                        log_dict[f"val/{task}/query_cosine_pair_acc"] = extra_task[task]["query_cosine_pair_acc"]
+                        log_dict[f"val/{task}/query_l2_pair_acc"] = extra_task[task]["query_l2_pair_acc"]
+                    if "query_auc" in extra_task[task]:
+                        log_dict[f"val/{task}/query_auc"] = extra_task[task]["query_auc"]
+                        log_dict[f"val/{task}/query_precision_at_10"] = extra_task[task].get("query_precision_at_10", float("nan"))
+                        log_dict[f"val/{task}/query_recall_at_10"] = extra_task[task].get("query_recall_at_10", float("nan"))
+                        log_dict[f"val/{task}/query_precision_at_50"] = extra_task[task].get("query_precision_at_50", float("nan"))
+                        log_dict[f"val/{task}/query_recall_at_50"] = extra_task[task].get("query_recall_at_50", float("nan"))
                 wandb.log(log_dict, step=wandb_step_offset + opt_step)
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
