@@ -221,6 +221,16 @@ class ShallowMLPLayer(nn.Module):
         return hidden_states
 
 
+class ResidualMLPBlock(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int, dtype: torch.dtype):
+        super().__init__()
+        self.norm = nn.RMSNorm(hidden_size).to(dtype)
+        self.mlp = QwenStyleMLP(hidden_size, intermediate_size, dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.mlp(self.norm(x))
+
+
 class DiseaseAwareEHREncoder(nn.Module):
     """Qwen model conditioned on disease via per-task prefix token embeddings.
 
@@ -250,15 +260,19 @@ class DiseaseAwareEHREncoder(nn.Module):
         task_prefix_mask: torch.Tensor,   # (num_tasks, max_P)  0=pad, 1=real
         middle_ids:       torch.Tensor,   # (1, P2)
         task_text_embs:   torch.Tensor,   # (num_tasks, bert_dim) BioLinkBERT disease text embeddings
+        disease_encoder_type: str = "query_head",
         shallow_encoder_type: str = "transformer",
         shallow_num_layers: int = 2,
         shallow_num_heads: int = 4,
         shallow_intermediate_size: int | None = None,
+        disease_head_layers: int = 0,
+        disease_head_intermediate_size: int | None = None,
         dtype:            torch.dtype = torch.float32,
     ):
         super().__init__()
         self.qwen        = qwen_model
         self.dtype       = dtype
+        self.disease_encoder_type = disease_encoder_type
         self.shallow_encoder_type = shallow_encoder_type
         self.shallow_num_layers = shallow_num_layers
         self.input_norm  = nn.RMSNorm(bert_dim).to(dtype)
@@ -288,6 +302,7 @@ class DiseaseAwareEHREncoder(nn.Module):
         else:
             self.shallow_layers = nn.ModuleList()
         shallow_out_dim = bert_dim if shallow_encoder_type in {"transformer", "mlp"} else qwen_dim
+        disease_head_intermediate_size = disease_head_intermediate_size or (shallow_out_dim * 4)
         num_tasks        = task_prefix_ids.size(0)
         self.task_input_emb = nn.Embedding(num_tasks, bert_dim).to(dtype)
         self.task_input_scale = nn.Parameter(torch.tensor(1e-3, dtype=dtype))
@@ -298,6 +313,14 @@ class DiseaseAwareEHREncoder(nn.Module):
         self.film_gamma = nn.Embedding(num_tasks, shallow_out_dim).to(dtype)
         self.film_beta  = nn.Embedding(num_tasks, shallow_out_dim).to(dtype)
         self.task_query_proj = nn.Linear(bert_dim, shallow_out_dim, bias=False).to(dtype)
+        self.disease_head_layers = nn.ModuleList([
+            ResidualMLPBlock(
+                hidden_size=shallow_out_dim,
+                intermediate_size=disease_head_intermediate_size,
+                dtype=dtype,
+            )
+            for _ in range(disease_head_layers)
+        ])
         self.task_cross_attn = nn.MultiheadAttention(
             embed_dim=shallow_out_dim,
             num_heads=4,
@@ -335,6 +358,35 @@ class DiseaseAwareEHREncoder(nn.Module):
             self.register_buffer("middle_embeds", embed_fn(middle_ids).to(dtype))  # (1, P2, D)
             eos_ids = torch.full((1, 1), EOS_TOKEN_ID, dtype=torch.long)
             self.register_buffer("eos_embed",    embed_fn(eos_ids).to(dtype))       # (1,  1, D)
+
+    def encode_task_query(self, task_idx: torch.Tensor) -> torch.Tensor:
+        if self.disease_encoder_type == "shared_backbone":
+            text_emb = self.task_text_embs[task_idx].to(self.dtype)  # (B, bert_dim)
+            tokens = text_emb.unsqueeze(1)  # (B, 1, bert_dim)
+            mask = torch.ones(tokens.size(0), 1, device=tokens.device, dtype=torch.long)
+            if self.shallow_encoder_type == "transformer":
+                hidden = tokens
+                if self.shallow_num_layers > 0:
+                    pos_emb = self.shallow_rotary(hidden.size(1), hidden.device, hidden.dtype)
+                    for layer in self.shallow_layers:
+                        hidden = layer(hidden, mask, pos_emb)
+                return hidden.squeeze(1)
+            if self.shallow_encoder_type == "mlp":
+                hidden = tokens
+                if self.shallow_num_layers > 0:
+                    for layer in self.shallow_layers:
+                        hidden = layer(hidden, mask)
+                return hidden.squeeze(1)
+            if self.shallow_encoder_type == "simple":
+                normed = self.input_norm(tokens)
+                proj = self.bert_proj_2(F.gelu(self.bert_proj_1(normed)))
+                return proj.squeeze(1)
+            raise ValueError(f"Unknown shallow_encoder_type: {self.shallow_encoder_type}")
+
+        query = self.task_query_proj(self.task_text_embs[task_idx])
+        for layer in self.disease_head_layers:
+            query = layer(query)
+        return query
 
     def forward(
         self,
@@ -404,7 +456,7 @@ class DiseaseAwareEHREncoder(nn.Module):
                     beta  = self.film_beta(task_idx).to(pre_emb.dtype)
                     pre_emb = (1.0 + gamma) * pre_emb + beta
                 elif condition_mode == "xattn":
-                    task_query = self.task_query_proj(self.task_text_embs[task_idx]).to(pre_emb.dtype)
+                    task_query = self.encode_task_query(task_idx).to(pre_emb.dtype)
                     attn_out, _ = self.task_cross_attn(
                         query=task_query.unsqueeze(1),
                         key=shallow_tokens,
@@ -414,7 +466,7 @@ class DiseaseAwareEHREncoder(nn.Module):
                     )
                     pre_emb = pre_emb + self.task_xattn_scale * attn_out.squeeze(1)
                 elif condition_mode == "xattn_pool":
-                    task_query = self.task_query_proj(self.task_text_embs[task_idx]).to(pre_emb.dtype)
+                    task_query = self.encode_task_query(task_idx).to(pre_emb.dtype)
                     attn_out, _ = self.task_cross_attn(
                         query=task_query.unsqueeze(1),
                         key=shallow_tokens,
@@ -424,7 +476,7 @@ class DiseaseAwareEHREncoder(nn.Module):
                     )
                     pre_emb = attn_out.squeeze(1)
                 elif condition_mode == "query_proto":
-                    text_query = self.task_query_proj(self.task_text_embs[task_idx]).to(pre_emb.dtype)
+                    text_query = self.encode_task_query(task_idx).to(pre_emb.dtype)
                     proto_query = self.task_proto_emb(task_idx).to(pre_emb.dtype)
                     fused_query = self.query_fuse(torch.cat([text_query, proto_query], dim=-1))
                     attn_out, _ = self.task_cross_attn(
@@ -491,6 +543,7 @@ class DiseaseAwareEHREncoder(nn.Module):
                 "input_norm":  self.input_norm.state_dict(),
                 "shallow_layers": self.shallow_layers.state_dict(),
                 "shallow_encoder_type": self.shallow_encoder_type,
+                "disease_encoder_type": self.disease_encoder_type,
                 "task_input_emb": self.task_input_emb.state_dict(),
                 "task_input_scale": self.task_input_scale.detach().cpu(),
                 "task_cond_emb": self.task_cond_emb.state_dict(),
@@ -500,6 +553,7 @@ class DiseaseAwareEHREncoder(nn.Module):
                 "film_gamma": self.film_gamma.state_dict(),
                 "film_beta":  self.film_beta.state_dict(),
                 "task_query_proj": self.task_query_proj.state_dict(),
+                "disease_head_layers": self.disease_head_layers.state_dict(),
                 "task_cross_attn": self.task_cross_attn.state_dict(),
                 "task_xattn_scale": self.task_xattn_scale.detach().cpu(),
                 "task_proto_emb": self.task_proto_emb.state_dict(),
@@ -520,15 +574,21 @@ class DiseaseAwareEHREncoder(nn.Module):
         task_prefix_mask: torch.Tensor,
         middle_ids:       torch.Tensor,
         task_text_embs:   torch.Tensor,
+        disease_encoder_type: str = "query_head",
         shallow_num_layers: int = 2,
         shallow_num_heads: int = 4,
         shallow_intermediate_size: int | None = None,
+        disease_head_layers: int = 0,
+        disease_head_intermediate_size: int | None = None,
         dtype:            torch.dtype = torch.float32,
     ) -> "DiseaseAwareEHREncoder":
         qwen_lora = PeftModel.from_pretrained(qwen_base, str(save_dir / "lora"))
         encoder   = cls(
             qwen_lora, bert_dim, qwen_dim,
             task_prefix_ids, task_prefix_mask, middle_ids, task_text_embs,
+            disease_encoder_type=disease_encoder_type,
+            disease_head_layers=disease_head_layers,
+            disease_head_intermediate_size=disease_head_intermediate_size,
             shallow_num_layers=shallow_num_layers,
             shallow_num_heads=shallow_num_heads,
             shallow_intermediate_size=shallow_intermediate_size,
@@ -559,6 +619,8 @@ class DiseaseAwareEHREncoder(nn.Module):
             encoder.film_beta.load_state_dict(extra["film_beta"])
         if "task_query_proj" in extra:
             encoder.task_query_proj.load_state_dict(extra["task_query_proj"])
+        if "disease_head_layers" in extra:
+            encoder.disease_head_layers.load_state_dict(extra["disease_head_layers"])
         if "task_cross_attn" in extra:
             encoder.task_cross_attn.load_state_dict(extra["task_cross_attn"])
         if "task_xattn_scale" in extra:

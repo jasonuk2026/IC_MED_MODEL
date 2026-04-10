@@ -72,6 +72,9 @@ def parse_args():
     p.add_argument("--shallow_num_layers", type=int, default=2)
     p.add_argument("--shallow_num_heads", type=int, default=4)
     p.add_argument("--shallow_intermediate_size", type=int, default=None)
+    p.add_argument("--disease_encoder_type", choices=["query_head", "shared_backbone"], default="query_head")
+    p.add_argument("--disease_head_layers", type=int, default=0)
+    p.add_argument("--disease_head_intermediate_size", type=int, default=None)
     p.add_argument("--flash_attn", action="store_true")
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--fp16", action="store_true")
@@ -103,6 +106,9 @@ def _build_model_args(args) -> SimpleNamespace:
         shallow_num_layers=args.shallow_num_layers,
         shallow_num_heads=args.shallow_num_heads,
         shallow_intermediate_size=args.shallow_intermediate_size,
+        disease_encoder_type=args.disease_encoder_type,
+        disease_head_layers=args.disease_head_layers,
+        disease_head_intermediate_size=args.disease_head_intermediate_size,
     )
 
 
@@ -119,6 +125,13 @@ def load_encoder_for_viz(args, device: torch.device):
         is_ddp=False,
     )
     extra = torch.load(Path(args.checkpoint) / "extra_modules.pt", map_location="cpu")
+    saved_disease_encoder_type = extra.get("disease_encoder_type", "query_head")
+    if saved_disease_encoder_type != args.disease_encoder_type:
+        logger.warning(
+            "Checkpoint disease_encoder_type=%s but current args specify %s; visualization may be inconsistent.",
+            saved_disease_encoder_type,
+            args.disease_encoder_type,
+        )
     encoder.bert_proj_1.load_state_dict(extra["bert_proj_1"])
     encoder.bert_proj_2.load_state_dict(extra["bert_proj_2"])
     if "input_norm" in extra:
@@ -143,6 +156,8 @@ def load_encoder_for_viz(args, device: torch.device):
         encoder.film_beta.load_state_dict(extra["film_beta"])
     if "task_query_proj" in extra:
         encoder.task_query_proj.load_state_dict(extra["task_query_proj"])
+    if "disease_head_layers" in extra:
+        encoder.disease_head_layers.load_state_dict(extra["disease_head_layers"])
     if "task_cross_attn" in extra:
         encoder.task_cross_attn.load_state_dict(extra["task_cross_attn"])
     if "task_xattn_scale" in extra:
@@ -192,7 +207,8 @@ def encode_rows(encoder, rows, store, args, device):
         )
         all_pre.append(pre_emb.cpu())
     pre = torch.cat(all_pre, dim=0)
-    query_bank = encoder.task_query_proj(encoder.task_text_embs.to(device)).float().cpu()
+    all_task_idx = torch.arange(encoder.task_text_embs.size(0), device=device, dtype=torch.long)
+    query_bank = encoder.encode_task_query(all_task_idx).float().cpu()
     task_idxs = torch.tensor([r["task_idx"] for r in rows], dtype=torch.long)
     queries = query_bank[task_idxs]
     query_scores = torch.nn.functional.cosine_similarity(queries, pre, dim=1).numpy()
@@ -475,7 +491,8 @@ def main():
     store = EmbeddingStore(args.bert_embeddings)
     encoder = load_encoder_for_viz(args, device)
     patient_pre, query_scores = encode_rows(encoder, rows, store, args, device)
-    query_bank = encoder.task_query_proj(encoder.task_text_embs.to(device)).float().detach().cpu().numpy()
+    all_task_idx = torch.arange(encoder.task_text_embs.size(0), device=device, dtype=torch.long)
+    query_bank = encoder.encode_task_query(all_task_idx).float().detach().cpu().numpy()
     query_vecs = query_bank[np.array([r["task_idx"] for r in rows], dtype=np.int64)]
     rel_pre = patient_pre - query_vecs
 

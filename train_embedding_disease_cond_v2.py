@@ -574,6 +574,7 @@ def _make_param_groups(
             *raw_enc.film_gamma.parameters(),
             *raw_enc.film_beta.parameters(),
             *raw_enc.task_query_proj.parameters(),
+            *raw_enc.disease_head_layers.parameters(),
             *raw_enc.task_cross_attn.parameters(),
             raw_enc.task_xattn_scale,
             *raw_enc.task_proto_emb.parameters(),
@@ -697,7 +698,7 @@ def _disease_retrieval_loss(
 
     # Prepared training batches are single-task; use the batch task query.
     task_id = task_idxs[0]
-    query = raw_enc.task_query_proj(raw_enc.task_text_embs[task_id].unsqueeze(0).to(feat.device))
+    query = raw_enc.encode_task_query(task_id.unsqueeze(0).to(feat.device))
     query = torch.nn.functional.normalize(query.float(), p=2, dim=-1).squeeze(0)  # (D,)
 
     scores = (feat @ query) / temperature  # (B,)
@@ -1011,6 +1012,9 @@ def build_encoder(qwen_model, tokenizer, args, device: torch.device, rank: int, 
         shallow_num_layers = args.shallow_num_layers,
         shallow_num_heads = args.shallow_num_heads,
         shallow_intermediate_size = args.shallow_intermediate_size,
+        disease_encoder_type = args.disease_encoder_type,
+        disease_head_layers = args.disease_head_layers,
+        disease_head_intermediate_size = args.disease_head_intermediate_size,
         dtype            = dtype,
     )
     logger.info(
@@ -1034,6 +1038,14 @@ def build_encoder(qwen_model, tokenizer, args, device: torch.device, rank: int, 
         logger.info(
             f"  Event encoder: RMSNorm → Linear({BERT_DIM}→{BERT_DIM}) → GELU → Linear({BERT_DIM}→{qwen_dim})  dtype={dtype}"
         )
+    if args.disease_encoder_type == "shared_backbone":
+        logger.info("  Disease encoder: shared shallow backbone (siamese) over disease embeddings")
+    else:
+        logger.info(
+            f"  Disease head: base linear projection + {args.disease_head_layers} residual MLP block(s)  "
+            f"intermediate={args.disease_head_intermediate_size or 'default'}"
+        )
+    logger.info(f"  Disease encoder type: {args.disease_encoder_type}")
 
     total     = sum(p.numel() for p in encoder.parameters())
     trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
@@ -1228,7 +1240,8 @@ def evaluate_rank0(
         neg_pre = pair_pre[1::2]
         pair_tasks = pair_task_idxs[0::2]
 
-        raw_query = raw_encoder.task_query_proj(raw_encoder.task_text_embs.to(device)).float().cpu()
+        all_task_idx = torch.arange(raw_encoder.task_text_embs.size(0), device=device, dtype=torch.long)
+        raw_query = raw_encoder.encode_task_query(all_task_idx).float().cpu()
         q_vecs = raw_query[pair_tasks]
 
         sim_pos = torch.nn.functional.cosine_similarity(q_vecs, pos_pre, dim=1)
@@ -1275,7 +1288,8 @@ def evaluate_rank0(
                 all_val_pre.append(pre_emb.cpu())
             val_pre_embs = torch.cat(all_val_pre, dim=0)
 
-            query_bank = raw_encoder.task_query_proj(raw_encoder.task_text_embs.to(device)).float().cpu()
+            all_task_idx = torch.arange(raw_encoder.task_text_embs.size(0), device=device, dtype=torch.long)
+            query_bank = raw_encoder.encode_task_query(all_task_idx).float().cpu()
             query_vecs = query_bank[val_task_idxs]
             query_scores = torch.nn.functional.cosine_similarity(query_vecs, val_pre_embs, dim=1)
 
@@ -1351,6 +1365,14 @@ def parse_args():
                    help="Number of attention heads in the lightweight event Transformer.")
     p.add_argument("--shallow_intermediate_size", type=int, default=None,
                    help="Intermediate size of the lightweight Transformer MLP. Defaults to 4 * qwen_dim.")
+    p.add_argument("--disease_head_layers", type=int, default=0,
+                   help="Number of residual MLP blocks on top of disease text embeddings before retrieval/query use.")
+    p.add_argument("--disease_head_intermediate_size", type=int, default=None,
+                   help="Intermediate size of the disease head MLP blocks. Defaults to 4 * query dim.")
+    p.add_argument("--disease_encoder_type", choices=["query_head", "shared_backbone"], default="query_head",
+                   help="How to encode disease text embeddings for retrieval. "
+                        "'query_head' uses a separate learnable disease-side head; "
+                        "'shared_backbone' sends disease embeddings through the same shallow backbone as patients.")
     p.add_argument("--encoder_mode", choices=["full", "proj", "proj_cond", "proj_cond_token_pre", "proj_cond_residual", "proj_cond_film", "proj_cond_xattn", "proj_cond_xattn_pool", "proj_cond_query_proto", "raw"], default="full",
                    help="Embedding path to optimise/evaluate. "
                         "'full' = proj + Qwen, 'proj' = bert_proj mean-pool, "
@@ -1512,10 +1534,16 @@ def main():
         encoder = build_encoder(qwen_lora, tokenizer, args, device, rank, is_ddp)
         extra = torch.load(Path(args.checkpoint) / "extra_modules.pt", map_location="cpu")
         saved_shallow_type = extra.get("shallow_encoder_type", "simple")
+        saved_disease_encoder_type = extra.get("disease_encoder_type", "query_head")
         if saved_shallow_type != args.shallow_encoder_type:
             logger.warning(
                 f"Checkpoint shallow_encoder_type={saved_shallow_type} but current args specify "
                 f"{args.shallow_encoder_type}; loading may fail or behave unexpectedly."
+            )
+        if saved_disease_encoder_type != args.disease_encoder_type:
+            logger.warning(
+                f"Checkpoint disease_encoder_type={saved_disease_encoder_type} but current args specify "
+                f"{args.disease_encoder_type}; loading may fail or behave unexpectedly."
             )
         encoder.bert_proj_1.load_state_dict(extra["bert_proj_1"])
         encoder.bert_proj_2.load_state_dict(extra["bert_proj_2"])
@@ -1541,6 +1569,8 @@ def main():
             encoder.film_beta.load_state_dict(extra["film_beta"])
         if "task_query_proj" in extra:
             encoder.task_query_proj.load_state_dict(extra["task_query_proj"])
+        if "disease_head_layers" in extra:
+            encoder.disease_head_layers.load_state_dict(extra["disease_head_layers"])
         if "task_cross_attn" in extra:
             encoder.task_cross_attn.load_state_dict(extra["task_cross_attn"])
         if "task_xattn_scale" in extra:
