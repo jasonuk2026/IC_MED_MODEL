@@ -278,7 +278,7 @@ class DiseaseEventSoftTokenClassifier(nn.Module):
         if return_features:
             return logits, aux_logits, disease_hidden.float(), head_hidden.float(), event_pooled.float()
         if return_aux_logits:
-            return logits, aux_logits
+            return logits, aux_logits, disease_hidden.float(), event_pooled.float()
         return logits
 
     def save_checkpoint(self, save_dir: Path):

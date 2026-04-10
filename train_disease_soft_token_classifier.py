@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -74,6 +75,7 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--prefetch_factor", type=int, default=4)
     p.add_argument("--aux_loss_weight", type=float, default=0.0)
+    p.add_argument("--align_loss_weight", type=float, default=0.0)
 
     p.add_argument("--wandb_project", default=None)
     p.add_argument("--wandb_run_name", default=None)
@@ -252,7 +254,7 @@ def main():
 
         for batch_idx, batch in enumerate(pbar):
             labels = batch["labels"].to(device).float()
-            logits, aux_logits = model(
+            logits, aux_logits, disease_hidden, event_pooled = model(
                 batch["event_embs"].to(device),
                 batch["event_mask"].to(device),
                 batch["task_idxs"].to(device),
@@ -260,7 +262,11 @@ def main():
             )
             main_loss = loss_fn(logits, labels)
             aux_loss = loss_fn(aux_logits, labels)
-            loss = (main_loss + args.aux_loss_weight * aux_loss) / args.grad_accum
+            align_loss = F.mse_loss(
+                F.normalize(event_pooled.float(), dim=-1),
+                F.normalize(disease_hidden.float(), dim=-1),
+            )
+            loss = (main_loss + args.aux_loss_weight * aux_loss + args.align_loss_weight * align_loss) / args.grad_accum
             loss.backward()
 
             is_update_step = ((batch_idx + 1) % args.grad_accum == 0) or ((batch_idx + 1) == len(epoch_ds))
@@ -284,6 +290,7 @@ def main():
                     loss=f"{loss.item() * args.grad_accum:.4f}",
                     lmain=f"{main_loss.item():.4f}",
                     laux=f"{aux_loss.item():.4f}",
+                    lalign=f"{align_loss.item():.4f}",
                     posp=f"{probs[labels == 1].mean().item():.3f}" if (labels == 1).any() else "nan",
                     negp=f"{probs[labels == 0].mean().item():.3f}" if (labels == 0).any() else "nan",
                     gnorm=f"{float(grad_norm):.3f}" if not isinstance(grad_norm, float) or not math.isnan(grad_norm) else "nan",

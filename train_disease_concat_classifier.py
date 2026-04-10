@@ -201,13 +201,22 @@ def evaluate_classifier(
             "neg_prob_mean": task_probs[task_labels == 0].mean().item() if (task_labels == 0).any() else float("nan"),
         }
 
+    if per_task:
+        overall["macro_auc"] = float(np.mean([stats["auc"] for stats in per_task.values()]))
+        overall["macro_accuracy"] = float(np.mean([stats["accuracy"] for stats in per_task.values()]))
+    else:
+        overall["macro_auc"] = float("nan")
+        overall["macro_accuracy"] = float("nan")
+
     raw_model.train()
     return overall, per_task
 
 
 def _log_eval(prefix: str, overall: dict[str, float], per_task: dict[str, dict[str, float]]):
     logger.info("%s val auc: %.4f", prefix, overall["auc"])
+    logger.info("%s val macro_auc: %.4f", prefix, overall["macro_auc"])
     logger.info("%s val accuracy: %.4f", prefix, overall["accuracy"])
+    logger.info("%s val macro_accuracy: %.4f", prefix, overall["macro_accuracy"])
     logger.info(
         "%s counts: n=%d  pos=%d  neg=%d",
         prefix,
