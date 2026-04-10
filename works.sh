@@ -135,3 +135,28 @@ torchrun --nproc_per_node=4 train_disease_concat_classifier.py \
   --head_layers 1 \
   --wandb_project medical_cond_embed \
   --wandb_tags concat_classifier
+
+torchrun --nproc_per_node=4 train_disease_soft_token_classifier.py \
+  --train_data_dir data/llm_data_ixc_patch \
+  --train_data_epochs 3 \
+  --eval_data_paths data/llm_eval_data_ixc/new_acutemi/val.parquet data/llm_eval_data_ixc/new_celiac/val.parquet data/llm_eval_data_ixc/new_hyperlipidemia/val.parquet data/llm_eval_data_ixc/new_hypertension/val.parquet data/llm_eval_data_ixc/new_lupus/val.parquet data/llm_eval_data_ixc/new_pancan/val.parquet \
+  --bert_embeddings data/embeddings.npy \
+  --bf16 \
+  --batch_size 32 \
+  --eval_batch_size 32 \
+  --pad_to_num_events 1000 \
+  --num_workers 4 \
+  --prefetch_factor 8 \
+  --lr 2e-4 \
+  --warmup_ratio 0.1 \
+  --weight_decay 0.005 \
+  --grad_clip 1.0 \
+  --hidden_size 768 \
+  --num_layers 1 \
+  --num_heads 4 \
+  --head_layers 1 \
+  --pos_weight 1.0 \
+  --wandb_project medical_cond_embed \
+  --wandb_tags soft_token_classifier
+
+torchrun --nproc_per_node=4 train_disease_soft_token_classifier.py   --train_data_dir EHRSHOT_ASSETS/llm_data_v7   --eval_data_paths data/llm_eval_data_ixc/new_acutemi/val.parquet data/llm_eval_data_ixc/new_celiac/val.parquet data/llm_eval_data_ixc/new_hyperlipidemia/val.parquet data/llm_eval_data_ixc/new_hypertension/val.parquet data/llm_eval_data_ixc/new_lupus/val.parquet data/llm_eval_data_ixc/new_pancan/val.parquet   --bert_embeddings data/embeddings.npy   --bf16   --batch_size 32   --eval_batch_size 32   --pad_to_num_events 1000   --num_workers 4   --prefetch_factor 8   --lr 2e-4   --warmup_ratio 0.1   --weight_decay 0.005   --grad_clip 1.0   --hidden_size 768   --num_layers 2   --num_heads 4   --head_layers 1   --pos_weight 1.0   --wandb_project medical_cond_embed   --wandb_tags soft_token_classifier --position_type learned --attention_type bidirectional
