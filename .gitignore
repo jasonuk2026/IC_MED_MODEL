@@ -28,6 +28,7 @@ results*/
 
 core
 logs/
+wandb/
 toy*.*
 output/
 extract_bio_emb.py

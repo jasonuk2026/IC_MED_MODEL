@@ -39,7 +39,6 @@ _CODE_2_DESC: dict[str, str] = {}
 _INCLUDE_CONDITION_OCCURRENCE = False
 _EOS_TOKEN_ID = None
 _BLOCK_SIZE = None
-_DROP_LAST = False
 
 
 def load_code_description_map(data_dir: Path) -> dict[str, str]:
@@ -84,32 +83,26 @@ def format_event_row(ev: pd.Series, code_2_desc: dict[str, str], include_conditi
         return None
 
     code = str(ev["code"])
+    event_type = OMOP_TABLE_PREFIX.get(ev["omop_table"], ev["omop_table"])
+    time = str(ev["start"])[:16]
     description = code_2_desc.get(code)
     value = normalize_optional_float(ev["value"])
     unit = normalize_optional_str(ev["unit"])
 
-    event = {
-        "time": str(ev["start"])[:16],
-        "type": OMOP_TABLE_PREFIX.get(ev["omop_table"], ev["omop_table"]),
-        "table": ev["omop_table"],
-        "code": code,
-        "description": description,
-        "value": value,
-        "unit": unit,
-    }
-    return json.dumps(event, ensure_ascii=False)
+    label = f"{code} {description}" if description else code
+    parts = [f"[{event_type}]", time, "|", label]
+    if value is not None:
+        val_str = f"{value:g}"
+        if unit:
+            val_str += f" {unit}"
+        parts.append(val_str)
+
+    return " ".join(parts)
 
 
-def chunk_list(xs: list[int], block_size: int, drop_last: bool) -> list[list[int]]:
+def chunk_list(xs: list[int], block_size: int) -> list[list[int]]:
     n_full = len(xs) // block_size
-    blocks = [xs[i * block_size : (i + 1) * block_size] for i in range(n_full)]
-    rem = len(xs) % block_size
-    if rem and not drop_last:
-        tail = xs[n_full * block_size :]
-        if len(tail) < block_size:
-            tail = tail + [0] * (block_size - len(tail))
-        blocks.append(tail)
-    return blocks
+    return [xs[i * block_size : (i + 1) * block_size] for i in range(n_full)]
 
 
 def _init_worker(
@@ -120,16 +113,14 @@ def _init_worker(
     include_condition_occurrence: bool,
     eos_token_id: int,
     block_size: int,
-    drop_last: bool,
 ):
-    global _PATIENT_GROUPS, _TOKENIZER, _CODE_2_DESC, _INCLUDE_CONDITION_OCCURRENCE, _EOS_TOKEN_ID, _BLOCK_SIZE, _DROP_LAST
+    global _PATIENT_GROUPS, _TOKENIZER, _CODE_2_DESC, _INCLUDE_CONDITION_OCCURRENCE, _EOS_TOKEN_ID, _BLOCK_SIZE
     _PATIENT_GROUPS = patient_groups
     _TOKENIZER = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=local_files_only)
     _CODE_2_DESC = code_2_desc
     _INCLUDE_CONDITION_OCCURRENCE = include_condition_occurrence
     _EOS_TOKEN_ID = eos_token_id
     _BLOCK_SIZE = block_size
-    _DROP_LAST = drop_last
 
 
 def _process_patient(patient_id: int) -> tuple[list[dict], int, int]:
@@ -157,12 +148,12 @@ def _process_patient(patient_id: int) -> tuple[list[dict], int, int]:
     if not patient_tokens:
         return [], valid_events, 0
 
-    blocks = chunk_list(patient_tokens, _BLOCK_SIZE, drop_last=_DROP_LAST)
+    blocks = chunk_list(patient_tokens, _BLOCK_SIZE)
     rows = [
         {
             "patient_id": int(patient_id),
             "block_idx": int(block_idx),
-            "num_tokens": int(_BLOCK_SIZE if _DROP_LAST or len(block) == _BLOCK_SIZE else len(block)),
+            "num_tokens": _BLOCK_SIZE,
             "input_ids": [int(x) for x in block],
         }
         for block_idx, block in enumerate(blocks)
@@ -180,7 +171,6 @@ def parse_args():
     p.add_argument("--ehr_csv", default=None, help="Override raw EHR CSV path; defaults to <data_dir>/data/ehrshot.csv")
     p.add_argument("--output_path", required=True, help="Output parquet path")
     p.add_argument("--block_size", type=int, required=True, help="Fixed token length N for each row/block")
-    p.add_argument("--drop_last", action="store_true", help="Drop the final short block per patient")
     p.add_argument("--include_condition_occurrence", action="store_true", help="Keep condition_occurrence rows")
     p.add_argument("--max_patients", type=int, default=None, help="Optional cap for quick experiments")
     p.add_argument("--local_files_only", action="store_true")
@@ -209,11 +199,20 @@ def main():
     code_2_desc = load_code_description_map(data_dir)
 
     print(f"Reading raw EHR CSV: {ehr_csv}")
-    df_ehr = pd.read_csv(ehr_csv, low_memory=False, dtype={"value": str, "unit": str})
-    if df_ehr.columns[0] == "" or str(df_ehr.columns[0]).startswith("Unnamed"):
-        df_ehr = df_ehr.drop(columns=[df_ehr.columns[0]])
+    chunks = []
+    for chunk in tqdm(
+        pd.read_csv(ehr_csv, low_memory=False, dtype={"value": str, "unit": str}, chunksize=500_000),
+        desc="reading CSV",
+        unit="chunk",
+        dynamic_ncols=True,
+    ):
+        if chunk.columns[0] == "" or str(chunk.columns[0]).startswith("Unnamed"):
+            chunk = chunk.drop(columns=[chunk.columns[0]])
+        chunks.append(chunk)
+    df_ehr = pd.concat(chunks, ignore_index=True)
+    del chunks
     df_ehr["start"] = pd.to_datetime(df_ehr["start"])
-    df_ehr = df_ehr.sort_values(["patient_id", "start"]).reset_index(drop=True)
+    df_ehr = df_ehr.sort_values(["patient_id", "start"], ascending=[True, False]).reset_index(drop=True)
     print(f"Loaded {len(df_ehr):,} raw events across {df_ehr['patient_id'].nunique():,} patients")
 
     patient_ids = df_ehr["patient_id"].drop_duplicates().tolist()
@@ -223,6 +222,21 @@ def main():
         print(f"Restricted to first {len(patient_ids):,} patients for this run")
 
     patient_groups = {int(pid): pdf for pid, pdf in df_ehr.groupby("patient_id", sort=False)}
+
+    # Preview: show the first few formatted event strings for the first patient
+    first_pid = next(iter(patient_groups))
+    sample_texts = []
+    for _, ev in patient_groups[first_pid].iterrows():
+        t = format_event_row(ev, code_2_desc, args.include_condition_occurrence)
+        if t:
+            sample_texts.append(t)
+        if len(sample_texts) >= 5:
+            break
+    print(f"\n--- Sample event strings (patient {first_pid}) ---")
+    for t in sample_texts:
+        print(" ", t)
+    print("---\n")
+
     rows: list[dict] = []
     total_event_count = 0
     total_token_count = 0
@@ -240,7 +254,6 @@ def main():
             args.include_condition_occurrence,
             int(eos_token_id),
             args.block_size,
-            args.drop_last,
         ),
     ) as pool:
         for patient_rows, event_count, token_count in tqdm(
@@ -276,7 +289,6 @@ def main():
         "eos_token": eos_token,
         "eos_token_id": int(eos_token_id),
         "block_size": args.block_size,
-        "drop_last": bool(args.drop_last),
         "include_condition_occurrence": bool(args.include_condition_occurrence),
         "num_blocks": len(rows),
         "num_patients": len({r["patient_id"] for r in rows}),
