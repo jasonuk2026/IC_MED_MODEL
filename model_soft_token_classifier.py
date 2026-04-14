@@ -84,7 +84,12 @@ class TransformerBlock(nn.Module):
         nn.init.xavier_uniform_(self.fc1.weight)
         nn.init.zeros_(self.fc2.weight)
 
-    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+        return_attn_probs: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         residual = x
         attn_in = self.attn_norm(x)
         seq_len = attn_in.size(1)
@@ -113,14 +118,16 @@ class TransformerBlock(nn.Module):
             probs = torch.softmax(scores.float(), dim=-1).to(scores.dtype)
             attn_out = torch.matmul(probs, v).permute(0, 2, 1, 3).reshape(bsz, seq_len, hidden)
             attn_out = self.o_proj(attn_out)
+            attn_probs = probs
         else:
-            attn_out, _ = self.attn(
+            attn_out, attn_probs = self.attn(
                 attn_in,
                 attn_in,
                 attn_in,
                 attn_mask=causal_mask,
                 key_padding_mask=key_padding_mask,
-                need_weights=False,
+                need_weights=return_attn_probs,
+                average_attn_weights=False,
             )
         x = residual + self.dropout(attn_out)
 
@@ -128,6 +135,8 @@ class TransformerBlock(nn.Module):
         mlp_in = self.mlp_norm(x)
         mlp_out = self.fc2(F.gelu(self.fc1(mlp_in)))
         x = residual + self.dropout(mlp_out)
+        if return_attn_probs:
+            return x, attn_probs
         return x
 
 
@@ -280,6 +289,58 @@ class DiseaseEventSoftTokenClassifier(nn.Module):
         if return_aux_logits:
             return logits, aux_logits, disease_hidden.float(), event_pooled.float()
         return logits
+
+    @torch.inference_mode()
+    def get_disease_event_attention(
+        self,
+        event_embs: torch.Tensor,
+        event_mask: torch.Tensor,
+        task_idx: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        event_tokens = self.event_proj(self.event_norm(event_embs.to(self.dtype)))
+        event_tokens, event_mask = self._left_pad_events(event_tokens, event_mask)
+        disease_token = self.disease_proj(self.disease_norm(self.task_text_embs[task_idx].to(self.dtype))).unsqueeze(1)
+        event_seq_len = event_tokens.size(1)
+        if event_seq_len > self.max_positions:
+            raise ValueError(f"Event sequence length {event_seq_len} exceeds max_positions={self.max_positions}")
+        if self.position_type == "learned":
+            pos_ids = torch.arange(event_seq_len, device=event_tokens.device)
+            event_pos = self.pos_emb(pos_ids).unsqueeze(0)
+            event_tokens = event_tokens + event_pos * event_mask.to(event_tokens.dtype).unsqueeze(-1)
+        tokens = torch.cat([event_tokens, disease_token], dim=1)
+
+        batch_size = event_mask.size(0)
+        disease_mask = torch.ones(batch_size, 1, device=event_mask.device, dtype=event_mask.dtype)
+        full_mask = torch.cat([event_mask, disease_mask], dim=1)
+        key_padding_mask = ~full_mask.bool()
+
+        hidden = tokens
+        last_attn = None
+        for i, layer in enumerate(self.layers):
+            if i == len(self.layers) - 1:
+                hidden, last_attn = layer(hidden, key_padding_mask=key_padding_mask, return_attn_probs=True)
+            else:
+                hidden = layer(hidden, key_padding_mask=key_padding_mask)
+
+        disease_hidden = hidden[:, -1].float()
+        event_hidden = hidden[:, :-1].float()
+        event_pooled = (event_hidden * event_mask.unsqueeze(-1).float()).sum(1) / event_mask.sum(1, keepdim=True).clamp(min=1).float()
+
+        # last_attn: [B, H, T, T], disease token is the last query position.
+        disease_attn = last_attn[:, :, -1, :-1].float()
+        disease_attn = disease_attn * event_mask.unsqueeze(1).float()
+        attn_sum = disease_attn.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        disease_attn = disease_attn / attn_sum
+        mean_attn = disease_attn.mean(dim=1)
+
+        return {
+            "disease_hidden": disease_hidden,
+            "event_hidden": event_hidden,
+            "event_pooled": event_pooled,
+            "event_mask": event_mask.float(),
+            "attn_per_head": disease_attn,
+            "attn_mean": mean_attn,
+        }
 
     def save_checkpoint(self, save_dir: Path):
         save_dir.mkdir(parents=True, exist_ok=True)
