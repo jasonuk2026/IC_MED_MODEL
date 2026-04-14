@@ -299,7 +299,8 @@ class DiseaseEventSoftTokenClassifier(nn.Module):
     ) -> dict[str, torch.Tensor]:
         event_tokens = self.event_proj(self.event_norm(event_embs.to(self.dtype)))
         event_tokens, event_mask = self._left_pad_events(event_tokens, event_mask)
-        disease_token = self.disease_proj(self.disease_norm(self.task_text_embs[task_idx].to(self.dtype))).unsqueeze(1)
+        disease_input = self.disease_proj(self.disease_norm(self.task_text_embs[task_idx].to(self.dtype)))
+        disease_token = disease_input.unsqueeze(1)
         event_seq_len = event_tokens.size(1)
         if event_seq_len > self.max_positions:
             raise ValueError(f"Event sequence length {event_seq_len} exceeds max_positions={self.max_positions}")
@@ -334,6 +335,7 @@ class DiseaseEventSoftTokenClassifier(nn.Module):
         mean_attn = disease_attn.mean(dim=1)
 
         return {
+            "disease_input": disease_input.float(),
             "disease_hidden": disease_hidden,
             "event_hidden": event_hidden,
             "event_pooled": event_pooled,

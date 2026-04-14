@@ -147,13 +147,16 @@ def main():
         event_mask,
         torch.tensor([task_idx], device=device),
     )
+    disease_input = attn_info["disease_input"][0].cpu().numpy()
     disease_hidden = attn_info["disease_hidden"][0].cpu().numpy()
     attn = attn_info["attn_mean"][0, -len(eids) :].cpu().numpy()
     top_k = min(args.top_k, len(eids))
     top_idx = np.argsort(-attn)[:top_k]
 
     print(f"task={args.task} label={args.label} sample_rank={sample_rank} score={score:.6f} num_events={len(eids)}")
-    print("disease_hidden=")
+    print("disease_input_embedding=")
+    print(np.array2string(disease_input, precision=4, suppress_small=False, max_line_width=160))
+    print("disease_hidden_embedding=")
     print(np.array2string(disease_hidden, precision=4, suppress_small=False, max_line_width=160))
     print(f"top_{top_k}_events_by_attention:")
     for rank_idx, event_pos in enumerate(top_idx, start=1):
