@@ -1,21 +1,10 @@
 #!/usr/bin/env python3
 """
-Encode unique events from a parquet index into Bio/BERT-style embeddings.
+Encode unique events with a Qwen embedding model for comparison against BERT.
 
-This mirrors the overall flow of `extract_bio_emb.py`, but instead of scanning
-ehrshot.csv directly, it reads the pre-extracted unique-event parquet from
-`encode_events/extract_event_parquet.py` and renders each row into text with a
-Jinja2 template.
-
-Outputs:
-  <output_dir>/embeddings.npy
-      Float32 array where row i matches event_id == i.
-  <output_dir>/<template_name>.j2
-      Copy of the exact Jinja template used for rendering.
-
-Distributed behavior:
-  - world_size > 1: save rank-local shards, then merge on rank 0
-  - world_size == 1: write embeddings.npy directly, no shard merge step
+This mirrors `encode_events/encode_event_bert.py`, but defaults to
+`Qwen/Qwen3-Embedding-0.6B` and uses Qwen-style last-token pooling instead of
+BERT mean pooling.
 """
 
 from __future__ import annotations
@@ -26,15 +15,16 @@ import logging
 import os
 import shutil
 import time
-from pathlib import Path
 from contextlib import nullcontext
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import torch
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision("high")
 import torch.distributed as dist
+import torch.nn.functional as F
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
@@ -48,6 +38,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def last_token_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Pool the hidden state at the final real token, handling left padding."""
+    left_padded = bool((attention_mask[:, -1] == 1).all().item())
+    if left_padded:
+        return last_hidden_state[:, -1]
+    seq_lens = attention_mask.sum(dim=1) - 1
+    batch_idx = torch.arange(last_hidden_state.size(0), device=last_hidden_state.device)
+    return last_hidden_state[batch_idx, seq_lens]
+
+
 @torch.inference_mode()
 def encode_slice(
     texts: list[str],
@@ -56,13 +56,12 @@ def encode_slice(
     device: torch.device,
     batch_size: int,
     max_length: int,
-    special_ids: set[int],
     rank: int,
     use_amp: bool,
     amp_dtype: torch.dtype | None,
+    normalize: bool,
     desc: str = "Encoding",
 ) -> tuple[np.ndarray, dict[str, float]]:
-    """Encode a list of texts to a float32 numpy array of shape (N, H)."""
     model.eval()
     all_embs: list[np.ndarray] = []
     total_steps = 0
@@ -98,13 +97,12 @@ def encode_slice(
             torch.cuda.synchronize(device)
         t1 = time.time()
 
-        embs = mean_pool_no_special(
-            out.last_hidden_state,
-            enc["input_ids"],
-            enc["attention_mask"],
-            special_ids,
-        )
-        all_embs.append(embs.float().cpu().numpy())
+        embs = last_token_pool(out.last_hidden_state, enc["attention_mask"])
+        if normalize:
+            embs = F.normalize(embs.float(), p=2, dim=1)
+        else:
+            embs = embs.float()
+        all_embs.append(embs.cpu().numpy())
         total_steps += 1
         total_model_time += (t1 - t0)
 
@@ -118,23 +116,6 @@ def encode_slice(
         "total_model_time": float(total_model_time),
     }
     return arr, stats
-
-
-def mean_pool_no_special(
-    last_hidden_state: torch.Tensor,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    special_token_ids: set[int],
-) -> torch.Tensor:
-    """Mean pool over non-padding, non-special tokens."""
-    special = torch.zeros_like(attention_mask, dtype=torch.bool)
-    for sid in special_token_ids:
-        special |= (input_ids == sid)
-    pool_mask = attention_mask.bool() & ~special
-    pool_mask_f = pool_mask.float().unsqueeze(-1)
-    sum_emb = (last_hidden_state * pool_mask_f).sum(dim=1)
-    count = pool_mask_f.sum(dim=1).clamp(min=1e-9)
-    return sum_emb / count
 
 
 def parse_args():
@@ -151,16 +132,17 @@ def parse_args():
     )
     p.add_argument(
         "--model_name",
-        default="michiyasunaga/BioLinkBERT-base",
-        help="HuggingFace model name or local path.",
+        default="Qwen/Qwen3-Embedding-0.6B",
+        help="HF Qwen embedding model name or local path.",
     )
-    p.add_argument("--output_dir", default="encode_events_result/bert")
+    p.add_argument("--output_dir", default="encode_events_result/qwen")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--max_length", type=int, default=256)
     p.add_argument("--compile", action="store_true", help="Enable torch.compile for the model.")
     p.add_argument("--amp", action="store_true", help="Enable autocast during model forward.")
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--fp16", action="store_true")
+    p.add_argument("--normalize", action="store_true", help="L2-normalize embeddings before saving.")
     p.add_argument("--local_files_only", action="store_true")
     return p.parse_args()
 
@@ -219,8 +201,7 @@ def read_event_slice(event_parquet: str, start: int, end: int) -> pd.DataFrame:
 
     if not chunks:
         return pd.DataFrame(columns=columns)
-    event_df = pd.concat(chunks, ignore_index=True)
-    return event_df
+    return pd.concat(chunks, ignore_index=True)
 
 
 def load_and_render_events(event_parquet: str, template_path: str, start: int, end: int) -> pd.DataFrame:
@@ -342,9 +323,9 @@ def main():
     logger.info("[Rank %d] Loading %s ...", rank, args.model_name)
     model_kwargs: dict[str, object] = {}
     if args.fp16:
-        model_kwargs["dtype"] = torch.float16
+        model_kwargs["torch_dtype"] = torch.float16
     elif args.bf16:
-        model_kwargs["dtype"] = torch.bfloat16
+        model_kwargs["torch_dtype"] = torch.bfloat16
     if args.local_files_only:
         model_kwargs["local_files_only"] = True
 
@@ -352,15 +333,18 @@ def main():
         args.model_name,
         **({} if not args.local_files_only else {"local_files_only": True}),
     )
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     model = AutoModel.from_pretrained(args.model_name, **model_kwargs).to(device)
     model.eval()
     if args.compile:
         model = torch.compile(model, dynamic=False)
-    special_ids = set(tokenizer.all_special_ids)
     amp_dtype = resolve_amp_dtype(args, device)
 
     logger.info(
-        "[Rank %d] Encoding %s texts (of %s total, world_size=%d, amp=%s, amp_dtype=%s, compile=%s) ...",
+        "[Rank %d] Encoding %s texts (of %s total, world_size=%d, amp=%s, amp_dtype=%s, compile=%s, normalize=%s) ...",
         rank,
         f"{len(texts):,}",
         f"{n_total:,}",
@@ -368,6 +352,7 @@ def main():
         "on" if args.amp else "off",
         str(amp_dtype).replace("torch.", "") if amp_dtype is not None else "n/a",
         "on" if args.compile else "off",
+        "on" if args.normalize else "off",
     )
     embs, local_stats = encode_slice(
         texts,
@@ -376,22 +361,17 @@ def main():
         device,
         batch_size=args.batch_size,
         max_length=args.max_length,
-        special_ids=special_ids,
         rank=rank,
         use_amp=args.amp,
         amp_dtype=amp_dtype,
+        normalize=args.normalize,
         desc=f"[Rank {rank}]",
     )
 
     local_model_time = float(local_stats["total_model_time"])
     local_steps = int(local_stats["total_steps"])
     local_ms_step = (1000.0 * local_model_time / local_steps) if local_steps > 0 else 0.0
-    logger.info(
-        "[Rank %d] Timing: %.1f ms/step across %d steps",
-        rank,
-        local_ms_step,
-        local_steps,
-    )
+    logger.info("[Rank %d] Timing: %.1f ms/step across %d steps", rank, local_ms_step, local_steps)
 
     if is_dist:
         shard_npy = shard_dir / f"shard_{rank:04d}.npy"

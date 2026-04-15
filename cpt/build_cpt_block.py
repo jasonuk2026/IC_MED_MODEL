@@ -151,17 +151,17 @@ def parse_args():
         description="Build fixed-length token blocks for CPT from raw EHR CSV",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--tokenizer_name", default="Qwen/Qwen3-0.6B-Base", help="Tokenizer name or local path, e.g. Qwen/Qwen3-0.6B-Base")
+    p.add_argument("--tokenizer_name", default="Qwen/Qwen3-0.6B", help="Tokenizer name or local path, e.g. Qwen/Qwen3-0.6B-Base")
     p.add_argument("--data_dir", default="EHRSHOT_ASSETS", help="EHRSHOT asset root containing data/ehrshot.csv and models/clmbr/*")
     p.add_argument("--ehr_csv", default=None, help="Override raw EHR CSV path; defaults to <data_dir>/data/ehrshot.csv")
-    p.add_argument("--unique_event_parquet", default="EHRSHOT_ASSETS/features/unique_event_rows_plus_cond_fast.parquet", help="Unique-event parquet used to build the token cache")
-    p.add_argument("--output_path", default="EHRSHOT_ASSETS/cpt_blocks/qwen3_0.6b_block2048.parquet", help="Output parquet path")
+    p.add_argument("--unique_event_parquet", default="init_files/unique_event_rows_plus_cond_fast.parquet", help="Unique-event parquet used to build the token cache")
+    p.add_argument("--output_path", default="cpt_inputs/qwen3_0.6b_block2048.parquet", help="Output parquet path")
     p.add_argument("--block_size", type=int, default=2048, help="Fixed token length N for each row/block")
     p.add_argument("--template_path", default="encode_events/event_to_text.j2", help="Jinja2 template used to render each event")
     p.add_argument("--include_condition_occurrence", action="store_true", help="Keep condition_occurrence rows")
     p.add_argument("--max_patients", type=int, default=None, help="Optional cap for quick experiments")
     p.add_argument("--local_files_only", action="store_true")
-    p.add_argument("--num_workers", type=int, default=None, help="Patient-level worker processes (default: cpu_count)")
+    p.add_argument("--num_workers", type=int, default=16, help="Patient-level worker processes (default: cpu_count)")
     p.add_argument("--tokenize_batch_size", type=int, default=4096, help="Batch size used when tokenizing unique events")
     return p.parse_args()
 
@@ -202,7 +202,7 @@ def main():
     df_ehr = pd.concat(chunks, ignore_index=True)
     del chunks
     df_ehr["start"] = pd.to_datetime(df_ehr["start"])
-    df_ehr = df_ehr.sort_values(["patient_id", "start"], ascending=[True, False]).reset_index(drop=True)
+    df_ehr = df_ehr.sort_values(["patient_id", "start"], ascending=[True, True]).reset_index(drop=True)
     print(f"Loaded {len(df_ehr):,} raw events across {df_ehr['patient_id'].nunique():,} patients")
 
     patient_ids = df_ehr["patient_id"].drop_duplicates().tolist()
@@ -223,6 +223,7 @@ def main():
     print(f"Unique events to tokenize: {len(key_df):,}")
 
     sample_texts = []
+    sample_times = []
     for _, row in key_df.head(5).iterrows():
         t = format_event_row(row, args.include_condition_occurrence)
         if t:
@@ -231,6 +232,23 @@ def main():
     for t in sample_texts:
         print(" ", t)
     print("---\n")
+
+    # Preview chronological order for one patient so the left-to-right token order is explicit.
+    first_pid = next(iter(patient_groups))
+    first_events = patient_groups[first_pid]
+    for _, ev in first_events.iterrows():
+        if (not args.include_condition_occurrence) and ev["omop_table"] == "condition_occurrence":
+            continue
+        sample_times.append(str(ev["start"])[:19])
+        if len(sample_times) >= 2:
+            break
+    if len(sample_times) >= 2:
+        print("--- Chronological order preview ---")
+        print(f" patient_id={first_pid}")
+        print(f" left event time : {sample_times[0]}")
+        print(f" right event time: {sample_times[1]}")
+        print(" token stream order is old -> new (left -> right)")
+        print("---\n")
 
     unique_texts: list[str] = []
     unique_keys: list[tuple[str, str, str, str]] = []
