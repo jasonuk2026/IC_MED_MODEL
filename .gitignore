@@ -37,3 +37,6 @@ figures/retrieval_viz/
 figures/classifier_score_distributions/
 cpt_trial
 encode_events_result
+
+cpt_inputs
+cpt_outputs

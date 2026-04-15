@@ -172,7 +172,7 @@ def parse_args():
     p.add_argument("--local_files_only", action="store_true")
     # Training
     p.add_argument("--epochs",           type=int,   default=1)
-    p.add_argument("--batch_size",       type=int,   default=4,    help="Per-GPU batch size")
+    p.add_argument("--batch_size",       type=int,   default=8,    help="Per-GPU batch size")
     p.add_argument("--grad_accum",       type=int,   default=8,    help="Gradient accumulation steps")
     p.add_argument("--lr",               type=float, default=1e-4)
     p.add_argument("--weight_decay",     type=float, default=0.1)
@@ -254,7 +254,7 @@ def main():
     if args.fa2:
         attn_implementation = "flash_attention_2"
     if args.fa3:
-        attn_implementation = 'varunneal/flash-attention-3'
+        attn_implementation = 'flash_attention_3'
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         dtype=dtype,
