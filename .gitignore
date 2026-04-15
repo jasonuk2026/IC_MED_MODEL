@@ -13,7 +13,7 @@ venv/
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
-
+llm_data_ixc_patch
 # OS
 .DS_Store
 
@@ -25,13 +25,14 @@ venv/
 cmd.md
 results*/
 *.zip
+*.npy
 
 core
 logs/
 wandb/
 toy*.*
 output/
-extract_bio_emb.py
 run_sm_cpu.sh
 figures/retrieval_viz/
 figures/classifier_score_distributions/
+cpt_trial
