@@ -36,3 +36,4 @@ run_sm_cpu.sh
 figures/retrieval_viz/
 figures/classifier_score_distributions/
 cpt_trial
+encode_events_result

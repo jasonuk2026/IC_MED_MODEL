@@ -180,7 +180,8 @@ def parse_args():
     p.add_argument("--warmup_ratio",     type=float, default=0.05, help="Fraction of total steps used for warmup")
     # Efficiency
     p.add_argument("--gradient_checkpointing", action="store_true")
-    p.add_argument("--flash_attn", action="store_true", help="Use Flash Attention 2")
+    p.add_argument("--fa2", action="store_true", help="Use Flash Attention 2")
+    p.add_argument("--fa3", action="store_true", help="Use Flash Attention 3")
     p.add_argument("--compile",    action="store_true", help="torch.compile the model")
     p.add_argument("--num_workers",  type=int, default=4, help="DataLoader workers per GPU")
     # Checkpointing
@@ -249,10 +250,15 @@ def main():
     # ── Model ──────────────────────────────────────────────────────────────────
     logger.info(f"Loading model: {args.model_name}")
     dtype = torch.bfloat16
+    attn_implementation = "eager"
+    if args.fa2:
+        attn_implementation = "flash_attention_2"
+    if args.fa3:
+        attn_implementation = 'varunneal/flash-attention-3'
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         dtype=dtype,
-        attn_implementation="flash_attention_2" if args.flash_attn else "eager",
+        attn_implementation=attn_implementation,
         local_files_only=args.local_files_only,
     ).to(device)
 
