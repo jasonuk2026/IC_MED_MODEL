@@ -43,3 +43,4 @@ cpt_outputs
 *_data
 *.npz
 *ckpt
+*data*
