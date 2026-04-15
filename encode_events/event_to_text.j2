@@ -1,0 +1,15 @@
+{%- if event_type -%}
+{{ event_type }}:
+{%- endif -%}
+ {%- set same_label = description and code and (description | trim) == (code | trim) -%}
+{%- if description and code and not same_label -%}
+{{ description }} | code={{ code }}
+{%- elif code -%}
+{{ code }}
+{%- elif description -%}
+{{ description }}
+{%- else -%}
+unknown event
+{%- endif -%}
+{%- if value %} | value={{ value }}{% endif -%}
+{%- if unit %} | unit={{ unit }}{% endif -%}
