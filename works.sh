@@ -186,3 +186,44 @@ conda run -n torch python inspect_soft_token_attention.py \
   --top_k 4
 
 CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_disease_soft_token_classifier.py   --train_data_dir ./llm_data_ixc_patch --eval_data_paths EHRSHOT_ASSETS/llm_eval_data/*/val.parquet --bert_embeddings encode_events_result/embeddings.npy --bf16 --batch_size 32 --eval_batch_size 32 --pad_to_num_events 1000 --num_workers 4 --prefetch_factor 8 --lr 2e-4 --warmup_ratio 0.1 --weight_decay 0.005 --grad_clip 1.0 --hidden_size 768 --num_layers 2 --num_heads 4 --head_layers 1 --pos_weight 1.0 --wandb_project medical_cond_embed --wandb_tags soft_token_classifier --position_type learned --attention_type bidirectional --aux_loss_weight 0.2 --align_loss_weight 0.1 --train_data_epochs 0
+
+
+torchrun --nproc_per_node=2 train_disease_soft_token_classifier_extracted.py \
+  --event_embedding_dir encode_events_result/bert \
+  --data_dir extracted_task_data \
+  --max_events 1000 \
+  --bf16 \
+  --batch_size 32 \
+  --eval_batch_size 32
+
+
+
+source ~/miniforge3/bin/activate torch
+python dataset/build_oversampled_extracted_task_data.py \
+  --task new_hyperlipidemia \
+  --splits train \
+  --input_dir extracted_task_data \
+  --output_dir upsampled_data \
+  --max_events 1024 \
+  --epoch_idx 0
+
+source ~/miniforge3/bin/activate torch
+python dataset/prepare_embedded_task_data.py \
+  --task new_hyperlipidemia \
+  --input_dir upsampled_data \
+  --output_dir upsampled_assembled_data \
+  --event_embedding_dir encode_events_result/bert \
+  --epochs 5 \
+  --max_events 1024
+
+python train_disease_transformer_classifier_extracted_single.py \
+  --task new_hyperlipidemia \
+  --train_data_dir upsampled_data \
+  --eval_data_dir extracted_task_data \
+  --event_embedding_dir encode_events_result/bert \
+  --hidden_size 768 \
+  --num_heads 4 \
+  --batch_size 32 \
+  --eval_batch_size 32 \
+  --epochs 5 --num_workers 16
+

@@ -3,8 +3,8 @@
 Encode unique events with a Qwen embedding model for comparison against BERT.
 
 This mirrors `encode_events/encode_event_bert.py`, but defaults to
-`Qwen/Qwen3-Embedding-0.6B` and uses Qwen-style last-token pooling instead of
-BERT mean pooling.
+`Qwen/Qwen3-Embedding-0.6B` and uses mean pooling over real tokens, without
+adding any special tokens.
 """
 
 from __future__ import annotations
@@ -38,14 +38,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def last_token_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Pool the hidden state at the final real token, handling left padding."""
-    left_padded = bool((attention_mask[:, -1] == 1).all().item())
-    if left_padded:
-        return last_hidden_state[:, -1]
-    seq_lens = attention_mask.sum(dim=1) - 1
-    batch_idx = torch.arange(last_hidden_state.size(0), device=last_hidden_state.device)
-    return last_hidden_state[batch_idx, seq_lens]
+def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """Mean-pool hidden states across real tokens only."""
+    mask = attention_mask.to(last_hidden_state.dtype).unsqueeze(-1)
+    return (last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
 
 
 @torch.inference_mode()
@@ -79,6 +75,7 @@ def encode_slice(
             padding=True,
             truncation=True,
             max_length=max_length,
+            add_special_tokens=False,
             return_tensors="pt",
         ).to(device)
 
@@ -97,7 +94,7 @@ def encode_slice(
             torch.cuda.synchronize(device)
         t1 = time.time()
 
-        embs = last_token_pool(out.last_hidden_state, enc["attention_mask"])
+        embs = mean_pool(out.last_hidden_state, enc["attention_mask"])
         if normalize:
             embs = F.normalize(embs.float(), p=2, dim=1)
         else:
@@ -122,7 +119,7 @@ def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument(
         "--event_parquet",
-        default="EHRSHOT_ASSETS/features/unique_event_rows_plus_cond_fast.parquet",
+        default="unique_event_pq_data/unique_event_rows_plus_cond_fast.parquet",
         help="Unique-event parquet from encode_events/extract_event_parquet.py",
     )
     p.add_argument(
@@ -132,11 +129,11 @@ def parse_args():
     )
     p.add_argument(
         "--model_name",
-        default="Qwen/Qwen3-Embedding-0.6B",
+        default="Qwen/Qwen3-0.6B",
         help="HF Qwen embedding model name or local path.",
     )
     p.add_argument("--output_dir", default="encode_events_result/qwen")
-    p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--max_length", type=int, default=256)
     p.add_argument("--compile", action="store_true", help="Enable torch.compile for the model.")
     p.add_argument("--amp", action="store_true", help="Enable autocast during model forward.")

@@ -42,3 +42,4 @@ cpt_inputs
 cpt_outputs
 *_data
 *.npz
+*ckpt

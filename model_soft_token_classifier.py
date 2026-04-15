@@ -144,8 +144,9 @@ class DiseaseEventSoftTokenClassifier(nn.Module):
     def __init__(
         self,
         *,
-        bert_dim: int,
+        event_dim: int,
         task_text_embs: torch.Tensor,
+        disease_dim: int | None = None,
         hidden_size: int = 768,
         num_layers: int = 1,
         num_heads: int = 4,
@@ -158,7 +159,8 @@ class DiseaseEventSoftTokenClassifier(nn.Module):
         dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
-        self.bert_dim = bert_dim
+        self.event_dim = event_dim
+        self.disease_dim = int(disease_dim if disease_dim is not None else task_text_embs.shape[-1])
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -172,12 +174,12 @@ class DiseaseEventSoftTokenClassifier(nn.Module):
 
         self.register_buffer("task_text_embs", task_text_embs.to(dtype))
 
-        self.event_norm = nn.RMSNorm(bert_dim).to(dtype)
-        self.event_proj = nn.Linear(bert_dim, hidden_size, bias=False).to(dtype)
+        self.event_norm = nn.RMSNorm(self.event_dim).to(dtype)
+        self.event_proj = nn.Linear(self.event_dim, hidden_size, bias=False).to(dtype)
         nn.init.xavier_uniform_(self.event_proj.weight)
 
-        self.disease_norm = nn.RMSNorm(bert_dim).to(dtype)
-        self.disease_proj = nn.Linear(bert_dim, hidden_size, bias=False).to(dtype)
+        self.disease_norm = nn.RMSNorm(self.disease_dim).to(dtype)
+        self.disease_proj = nn.Linear(self.disease_dim, hidden_size, bias=False).to(dtype)
         nn.init.xavier_uniform_(self.disease_proj.weight)
 
         if position_type == "learned":
@@ -350,7 +352,8 @@ class DiseaseEventSoftTokenClassifier(nn.Module):
             {
                 "state_dict": self.state_dict(),
                 "config": {
-                    "bert_dim": self.bert_dim,
+                    "event_dim": self.event_dim,
+                    "disease_dim": self.disease_dim,
                     "hidden_size": self.hidden_size,
                     "num_layers": self.num_layers,
                     "num_heads": self.num_heads,
@@ -379,8 +382,9 @@ class DiseaseEventSoftTokenClassifier(nn.Module):
         payload = torch.load(save_dir / "model.pt", map_location="cpu")
         cfg = payload["config"]
         model = cls(
-            bert_dim=cfg["bert_dim"],
+            event_dim=cfg.get("event_dim", cfg.get("bert_dim")),
             task_text_embs=task_text_embs,
+            disease_dim=cfg.get("disease_dim", task_text_embs.shape[-1]),
             hidden_size=cfg["hidden_size"],
             num_layers=cfg["num_layers"],
             num_heads=cfg["num_heads"],
