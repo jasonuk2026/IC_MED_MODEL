@@ -34,3 +34,6 @@ extract_bio_emb.py
 run_sm_cpu.sh
 figures/retrieval_viz/
 figures/classifier_score_distributions/
+cpt_inputs
+cpt_outputs
+wandb
