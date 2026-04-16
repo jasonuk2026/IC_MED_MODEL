@@ -46,3 +46,5 @@ wandb
 cpt_inputs
 cpt_outputs
 wandb
+01_results
+02_collect_train_data_results
