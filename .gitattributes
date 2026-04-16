@@ -1,0 +1,22 @@
+* annex.largefiles=nothing
+
+*.h5 annex.largefiles=anything
+*.pth annex.largefiles=anything
+*.bin annex.largefiles=anything
+*.pt annex.largefiles=anything
+*.ckpt annex.largefiles=anything
+*.onnx annex.largefiles=anything
+*.npz annex.largefiles=anything
+
+data/** annex.largefiles=anything
+models/** annex.largefiles=anything
+checkpoints/** annex.largefiles=anything
+outputs/** annex.largefiles=anything
+
+*.py annex.largefiles=nothing
+*.sh annex.largefiles=nothing
+*.txt annex.largefiles=nothing
+*.md annex.largefiles=nothing
+*.yaml annex.largefiles=nothing
+*.json annex.largefiles=nothing
+*.yml annex.largefiles=nothing
