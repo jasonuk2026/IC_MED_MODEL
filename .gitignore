@@ -1,6 +1,3 @@
-# Data assets (likely large)
-EHRSHOT_ASSETS/
-
 # Python
 __pycache__/
 *.pyc
@@ -21,29 +18,9 @@ venv/
 .idea/
 .claude/
 
-cmd.md
-results*/
 *.zip
 
 core
-logs/
-output/
-extract_bio_emb.py
-run_sm_cpu.sh
-figures/retrieval_viz/
-figures/classifier_score_distributions/
-cpt_inputs
-encode_events_result
-cpt_trial
-extracted_task_data
-foundation*
+
+logs
 wandb
-*.npy
-*.npz
-!data/**/*.npy
-!data/**/*.npz
-cpt_inputs
-cpt_outputs
-wandb
-01_results
-02_collect_train_data_results
