@@ -227,3 +227,18 @@ python train_disease_transformer_classifier_extracted_single.py \
   --eval_batch_size 32 \
   --epochs 5 --num_workers 16
 
+python train_stage2.py \
+  --data_path cpt_inputs/qwen3_0.6b_block2048.parquet \
+  --model_name Qwen/Qwen3-0.6B \
+  --output_dir output/stage2_qwen3_0.6b_single \
+  --batch_size 2 \
+  --grad_accum 8
+
+
+# 该跑这个了
+CUDA_VISIBLE_DEVICES=1 python train_stage2.py \
+  --data_path cpt_inputs/qwen3_0.6b_block2048.parquet \
+  --model_name Qwen/Qwen3-0.6B \
+  --output_dir output/stage2_qwen3_0.6b_single \
+  --batch_size 1 \
+  --grad_accum 8 --save_at_steps 500 --lambda_red 0 --lambda_jepa 0

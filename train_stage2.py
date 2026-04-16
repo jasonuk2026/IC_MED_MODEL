@@ -9,7 +9,8 @@ Three joint losses
 
   2. JEPA  (--lambda_jepa)
        • The last --future_len tokens are the "target" window.
-       • --mask_ratio fraction of those positions are replaced with [MASK].
+       • --mask_ratio fraction of those positions are replaced with a learnable
+         mask embedding (no tokenizer/vocab change).
        • Online encoder encodes the masked sequence → predictor MLP → predictions.
        • EMA teacher encodes the full sequence (no grad) → targets.
        • MSE between predictor output and teacher output at masked positions only.
@@ -132,6 +133,20 @@ class Predictor(nn.Module):
         return self.net(x)
 
 
+class LearnableMaskEmbedding(nn.Module):
+    def __init__(self, hidden_size: int, dtype: torch.dtype):
+        super().__init__()
+        self.mask = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
+        nn.init.normal_(self.mask, mean=0.0, std=0.02)
+
+    def apply(self, input_ids: torch.Tensor, embed_tokens: nn.Module, masked_positions: torch.Tensor) -> torch.Tensor:
+        inputs_embeds = embed_tokens(input_ids)
+        if masked_positions.any():
+            inputs_embeds = inputs_embeds.clone()
+            inputs_embeds[masked_positions] = self.mask
+        return inputs_embeds
+
+
 # ── EMA helpers ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -145,7 +160,6 @@ def update_ema(online: nn.Module, teacher: nn.Module, decay: float) -> None:
 def collate_fn(
     batch: list[torch.Tensor],
     eos_token_id: int,
-    mask_token_id: int,
     future_len: int,
     mask_ratio: float,
 ) -> dict:
@@ -169,21 +183,98 @@ def collate_fn(
         event_boundaries.append(bounds)
 
     # ── JEPA masking ──
-    masked_input_ids = full_input_ids.clone()
     masked_positions = torch.zeros(B, T, dtype=torch.bool)
     n_mask = max(1, int(future_len * mask_ratio))
     for b in range(B):
         idx = torch.randperm(future_len, device=full_input_ids.device)[:n_mask]
         positions = future_start + idx
-        masked_input_ids[b, positions] = mask_token_id
         masked_positions[b, positions] = True
 
     return {
         "full_input_ids":   full_input_ids,
-        "masked_input_ids": masked_input_ids,
         "masked_positions": masked_positions,   # (B, T) bool
         "event_boundaries": event_boundaries,   # list[list[(start, red_pos)]]
     }
+
+
+def _decode_ids(tokenizer, ids: list[int]) -> str:
+    return tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+
+
+def _render_masked_preview(tokenizer, ids: list[int], mask_positions: list[int], mask_placeholder: str) -> str:
+    pieces: list[str] = []
+    pos_set = set(mask_positions)
+    i = 0
+    while i < len(ids):
+        if i in pos_set:
+            j = i
+            while j < len(ids) and j in pos_set:
+                j += 1
+            pieces.append(mask_placeholder)
+            i = j
+        else:
+            j = i
+            while j < len(ids) and j not in pos_set:
+                j += 1
+            pieces.append(_decode_ids(tokenizer, ids[i:j]))
+            i = j
+    return "".join(pieces)
+
+
+def log_objective_preview(
+    tokenizer,
+    batch: dict,
+    *,
+    eos_token_id: int,
+    future_len: int,
+    mask_placeholder: str = "<LEARNABLE_MASK>",
+) -> None:
+    full_ids = batch["full_input_ids"]
+    masked_positions = batch["masked_positions"]
+    event_boundaries = batch["event_boundaries"]
+    if full_ids.size(0) == 0:
+        return
+
+    sample_idx = int(torch.randint(0, full_ids.size(0), (1,)).item())
+    sample_ids = full_ids[sample_idx].tolist()
+    sample_mask = masked_positions[sample_idx].tolist()
+    future_start = max(0, len(sample_ids) - future_len)
+    future_ids = sample_ids[future_start:]
+    future_mask_positions = [i - future_start for i, flag in enumerate(sample_mask[future_start:], start=future_start) if flag]
+    future_mask_count = sum(sample_mask[future_start:])
+
+    logger.info("")
+    logger.info("=" * 72)
+    logger.info("Stage2 Objective Preview")
+    logger.info("=" * 72)
+    logger.info("sample_idx=%d  total_seq_len=%d  future_len=%d", sample_idx, len(sample_ids), len(future_ids))
+    logger.info("CPT preview: the final %d token(s) of the full sequence are used in causal LM training.", len(future_ids))
+    logger.info("  CPT future token ids: %s", future_ids[:64] if len(future_ids) > 64 else future_ids)
+    logger.info("  CPT future text:")
+    logger.info("  %s", _decode_ids(tokenizer, future_ids))
+
+    logger.info("JEPA preview: %d/%d future token position(s) are replaced by a learnable mask embedding.", future_mask_count, len(future_ids))
+    logger.info("  JEPA masked positions within future window: %s", future_mask_positions[:64] if len(future_mask_positions) > 64 else future_mask_positions)
+    logger.info("  JEPA masked future text preview:")
+    logger.info("  %s", _render_masked_preview(tokenizer, future_ids, future_mask_positions, mask_placeholder))
+
+    eos_token_text = _decode_ids(tokenizer, [eos_token_id])
+    logger.info("RED preview: eos_token_id=%d  eos_token_text=%r", eos_token_id, eos_token_text)
+    sample_bounds = event_boundaries[sample_idx]
+    if sample_bounds:
+        ev_start, red_pos = sample_bounds[0]
+        event_plus_eos = sample_ids[ev_start : red_pos + 1]
+        event_body = sample_ids[ev_start:red_pos]
+        logger.info("  Example event span: start=%d end=%d (inclusive of EOS)", ev_start, red_pos)
+        logger.info("  Event+EOS token ids: %s", event_plus_eos[:64] if len(event_plus_eos) > 64 else event_plus_eos)
+        logger.info("  Event+EOS text:")
+        logger.info("  %s", _decode_ids(tokenizer, event_plus_eos))
+        logger.info("  RED target meaning: use the EOS hidden state to predict the average representation of the preceding event tokens.")
+        logger.info("  Event body text (without EOS):")
+        logger.info("  %s", _decode_ids(tokenizer, event_body))
+    else:
+        logger.info("  No complete event boundary was found in the sampled sequence, so RED preview is unavailable for this example.")
+    logger.info("=" * 72)
 
 
 # ── LR schedule ────────────────────────────────────────────────────────────────
@@ -249,8 +340,8 @@ def parse_args():
     p.add_argument("--lambda_red",  type=float, default=1.0)
     # JEPA config
     p.add_argument("--future_len",  type=int,   default=256,  help="Last N tokens as JEPA target window")
-    p.add_argument("--mask_ratio",  type=float, default=0.5,  help="Fraction of future tokens to mask")
-    p.add_argument("--ema_decay",   type=float, default=0.999)
+    p.add_argument("--mask_ratio",  type=float, default=0.15,  help="Fraction of future tokens to mask")
+    p.add_argument("--ema_decay",   type=float, default=0.96)
     p.add_argument("--pred_mlp_ratio", type=float, default=4.0, help="Predictor MLP inner dim ratio")
     # Efficiency
     p.add_argument("--gradient_checkpointing", action="store_true")
@@ -303,15 +394,9 @@ def main():
             config=vars(args),
         )
 
-    # ── Tokenizer + [MASK] token ───────────────────────────────────────────────
+    # ── Tokenizer (no mask token added; JEPA uses a learnable mask embedding) ──
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, local_files_only=args.local_files_only)
-    vocab_resized = False
-    if tokenizer.mask_token is None:
-        tokenizer.add_special_tokens({"mask_token": "<mask>"})
-        vocab_resized = True
-        logger.info(f"Added <mask> token (id={tokenizer.mask_token_id})")
-    mask_token_id = tokenizer.mask_token_id
-    eos_token_id  = tokenizer.eos_token_id
+    eos_token_id  = tokenizer.pad_token_id
 
     # ── Dataset & DataLoader ───────────────────────────────────────────────────
     dataset = CPTDataset(args.data_path)
@@ -328,7 +413,6 @@ def main():
         collate_fn=partial(
             collate_fn,
             eos_token_id=eos_token_id,
-            mask_token_id=mask_token_id,
             future_len=args.future_len,
             mask_ratio=args.mask_ratio,
         ),
@@ -343,8 +427,6 @@ def main():
         attn_implementation="flash_attention_2" if args.flash_attn else "eager",
         local_files_only=args.local_files_only,
     ).to(device)
-    if vocab_resized:
-        online.resize_token_embeddings(len(tokenizer))
     if args.gradient_checkpointing:
         online.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     if args.compile:
@@ -361,8 +443,6 @@ def main():
         attn_implementation="flash_attention_2" if args.flash_attn else "eager",
         local_files_only=args.local_files_only,
     ).to(device)
-    if vocab_resized:
-        teacher.resize_token_embeddings(len(tokenizer))
     for p in teacher.parameters():
         p.requires_grad_(False)
     teacher.eval()
@@ -370,15 +450,17 @@ def main():
     # ── Predictor (position-wise MLP, online only) ─────────────────────────────
     hidden_size = online.config.hidden_size if not is_ddp else online.module.config.hidden_size
     predictor = Predictor(hidden_size, args.pred_mlp_ratio).to(device).to(dtype)
+    mask_embedding = LearnableMaskEmbedding(hidden_size, dtype).to(device)
     if is_ddp:
         predictor = DDP(predictor, device_ids=[local_rank], output_device=local_rank)
 
     n_online  = sum(p.numel() for p in online.parameters()) / 1e6
     n_pred    = sum(p.numel() for p in predictor.parameters()) / 1e6
-    logger.info(f"Online encoder: {n_online:.1f}M  |  Predictor: {n_pred:.2f}M")
+    n_mask    = sum(p.numel() for p in mask_embedding.parameters()) / 1e6
+    logger.info(f"Online encoder: {n_online:.1f}M  |  Predictor: {n_pred:.2f}M  |  Mask embedding: {n_mask:.4f}M")
 
     # ── Optimizer ──────────────────────────────────────────────────────────────
-    all_params = list(online.parameters()) + list(predictor.parameters())
+    all_params = list(online.parameters()) + list(predictor.parameters()) + list(mask_embedding.parameters())
     decay_p    = [p for p in all_params if p.requires_grad and p.dim() >= 2]
     nodecay_p  = [p for p in all_params if p.requires_grad and p.dim() < 2]
     optimizer  = torch.optim.AdamW(
@@ -415,6 +497,7 @@ def main():
 
     online.train()
     predictor.train()
+    preview_printed = False
 
     for epoch in range(args.epochs):
         if is_ddp:
@@ -428,8 +511,16 @@ def main():
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=(rank != 0), dynamic_ncols=True)
 
         for batch in pbar:
+            if rank == 0 and not preview_printed:
+                log_objective_preview(
+                    tokenizer,
+                    batch,
+                    eos_token_id=eos_token_id,
+                    future_len=args.future_len,
+                )
+                preview_printed = True
+
             full_ids    = batch["full_input_ids"].to(device)
-            masked_ids  = batch["masked_input_ids"].to(device)
             mask_pos    = batch["masked_positions"].to(device)    # (B, T) bool
             ev_bounds   = batch["event_boundaries"]               # list[list[(start, red_pos)]]
             B, T        = full_ids.shape
@@ -467,8 +558,10 @@ def main():
                 loss_red = loss_red / n_events
 
             # ── Part 2: JEPA forward ────────────────────────────────────────
+            embed_tokens = get_raw_online().get_input_embeddings()
+            masked_embeds = mask_embedding.apply(full_ids, embed_tokens, mask_pos)
             masked_out = online(
-                input_ids=masked_ids,
+                inputs_embeds=masked_embeds,
                 output_hidden_states=True,
             )
             online_h   = masked_out.hidden_states[-1]             # (B, T, D)
@@ -502,7 +595,7 @@ def main():
             # ── Optimizer step ─────────────────────────────────────────────
             if micro_steps % args.grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(
-                    list(online.parameters()) + list(predictor.parameters()),
+                    list(online.parameters()) + list(predictor.parameters()) + list(mask_embedding.parameters()),
                     args.max_grad_norm,
                 )
                 optimizer.step()
