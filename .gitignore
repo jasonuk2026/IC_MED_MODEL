@@ -43,3 +43,6 @@ foundation*
 wandb
 *.npy
 *.npz
+cpt_inputs
+cpt_outputs
+wandb
