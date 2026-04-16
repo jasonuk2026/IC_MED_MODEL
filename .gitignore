@@ -28,7 +28,6 @@ results*/
 
 core
 logs/
-toy*.*
 output/
 extract_bio_emb.py
 run_sm_cpu.sh
