@@ -40,6 +40,8 @@ foundation*
 wandb
 *.npy
 *.npz
+!data/**/*.npy
+!data/**/*.npz
 cpt_inputs
 cpt_outputs
 wandb
