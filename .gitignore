@@ -1,6 +1,5 @@
 # Data assets (likely large)
 EHRSHOT_ASSETS/
-data/
 
 # Python
 __pycache__/
@@ -37,7 +36,6 @@ cpt_inputs
 encode_events_result
 cpt_trial
 extracted_task_data
-*data*
 foundation*
 wandb
 *.npy
