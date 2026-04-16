@@ -32,7 +32,7 @@ from determine_num_sample import get_sample_n_times
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-EHRSHOT_ASSETS = "EHRSHOT_ASSETS"
+EHRSHOT_ASSETS = "data/EHRSHOT_ASSETS"
 
 DEFAULT_EMBED_DIR = "data/biolinkbert_embeddings"
 

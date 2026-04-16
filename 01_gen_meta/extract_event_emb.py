@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-extract_biolinkbert_embeddings.py
+Offline extraction of per-event embeddings from a unique-events parquet.
 
-Offline extraction of per-event BioLinkBERT embeddings from ehrshot.csv.
-Each unique event text (derived from code + description + value + unit) is
-embedded exactly once, enabling downstream training to look up pre-computed
-embeddings rather than re-tokenising full patient histories.
+The unique semantic events are expected to come from
+`01_gen_meta/extract_unique_events.py`, which writes a parquet with one row per
+deduplicated event and preserves structured columns for Jinja-based text
+templating.
 
 Pooling: mean pooling over non-padding, non-special tokens (no [CLS]/[SEP]).
 
 ─── Pipeline ───────────────────────────────────────────────────────────────
-Phase 1  (rank 0): scan ehrshot.csv → collect unique events →
+Phase 1  (rank 0): load unique-events parquet → render event_text with Jinja →
              save  <output_dir>/event_index.parquet
 Phase 2  (all ranks): each rank encodes its own slice → saves
              <output_dir>/shards/shard_{rank:04d}.npy
@@ -19,22 +19,23 @@ Phase 3  (rank 0): merge shards → <output_dir>/embeddings.npy
 
 ─── Usage ──────────────────────────────────────────────────────────────────
 Single-node, 4 GPUs:
-    torchrun --nproc_per_node=4 extract_biolinkbert_embeddings.py
+    torchrun --nproc_per_node=4 extract_event_emb.py
 
 Multi-node (2 × 4 GPUs):
     torchrun --nnodes=2 --nproc_per_node=4 \\
         --rdzv_id=job1 --rdzv_backend=c10d \\
         --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \\
-        extract_biolinkbert_embeddings.py [args]
+        extract_event_emb.py [args]
 
 Single GPU / CPU (debug):
-    python extract_biolinkbert_embeddings.py --batch_size 32
+    python extract_event_emb.py --batch_size 32
 """
 
 import os
 import json
 import logging
 import argparse
+import random
 from pathlib import Path
 
 import numpy as np
@@ -43,6 +44,8 @@ import torch
 import torch.distributed as dist
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
+
+from encoders import get_encoder
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -67,122 +70,70 @@ def normalise_event_key(code, value, unit) -> tuple[str, str, str]:
     )
 
 
-def format_event_text(code: str, description: str, value: str, unit: str) -> str | None:
-    """Format a single EHR event row into a text string.
+# ── Phase 1: render unique event texts from parquet ───────────────────────────
 
-    Returns None if there is nothing meaningful to encode.
-    """
-    desc  = (description or "").strip()
-    code  = (code        or "").strip()
-    value = (value       or "").strip()
-    unit  = (unit        or "").strip()
-
-    if desc and code:
-        text = f"{desc} [{code}]"
-    elif code:
-        text = f"[{code}]"
-    elif desc:
-        text = desc
-    else:
-        return None
-
-    if value:
-        text += f" | value={value}"
-    if unit:
-        text += f" | unit={unit}"
-    return text
-
-
-# ── Mean pooling (exclude [CLS], [SEP], and padding) ──────────────────────────
-
-def mean_pool_no_special(
-    last_hidden_state: torch.Tensor,   # (B, L, H)
-    input_ids:         torch.Tensor,   # (B, L)
-    attention_mask:    torch.Tensor,   # (B, L)
-    special_token_ids: set[int],
-) -> torch.Tensor:                     # (B, H)
-    """Mean pool over real tokens, excluding padding and special tokens."""
-    # Build mask: True where token is real AND not a special token
-    special = torch.zeros_like(attention_mask, dtype=torch.bool)
-    for sid in special_token_ids:
-        special |= (input_ids == sid)
-    pool_mask = attention_mask.bool() & ~special          # (B, L)
-    pool_mask_f = pool_mask.float().unsqueeze(-1)          # (B, L, 1)
-    sum_emb = (last_hidden_state * pool_mask_f).sum(dim=1) # (B, H)
-    count   = pool_mask_f.sum(dim=1).clamp(min=1e-9)       # (B, 1)
-    return sum_emb / count                                  # (B, H)
-
-
-# ── Phase 1: collect unique event texts ───────────────────────────────────────
-
-def collect_unique_events(
-    ehrshot_csv: str,
-    concept_csv: str,
+def build_event_index(
+    unique_events_path: str,
     output_dir: Path,
-    chunksize:  int = 500_000,
+    encoder,
 ) -> pd.DataFrame:
-    """Scan ehrshot.csv, build unique (code, value, unit) → event_text mapping.
-
-    Saves <output_dir>/event_index.parquet and returns the DataFrame.
-    Columns: event_id (int), event_text (str), code, value, unit.
-    """
+    """Load unique events parquet, render Jinja event_text, write event_index."""
     index_path = output_dir / "event_index.parquet"
     if index_path.exists():
         logger.info(f"[Phase 1] Found existing event_index.parquet — skipping scan.")
         return pd.read_parquet(index_path)
 
-    # Build code → description lookup from concept.csv
-    logger.info("[Phase 1] Loading concept.csv ...")
-    concept_df = pd.read_csv(
-        concept_csv,
-        usecols=["concept_name", "vocabulary_id", "concept_code"],
-        low_memory=False,
-        dtype=str,
-    ).fillna("")
-    # Construct the OMOP-style key used in ehrshot.csv: "vocab_id/concept_code"
-    concept_df["code"] = concept_df["vocabulary_id"] + "/" + concept_df["concept_code"]
-    filtered = concept_df[concept_df["code"] != concept_df["concept_name"]]
-    code2desc: dict[str, str] = dict(
-        zip(filtered["code"], filtered["concept_name"])
+    logger.info("[Phase 1] Loading unique events from %s ...", unique_events_path)
+    event_df = pd.read_parquet(unique_events_path)
+    required_cols = {
+        "event_id", "omop_table", "event_type", "code", "description", "value", "unit",
+    }
+    missing = sorted(required_cols - set(event_df.columns))
+    if missing:
+        raise ValueError(
+            "Unique events parquet is missing required columns: {}".format(", ".join(missing))
+        )
+
+    rows = []
+    n_no_text = 0
+    for row in event_df.itertuples(index=False):
+        code = str(row.code or "").strip()
+        description = str(row.description or "").strip()
+        value = str(row.value or "").strip()
+        unit = str(row.unit or "").strip()
+        omop_table = str(row.omop_table or "").strip()
+        event_type = str(row.event_type or "").strip()
+        text = encoder.format_event_text(
+            code=code,
+            description=description,
+            value=value,
+            unit=unit,
+            omop_table=omop_table,
+            event_type=event_type,
+        )
+        if text is None:
+            n_no_text += 1
+            continue
+        rows.append({
+            "event_id": int(row.event_id),
+            "omop_table": omop_table,
+            "event_type": event_type,
+            "code": code,
+            "description": description,
+            "value": value,
+            "unit": unit,
+            "event_text": text,
+        })
+
+    logger.info(
+        "[Phase 1] Loaded %s unique events → %s encodable (%s dropped by template).",
+        "{:,}".format(len(event_df)),
+        "{:,}".format(len(rows)),
+        "{:,}".format(n_no_text),
     )
-    logger.info(f"[Phase 1] Loaded {len(code2desc):,} code→description mappings.")
 
-    # Stream ehrshot.csv, collect unique (code, value, unit) tuples
-    logger.info("[Phase 1] Scanning ehrshot.csv for unique events ...")
-    seen:  set[tuple]    = set()
-    rows:  list[dict]    = []
-    total_lines          = 0
-    no_desc_count        = 0
-
-    for chunk in pd.read_csv(
-        ehrshot_csv,
-        usecols=["code", "value", "unit"],
-        chunksize=chunksize,
-        dtype=str,
-        keep_default_na=False,
-    ):
-        total_lines += len(chunk)
-        for code, value, unit in zip(chunk["code"], chunk["value"], chunk["unit"]):
-            key = normalise_event_key(code, value, unit)
-            if key in seen:
-                continue
-            seen.add(key)
-            norm_code, norm_value, norm_unit = key
-            desc = code2desc.get(norm_code, "")
-            if not desc:
-                no_desc_count += 1
-            text = format_event_text(norm_code, desc, norm_value, norm_unit)
-            if text is None:
-                continue
-            rows.append({"code": norm_code, "value": norm_value, "unit": norm_unit, "event_text": text})
-
-    n_unique = len(seen)
-    logger.info(f"[Phase 1] Scanned {total_lines:,} rows → {n_unique:,} unique events → {len(rows):,} encodable.")
-    logger.info(f"[Phase 1] No-description events: {no_desc_count:,} / {n_unique:,} ({100*no_desc_count/max(n_unique,1):.1f}%)")
-
-    event_df = pd.DataFrame(rows).reset_index(drop=True)
-    event_df.index.name = "event_id"
-    event_df = event_df.reset_index()   # event_id becomes a column
+    event_df = pd.DataFrame(rows)
+    event_df = event_df.sort_values("event_id").reset_index(drop=True)
 
     event_df.to_parquet(index_path, index=False)
     logger.info(f"[Phase 1] Saved event_index.parquet → {index_path}")
@@ -196,10 +147,10 @@ def encode_slice(
     texts:      list[str],
     model:      AutoModel,
     tokenizer:  AutoTokenizer,
+    encoder,
     device:     torch.device,
     batch_size: int,
     max_length: int,
-    special_ids: set[int],
     rank:       int,
     desc:       str = "Encoding",
 ) -> np.ndarray:
@@ -218,19 +169,15 @@ def encode_slice(
             batch,
             padding=True,
             truncation=False,
+            add_special_tokens=encoder.ADD_SPECIAL_TOKENS,
             return_tensors="pt",
         ).to(device)
 
         assert enc.input_ids[0].size(0) < max_length, f"Shouldn't exist sequence exceeding {max_length}"
 
-        out  = model(**enc)
-        embs = mean_pool_no_special(
-            out.last_hidden_state,
-            enc["input_ids"],
-            enc["attention_mask"],
-            special_ids,
-        )
-        embs = embs.float()
+        out = model(**enc)
+        embs = encoder.get_embeddings(out, enc, tokenizer)
+        embs = encoder.postprocess_embeddings(embs)
         all_embs.append(embs.cpu().numpy())
 
     return np.concatenate(all_embs, axis=0) if all_embs else np.empty((0, model.config.hidden_size), dtype=np.float32)
@@ -265,19 +212,68 @@ def merge_shards(shard_dir: Path, n_total: int, hidden_size: int, output_dir: Pa
     logger.info(f"[Phase 3] Saved embeddings.npy → {out_path}  shape={embeddings.shape}")
 
 
+def log_tokenization_preview(texts, tokenizer, encoder, n_examples=5, seed=0):
+    if not texts or n_examples <= 0:
+        return
+
+    n_examples = min(n_examples, len(texts))
+    rng = random.Random(seed)
+    sample_indices = sorted(rng.sample(range(len(texts)), n_examples))
+
+    logger.info("=" * 80)
+    logger.info(
+        "Tokenization preview: %s random event(s), add_special_tokens=%s",
+        n_examples,
+        encoder.ADD_SPECIAL_TOKENS,
+    )
+    logger.info("=" * 80)
+
+    for preview_idx, text_idx in enumerate(sample_indices, start=1):
+        text = texts[text_idx]
+        encoded = tokenizer(
+            text,
+            padding=False,
+            truncation=False,
+            add_special_tokens=encoder.ADD_SPECIAL_TOKENS,
+        )
+        input_ids = encoded["input_ids"]
+        tokens = tokenizer.convert_ids_to_tokens(input_ids)
+        decoded_with_special = tokenizer.decode(input_ids, skip_special_tokens=False)
+        decoded_without_special = tokenizer.decode(input_ids, skip_special_tokens=True)
+
+        logger.info("[Preview %s] event_index=%s", preview_idx, text_idx)
+        logger.info("  original_text: %s", text)
+        logger.info("  input_ids: %s", input_ids)
+        logger.info("  tokens: %s", tokens)
+        logger.info("  decoded(skip_special_tokens=False): %s", decoded_with_special)
+        logger.info("  decoded(skip_special_tokens=True):  %s", decoded_without_special)
+        logger.info("-" * 80)
+
+
 # ── Argument parsing ───────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--ehrshot_csv",  default="EHRSHOT_ASSETS/data/ehrshot.csv")
-    p.add_argument("--concept_csv",  default="EHRSHOT_ASSETS/femr/logs/omop_dir/concept.csv")
+    p.add_argument(
+        "--unique_events_path",
+        default="EHRSHOT_ASSETS/features/unique_event_rows.parquet",
+        help="Parquet produced by extract_unique_events.py.",
+    )
     p.add_argument("--model_name",   default="michiyasunaga/BioLinkBERT-base",
                    help="HuggingFace model name or local path.")
+    p.add_argument("--encoder",      default="biolinkbert",
+                   help="Encoder backend name. Controls model defaults, Jinja template, and pooling.")
+    p.add_argument("--template_path", default=None,
+                   help="Optional custom Jinja template path for event text formatting.")
     p.add_argument("--output_dir",   default="data/biolinkbert_embeddings")
     p.add_argument("--batch_size",   type=int, default=256,
                    help="Tokenisation + forward-pass batch size per rank.")
     p.add_argument("--max_length",   type=int, default=256,
                    help="Max token length. BioLinkBERT-base supports up to 512.")
+    p.add_argument("--preview_tokenization_n", type=int, default=5,
+                   help="On rank 0, log this many random tokenization/decode examples before encoding. Use 0 to disable.")
+    p.add_argument("--preview_seed", type=int, default=0,
+                   help="Random seed for tokenization preview sampling.")
     p.add_argument("--fp16",         action="store_true",
                    help="Run model in float16 (saves GPU memory, minor precision loss).")
     p.add_argument("--bf16",         action="store_true",
@@ -291,6 +287,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    encoder = get_encoder(
+        args.encoder,
+        model_name=args.model_name,
+        template_path=args.template_path,
+    )
 
     # ── Distributed setup ─────────────────────────────────────────────────────
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -319,10 +320,10 @@ def main():
     if is_dist:
         dist.barrier()   # ensure dirs exist before all ranks proceed
 
-    # ── Phase 1: collect unique events (rank 0 only) ───────────────────────────
+    # ── Phase 1: render unique event texts (rank 0 only) ──────────────────────
     if rank == 0:
-        event_df = collect_unique_events(
-            args.ehrshot_csv, args.concept_csv, output_dir
+        event_df = build_event_index(
+            args.unique_events_path, output_dir, encoder
         )
     if is_dist:
         dist.barrier()   # all ranks wait for Phase 1 to finish
@@ -346,7 +347,7 @@ def main():
     if shard_npy.exists() and shard_json.exists():
         logger.info(f"[Rank {rank}] Shard already exists — skipping encoding.")
     else:
-        logger.info(f"[Rank {rank}] Loading {args.model_name} ...")
+        logger.info(f"[Rank {rank}] Loading encoder={args.encoder} model={encoder.model_name} ...")
         model_kwargs = {}
         if args.fp16:
             model_kwargs["torch_dtype"] = torch.float16
@@ -356,23 +357,28 @@ def main():
             model_kwargs["local_files_only"] = True
 
         tokenizer = AutoTokenizer.from_pretrained(
-            args.model_name, **({} if not args.local_files_only else {"local_files_only": True})
+            encoder.model_name, **({} if not args.local_files_only else {"local_files_only": True})
         )
-        model = AutoModel.from_pretrained(args.model_name, **model_kwargs).to(device)
+        model = AutoModel.from_pretrained(encoder.model_name, **model_kwargs).to(device)
         model.eval()
 
-        # Identify special token IDs ([CLS]=101, [SEP]=102 for BERT-family)
-        special_ids: set[int] = set(tokenizer.all_special_ids)
+        if rank == 0 and args.preview_tokenization_n > 0:
+            log_tokenization_preview(
+                texts=texts,
+                tokenizer=tokenizer,
+                encoder=encoder,
+                n_examples=args.preview_tokenization_n,
+                seed=args.preview_seed,
+            )
 
         logger.info(
             f"[Rank {rank}] Encoding {len(my_texts):,} texts "
             f"(of {n_total:,} total, world_size={world_size}) ..."
         )
         embs = encode_slice(
-            my_texts, model, tokenizer, device,
+            my_texts, model, tokenizer, encoder, device,
             batch_size=args.batch_size,
             max_length=args.max_length,
-            special_ids=special_ids,
             rank=rank,
             desc=f"[Rank {rank}]",
         )
@@ -398,6 +404,7 @@ def main():
         logger.info(f"Outputs:")
         logger.info(f"  {output_dir}/event_index.parquet  — event_id, event_text, code, value, unit")
         logger.info(f"  {output_dir}/embeddings.npy       — shape ({n_total}, {hidden_size}), float32")
+        logger.info(f"  encoder={args.encoder}  model={encoder.model_name}  template={encoder.template_path}")
         logger.info(f"  Lookup: embeddings[event_index[event_index.event_text == text].event_id[0]]")
 
     if is_dist:

@@ -186,3 +186,9 @@ conda run -n torch python inspect_soft_token_attention.py \
 
 train_disease_soft_token_classifier.py --train_data_dir llm_data_ixc_patch --eval_data_paths llm_eval_data_ixc/new_*/val.parquet --bert_embeddings maybe_best_retrieval/embeddings.npy --bf16 --batch_size 32 --eval_batch_size 32 --pad_to_num_events 1000 --num_workers 4 --prefetch_factor 8 --lr 2e-4 --warmup_ratio 0.1 --weight_decay 0.005 --grad_clip 1.0 --hidden_size 768 --num_layers 2 --num_heads 4 --head_layers 1 --pos_weight 1.0 --wandb_project medical_cond_embed --wandb_tags soft_token_classifier --position_type learned --attention_type bidirectional --aux_loss_weight 0.2 --align_loss_weight 0.1 --train_data_epochs 0 1 2 3
 torchrun --standalone --nproc_per_node=2 train_disease_soft_token_classifier.py --train_data_dir data/02_collect_train_data_results --eval_data_paths data/llm_eval_data_ixc/new_*/val.parquet --bert_embeddings data/01_results/embeddings.npy --bf16 --batch_size 32 --eval_batch_size 32 --pad_to_num_events 1000 --num_workers 4 --prefetch_factor 8 --lr 2e-4 --warmup_ratio 0.1 --weight_decay 0.005 --grad_clip 1.0 --hidden_size 768 --num_layers 2 --num_heads 4 --head_layers 1 --pos_weight 1.0 --wandb_project medical_cond_embed --wandb_tags soft_token_classifier --position_type learned --attention_type bidirectional --aux_loss_weight 0.2 --align_loss_weight 0.1 --train_data_epochs 0
+
+python 01_gen_meta/extract_event_emb.py \
+  --unique_events_path data/01_outputs/unique_events.parquet \
+  --encoder biolinkbert \
+  --output_dir data/01_outputs_biolinkbert_embeddings \
+  --preview_tokenization_n 5
