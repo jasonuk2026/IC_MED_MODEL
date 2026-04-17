@@ -8,18 +8,19 @@ Three joint losses
        Standard causal LM next-token prediction on the full unmasked sequence.
 
   2. JEPA  (--lambda_jepa)
-       • The last --future_len tokens are the "target" window.
-       • --mask_ratio fraction of those positions are replaced with a learnable
+       • For each sample, randomly choose --num_mask_events complete events.
+       • All non-EOS tokens inside those events are replaced with a learnable
          mask embedding (no tokenizer/vocab change).
        • Online encoder encodes the masked sequence → predictor MLP → predictions.
        • EMA teacher encodes the full sequence (no grad) → targets.
-       • MSE between predictor output and teacher output at masked positions only.
+       • MSE between predictor output and teacher output at the masked token
+         positions only.
 
   3. RED   (--lambda_red)
-       • Each EHR event ends with EOS (our end-of-event separator token).
-       • The EOS hidden state (from the full-sequence forward pass) should equal
-         the mean of all preceding token hidden states in the same event.
-       • MSE averaged over all events in the batch.
+       • Each masked EHR event keeps its EOS token visible.
+       • Average the predictor outputs across the masked tokens of that event.
+       • Regress that average to the teacher EOS hidden state for the same event.
+       • MSE averaged over all masked events in the batch.
 
 EMA teacher
 ──────────────────
@@ -155,20 +156,18 @@ def update_ema(online: nn.Module, teacher: nn.Module, decay: float) -> None:
         p_t.data.mul_(decay).add_(p_o.data, alpha=1.0 - decay)
 
 
-# ── Collate: event boundaries + JEPA masking ──────────────────────────────────
+# ── Collate: event boundaries + event-level masking ───────────────────────────
 
 def collate_fn(
     batch: list[torch.Tensor],
     eos_token_id: int,
-    future_len: int,
-    mask_ratio: float,
+    num_mask_events: int,
 ) -> dict:
     full_input_ids = torch.stack(batch)           # (B, T)
     B, T = full_input_ids.shape
-    future_start = max(0, T - future_len)
 
     # ── Event boundaries ──
-    # For each sample: list of (event_start, red_pos) where red_pos is the
+    # For each sample: list of (event_start, eos_pos) where eos_pos is the
     # position of the EOS token that closes the event.
     event_boundaries: list[list[tuple[int, int]]] = []
     for b in range(B):
@@ -182,18 +181,28 @@ def collate_fn(
                 ev_start = pos + 1
         event_boundaries.append(bounds)
 
-    # ── JEPA masking ──
+    # ── Event-level JEPA masking ──
     masked_positions = torch.zeros(B, T, dtype=torch.bool)
-    n_mask = max(1, int(future_len * mask_ratio))
+    masked_event_boundaries: list[list[tuple[int, int]]] = []
     for b in range(B):
-        idx = torch.randperm(future_len, device=full_input_ids.device)[:n_mask]
-        positions = future_start + idx
-        masked_positions[b, positions] = True
+        bounds = event_boundaries[b]
+        if not bounds:
+            masked_event_boundaries.append([])
+            continue
+        n_select = min(num_mask_events, len(bounds))
+        chosen_idx = torch.randperm(len(bounds), device=full_input_ids.device)[:n_select].tolist()
+        chosen_bounds = [bounds[i] for i in chosen_idx]
+        chosen_bounds.sort()
+        for ev_start, eos_pos in chosen_bounds:
+            if eos_pos > ev_start:
+                masked_positions[b, ev_start:eos_pos] = True
+        masked_event_boundaries.append(chosen_bounds)
 
     return {
-        "full_input_ids":   full_input_ids,
-        "masked_positions": masked_positions,   # (B, T) bool
-        "event_boundaries": event_boundaries,   # list[list[(start, red_pos)]]
+        "full_input_ids":          full_input_ids,
+        "masked_positions":        masked_positions,        # (B, T) bool
+        "event_boundaries":        event_boundaries,        # list[list[(start, eos_pos)]]
+        "masked_event_boundaries": masked_event_boundaries, # list[list[(start, eos_pos)]]
     }
 
 
@@ -231,7 +240,7 @@ def log_objective_preview(
 ) -> None:
     full_ids = batch["full_input_ids"]
     masked_positions = batch["masked_positions"]
-    event_boundaries = batch["event_boundaries"]
+    masked_event_boundaries = batch["masked_event_boundaries"]
     if full_ids.size(0) == 0:
         return
 
@@ -240,40 +249,45 @@ def log_objective_preview(
     sample_mask = masked_positions[sample_idx].tolist()
     future_start = max(0, len(sample_ids) - future_len)
     future_ids = sample_ids[future_start:]
-    future_mask_positions = [i - future_start for i, flag in enumerate(sample_mask[future_start:], start=future_start) if flag]
-    future_mask_count = sum(sample_mask[future_start:])
 
     logger.info("")
     logger.info("=" * 72)
     logger.info("Stage2 Objective Preview")
     logger.info("=" * 72)
-    logger.info("sample_idx=%d  total_seq_len=%d  future_len=%d", sample_idx, len(sample_ids), len(future_ids))
+    logger.info("sample_idx=%d  total_seq_len=%d  cpt_preview_len=%d", sample_idx, len(sample_ids), len(future_ids))
     logger.info("CPT preview: the final %d token(s) of the full sequence are used in causal LM training.", len(future_ids))
     logger.info("  CPT future token ids: %s", future_ids[:64] if len(future_ids) > 64 else future_ids)
     logger.info("  CPT future text:")
     logger.info("  %s", _decode_ids(tokenizer, future_ids))
 
-    logger.info("JEPA preview: %d/%d future token position(s) are replaced by a learnable mask embedding.", future_mask_count, len(future_ids))
-    logger.info("  JEPA masked positions within future window: %s", future_mask_positions[:64] if len(future_mask_positions) > 64 else future_mask_positions)
-    logger.info("  JEPA masked future text preview:")
-    logger.info("  %s", _render_masked_preview(tokenizer, future_ids, future_mask_positions, mask_placeholder))
+    sample_masked_bounds = masked_event_boundaries[sample_idx]
+    logger.info("JEPA preview: %d token position(s) are masked across %d sampled event(s).", sum(sample_mask), len(sample_masked_bounds))
+    if sample_masked_bounds:
+        ev_start, eos_pos = sample_masked_bounds[0]
+        masked_event_plus_eos = sample_ids[ev_start : eos_pos + 1]
+        masked_event_rel_mask_positions = [i for i, flag in enumerate(sample_mask[ev_start : eos_pos + 1]) if flag]
+        logger.info("  Example masked event span: start=%d end=%d (inclusive of EOS)", ev_start, eos_pos)
+        logger.info("  Masked event+EOS token ids: %s", masked_event_plus_eos[:64] if len(masked_event_plus_eos) > 64 else masked_event_plus_eos)
+        logger.info("  JEPA masked event text preview:")
+        logger.info("  %s", _render_masked_preview(tokenizer, masked_event_plus_eos, masked_event_rel_mask_positions, mask_placeholder))
+    else:
+        logger.info("  No complete event was selected for masking in this sample.")
 
     eos_token_text = _decode_ids(tokenizer, [eos_token_id])
     logger.info("RED preview: eos_token_id=%d  eos_token_text=%r", eos_token_id, eos_token_text)
-    sample_bounds = event_boundaries[sample_idx]
-    if sample_bounds:
-        ev_start, red_pos = sample_bounds[0]
-        event_plus_eos = sample_ids[ev_start : red_pos + 1]
-        event_body = sample_ids[ev_start:red_pos]
-        logger.info("  Example event span: start=%d end=%d (inclusive of EOS)", ev_start, red_pos)
+    if sample_masked_bounds:
+        ev_start, eos_pos = sample_masked_bounds[0]
+        event_plus_eos = sample_ids[ev_start : eos_pos + 1]
+        event_body = sample_ids[ev_start:eos_pos]
+        logger.info("  Example masked event span: start=%d end=%d (inclusive of EOS)", ev_start, eos_pos)
         logger.info("  Event+EOS token ids: %s", event_plus_eos[:64] if len(event_plus_eos) > 64 else event_plus_eos)
         logger.info("  Event+EOS text:")
         logger.info("  %s", _decode_ids(tokenizer, event_plus_eos))
-        logger.info("  RED target meaning: use the EOS hidden state to predict the average representation of the preceding event tokens.")
-        logger.info("  Event body text (without EOS):")
+        logger.info("  RED target meaning: average the predictor outputs over the masked event tokens and regress that vector to the teacher EOS hidden state.")
+        logger.info("  Event body text to be averaged (without EOS):")
         logger.info("  %s", _decode_ids(tokenizer, event_body))
     else:
-        logger.info("  No complete event boundary was found in the sampled sequence, so RED preview is unavailable for this example.")
+        logger.info("  No masked complete event was found in the sampled sequence, so RED preview is unavailable for this example.")
     logger.info("=" * 72)
 
 
@@ -290,7 +304,7 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, total_steps: i
 
 # ── Checkpoint ─────────────────────────────────────────────────────────────────
 
-def save_checkpoint(output_dir: Path, step: int, online, predictor, optimizer, scheduler, args):
+def save_checkpoint(output_dir: Path, step: int, online, predictor, mask_embedding, optimizer, scheduler, args):
     ckpt_dir = output_dir / f"checkpoint-{step}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     # Unwrap DDP and torch.compile before saving
@@ -298,6 +312,7 @@ def save_checkpoint(output_dir: Path, step: int, online, predictor, optimizer, s
     raw = getattr(raw, "_orig_mod", raw)
     raw.save_pretrained(ckpt_dir)
     torch.save(predictor.state_dict(), ckpt_dir / "predictor.pt")
+    torch.save(mask_embedding.state_dict(), ckpt_dir / "mask_embedding.pt")
     torch.save(
         {"step": step, "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()},
         ckpt_dir / "trainer_state.pt",
@@ -305,9 +320,14 @@ def save_checkpoint(output_dir: Path, step: int, online, predictor, optimizer, s
     logger.info(f"Checkpoint saved → {ckpt_dir}")
 
 
-def load_checkpoint(ckpt_dir: Path, predictor, optimizer, scheduler):
+def load_checkpoint(ckpt_dir: Path, predictor, mask_embedding, optimizer, scheduler):
     state = torch.load(ckpt_dir / "trainer_state.pt", map_location="cpu", weights_only=False)
     predictor.load_state_dict(torch.load(ckpt_dir / "predictor.pt", map_location="cpu"))
+    mask_path = ckpt_dir / "mask_embedding.pt"
+    if mask_path.exists():
+        mask_embedding.load_state_dict(torch.load(mask_path, map_location="cpu"))
+    else:
+        logger.warning("mask_embedding.pt not found in %s; using freshly initialized mask embedding", ckpt_dir)
     optimizer.load_state_dict(state["optimizer"])
     scheduler.load_state_dict(state["scheduler"])
     logger.info(f"Resumed from step {state['step']} ({ckpt_dir})")
@@ -339,8 +359,8 @@ def parse_args():
     p.add_argument("--lambda_jepa", type=float, default=1.0)
     p.add_argument("--lambda_red",  type=float, default=1.0)
     # JEPA config
-    p.add_argument("--future_len",  type=int,   default=256,  help="Last N tokens as JEPA target window")
-    p.add_argument("--mask_ratio",  type=float, default=0.15,  help="Fraction of future tokens to mask")
+    p.add_argument("--future_len",  type=int,   default=256,  help="Only used for CPT preview logging")
+    p.add_argument("--num_mask_events", type=int, default=1, help="Randomly mask this many complete events per sample")
     p.add_argument("--ema_decay",   type=float, default=0.96)
     p.add_argument("--pred_mlp_ratio", type=float, default=4.0, help="Predictor MLP inner dim ratio")
     # Efficiency
@@ -413,8 +433,7 @@ def main():
         collate_fn=partial(
             collate_fn,
             eos_token_id=eos_token_id,
-            future_len=args.future_len,
-            mask_ratio=args.mask_ratio,
+            num_mask_events=args.num_mask_events,
         ),
     )
 
@@ -483,7 +502,7 @@ def main():
         raw = online.module if is_ddp else online
         raw = getattr(raw, "_orig_mod", raw)
         raw.from_pretrained(ckpt)
-        global_step = load_checkpoint(ckpt, predictor, optimizer, scheduler)
+        global_step = load_checkpoint(ckpt, predictor, mask_embedding, optimizer, scheduler)
 
     # ── Unwrap helpers for EMA update ─────────────────────────────────────────
     def get_raw_online():
@@ -522,7 +541,7 @@ def main():
 
             full_ids    = batch["full_input_ids"].to(device)
             mask_pos    = batch["masked_positions"].to(device)    # (B, T) bool
-            ev_bounds   = batch["event_boundaries"]               # list[list[(start, red_pos)]]
+            masked_ev_bounds = batch["masked_event_boundaries"]   # list[list[(start, eos_pos)]]
             B, T        = full_ids.shape
 
             if tokens_per_step is None:
@@ -532,51 +551,48 @@ def main():
                 synchronize()
                 t0 = time.time()
 
-            # ── Part 1 + Part 3: full sequence forward ─────────────────────
-            full_out = online(
-                input_ids=full_ids,
-                labels=full_ids,
-                output_hidden_states=True,
-            )
-            loss_cpt  = full_out.loss
-            full_h    = full_out.hidden_states[-1]    # (B, T, D)
+            # ── Part 1: full-sequence CPT ──────────────────────────────────
+            full_out = online(input_ids=full_ids, labels=full_ids)
+            loss_cpt = full_out.loss
 
-            # ── Part 3: RED-align loss ─────────────────────────────────────
-            loss_red  = full_h.new_zeros(())
-            n_events  = 0
-            for b in range(B):
-                for (ev_start, red_pos) in ev_bounds[b]:
-                    # token hiddens inside the event, excluding the EOS itself
-                    # +1 to skip the opening token (mirrors user's reference code)
-                    ev_h = full_h[b, ev_start + 1 : red_pos]
-                    if ev_h.shape[0] == 0:
-                        continue
-                    avg_h = ev_h.mean(dim=0)
-                    loss_red = loss_red + F.mse_loss(full_h[b, red_pos], avg_h.detach())
-                    n_events += 1
-            if n_events > 0:
-                loss_red = loss_red / n_events
+            loss_jepa = torch.zeros((), device=device, dtype=torch.float32)
+            loss_red = torch.zeros((), device=device, dtype=torch.float32)
 
-            # ── Part 2: JEPA forward ────────────────────────────────────────
-            embed_tokens = get_raw_online().get_input_embeddings()
-            masked_embeds = mask_embedding.apply(full_ids, embed_tokens, mask_pos)
-            masked_out = online(
-                inputs_embeds=masked_embeds,
-                output_hidden_states=True,
-            )
-            online_h   = masked_out.hidden_states[-1]             # (B, T, D)
-            pred_h     = predictor(online_h)                      # (B, T, D)
-
-            with torch.no_grad():
-                teacher_h = teacher(
-                    input_ids=full_ids,
+            # ── Part 2 + Part 3: event-masked predictor/teacher alignment ──
+            if args.lambda_jepa > 0 or args.lambda_red > 0:
+                embed_tokens = get_raw_online().get_input_embeddings()
+                masked_embeds = mask_embedding.apply(full_ids, embed_tokens, mask_pos)
+                masked_out = online(
+                    inputs_embeds=masked_embeds,
                     output_hidden_states=True,
-                ).hidden_states[-1]                               # (B, T, D)
+                )
+                online_h = masked_out.hidden_states[-1]          # (B, T, D)
+                pred_h = predictor(online_h)                     # (B, T, D)
 
-            # MSE only at masked positions
-            pred_masked   = pred_h[mask_pos]                      # (N, D)
-            target_masked = teacher_h[mask_pos].detach()          # (N, D)
-            loss_jepa = F.mse_loss(pred_masked, target_masked)
+                with torch.no_grad():
+                    teacher_h = teacher(
+                        input_ids=full_ids,
+                        output_hidden_states=True,
+                    ).hidden_states[-1]                          # (B, T, D)
+
+                if args.lambda_jepa > 0:
+                    pred_masked = pred_h[mask_pos]               # (N, D)
+                    target_masked = teacher_h[mask_pos].detach() # (N, D)
+                    if pred_masked.shape[0] > 0:
+                        loss_jepa = F.mse_loss(pred_masked, target_masked)
+
+                if args.lambda_red > 0:
+                    red_terms = []
+                    for b in range(B):
+                        for ev_start, eos_pos in masked_ev_bounds[b]:
+                            pred_event = pred_h[b, ev_start:eos_pos]
+                            if pred_event.shape[0] == 0:
+                                continue
+                            red_terms.append(
+                                F.mse_loss(pred_event.mean(dim=0), teacher_h[b, eos_pos].detach())
+                            )
+                    if red_terms:
+                        loss_red = torch.stack(red_terms).mean()
 
             # ── Combined loss ───────────────────────────────────────────────
             loss = (
@@ -641,7 +657,7 @@ def main():
                         (args.save_at_steps and global_step in args.save_at_steps)
                     )
                     if should_save:
-                        save_checkpoint(output_dir, global_step, online, predictor, optimizer, scheduler, args)
+                        save_checkpoint(output_dir, global_step, online, predictor, mask_embedding, optimizer, scheduler, args)
 
     # ── Final save ─────────────────────────────────────────────────────────────
     if rank == 0:
@@ -653,6 +669,7 @@ def main():
             (predictor.module if is_ddp else predictor).state_dict(),
             final_dir / "predictor.pt",
         )
+        torch.save(mask_embedding.state_dict(), final_dir / "mask_embedding.pt")
         tokenizer.save_pretrained(final_dir)
         logger.info(f"Final model saved → {final_dir}")
         logger.info(f"Total training time (excl. first {TIMING_WARMUP} steps): {total_train_time/60:.2f}m")
