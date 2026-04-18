@@ -226,6 +226,7 @@ def log_tokenization_preview(texts, tokenizer, encoder, n_examples=5, seed=0):
         n_examples,
         encoder.ADD_SPECIAL_TOKENS,
     )
+    logger.info("Pooling mode: %s", encoder.pooling_mode)
     logger.info("=" * 80)
 
     for preview_idx, text_idx in enumerate(sample_indices, start=1):
@@ -235,11 +236,20 @@ def log_tokenization_preview(texts, tokenizer, encoder, n_examples=5, seed=0):
             padding=False,
             truncation=False,
             add_special_tokens=encoder.ADD_SPECIAL_TOKENS,
+            return_tensors="pt",
         )
-        input_ids = encoded["input_ids"]
+        input_ids_tensor = encoded["input_ids"]
+        attention_mask = encoded["attention_mask"]
+        input_ids = input_ids_tensor[0].tolist()
         tokens = tokenizer.convert_ids_to_tokens(input_ids)
         decoded_with_special = tokenizer.decode(input_ids, skip_special_tokens=False)
         decoded_without_special = tokenizer.decode(input_ids, skip_special_tokens=True)
+        special_token_ids = set(tokenizer.all_special_ids) if encoder.ADD_SPECIAL_TOKENS else None
+        pool_mask = encoder.build_pool_mask(
+            attention_mask=attention_mask,
+            input_ids=input_ids_tensor,
+            special_token_ids=special_token_ids,
+        )[0].tolist()
 
         logger.info("[Preview %s] event_index=%s", preview_idx, text_idx)
         logger.info("  original_text: %s", text)
@@ -247,6 +257,15 @@ def log_tokenization_preview(texts, tokenizer, encoder, n_examples=5, seed=0):
         logger.info("  tokens: %s", tokens)
         logger.info("  decoded(skip_special_tokens=False): %s", decoded_with_special)
         logger.info("  decoded(skip_special_tokens=True):  %s", decoded_without_special)
+        logger.info("  token_contributes_to_embedding:")
+        for token_pos, (token_id, token_text, keep) in enumerate(zip(input_ids, tokens, pool_mask)):
+            logger.info(
+                "    [%02d] id=%s keep=%s token=%r",
+                token_pos,
+                token_id,
+                bool(keep),
+                token_text,
+            )
         logger.info("-" * 80)
 
 
@@ -256,15 +275,27 @@ def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument(
         "--unique_events_path",
-        default="EHRSHOT_ASSETS/features/unique_event_rows.parquet",
+        default="data/01_outputs/unique_events.parquet",
         help="Parquet produced by extract_unique_events.py.",
     )
     p.add_argument("--model_name",   default="michiyasunaga/BioLinkBERT-base",
-                   help="HuggingFace model name or local path.")
+                   help="Base HuggingFace model name. Also used as the default tokenizer source.")
+    p.add_argument("--model_path",   default=None,
+                   help="Optional local checkpoint/model path for AutoModel.from_pretrained. Defaults to --model_name.")
+    p.add_argument("--tokenizer_name", default=None,
+                   help="Optional tokenizer source for AutoTokenizer.from_pretrained. Defaults to --model_name.")
     p.add_argument("--encoder",      default="biolinkbert",
                    help="Encoder backend name. Controls model defaults, Jinja template, and pooling.")
     p.add_argument("--template_path", default=None,
                    help="Optional custom Jinja template path for event text formatting.")
+    p.add_argument("--append_token_text", default=None,
+                   help="Optional token text appended to the end of every rendered event text.")
+    p.add_argument("--append_token_name", default=None,
+                   help="Optional existing tokenizer token attribute to append, e.g. pad_token or eos_token.")
+    p.add_argument("--pool_max_tokens", type=int, default=None,
+                   help="Optional cap: mean-pool over only the first N valid tokens after masking.")
+    p.add_argument("--pooling_mode", default="mean", choices=["mean", "suffix_only"],
+                   help="How to collapse token hidden states into one event embedding.")
     p.add_argument("--output_dir",   default="data/biolinkbert_embeddings")
     p.add_argument("--batch_size",   type=int, default=256,
                    help="Tokenisation + forward-pass batch size per rank.")
@@ -278,6 +309,13 @@ def parse_args():
                    help="Run model in float16 (saves GPU memory, minor precision loss).")
     p.add_argument("--bf16",         action="store_true",
                    help="Run model in bfloat16.")
+    p.add_argument(
+        "--attn_implementation",
+        default=None,
+        choices=["eager", "sdpa", "flash_attention_2"],
+        help="Optional attention implementation passed to AutoModel.from_pretrained. "
+             "Useful for decoder-only models such as Qwen when matching training-time inference behavior.",
+    )
     p.add_argument("--local_files_only", action="store_true",
                    help="Load model from local cache only (no HuggingFace download).")
     return p.parse_args()
@@ -291,7 +329,13 @@ def main():
         args.encoder,
         model_name=args.model_name,
         template_path=args.template_path,
+        append_token_text=args.append_token_text,
+        append_token_name=args.append_token_name,
+        pool_max_tokens=args.pool_max_tokens,
+        pooling_mode=args.pooling_mode,
     )
+    model_source = args.model_path or encoder.model_name
+    tokenizer_source = args.tokenizer_name or encoder.model_name
 
     # ── Distributed setup ─────────────────────────────────────────────────────
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -320,6 +364,18 @@ def main():
     if is_dist:
         dist.barrier()   # ensure dirs exist before all ranks proceed
 
+    if rank == 0 and args.append_token_name and not encoder.append_token_text:
+        tokenizer_preview = AutoTokenizer.from_pretrained(
+            tokenizer_source, **({} if not args.local_files_only else {"local_files_only": True})
+        )
+        encoder.resolve_append_token(tokenizer_preview)
+        logger.info(
+            "Resolved append_token_name=%s to token=%r using tokenizer=%s",
+            args.append_token_name,
+            encoder.append_token_text,
+            tokenizer_source,
+        )
+
     # ── Phase 1: render unique event texts (rank 0 only) ──────────────────────
     if rank == 0:
         event_df = build_event_index(
@@ -347,20 +403,32 @@ def main():
     if shard_npy.exists() and shard_json.exists():
         logger.info(f"[Rank {rank}] Shard already exists — skipping encoding.")
     else:
-        logger.info(f"[Rank {rank}] Loading encoder={args.encoder} model={encoder.model_name} ...")
+        logger.info(
+            f"[Rank {rank}] Loading encoder={args.encoder} "
+            f"model={model_source} tokenizer={tokenizer_source} ..."
+        )
         model_kwargs = {}
         if args.fp16:
-            model_kwargs["torch_dtype"] = torch.float16
+            model_kwargs["dtype"] = torch.float16
         elif args.bf16:
-            model_kwargs["torch_dtype"] = torch.bfloat16
+            model_kwargs["dtype"] = torch.bfloat16
+        if args.attn_implementation is not None:
+            model_kwargs["attn_implementation"] = args.attn_implementation
         if args.local_files_only:
             model_kwargs["local_files_only"] = True
 
         tokenizer = AutoTokenizer.from_pretrained(
-            encoder.model_name, **({} if not args.local_files_only else {"local_files_only": True})
+            tokenizer_source, **({} if not args.local_files_only else {"local_files_only": True})
         )
-        model = AutoModel.from_pretrained(encoder.model_name, **model_kwargs).to(device)
+        model = AutoModel.from_pretrained(model_source, **model_kwargs).to(device)
+        tokenizer, model = encoder.configure_tokenizer_and_model(tokenizer, model)
         model.eval()
+        logger.info(
+            "[Rank %s] Loaded model with dtype=%s attn_implementation=%s",
+            rank,
+            str(model.dtype),
+            args.attn_implementation or "default",
+        )
 
         if rank == 0 and args.preview_tokenization_n > 0:
             log_tokenization_preview(
@@ -404,7 +472,13 @@ def main():
         logger.info(f"Outputs:")
         logger.info(f"  {output_dir}/event_index.parquet  — event_id, event_text, code, value, unit")
         logger.info(f"  {output_dir}/embeddings.npy       — shape ({n_total}, {hidden_size}), float32")
-        logger.info(f"  encoder={args.encoder}  model={encoder.model_name}  template={encoder.template_path}")
+        logger.info(
+            f"  encoder={args.encoder}  model={model_source}  tokenizer={tokenizer_source}  "
+            f"attn_implementation={args.attn_implementation or 'default'}  "
+            f"base_model={encoder.model_name}  template={encoder.template_path}  "
+            f"append_token={encoder.append_token_text}  append_token_name={encoder.append_token_name}  "
+            f"pool_max_tokens={encoder.pool_max_tokens}  pooling_mode={encoder.pooling_mode}"
+        )
         logger.info(f"  Lookup: embeddings[event_index[event_index.event_text == text].event_id[0]]")
 
     if is_dist:
