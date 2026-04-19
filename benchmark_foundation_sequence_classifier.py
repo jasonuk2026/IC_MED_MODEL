@@ -117,10 +117,10 @@ def build_event_text_map(args) -> Dict[int, str]:
         args.encoder,
         model_name=args.model_paths[0],
         template_path=args.template_path,
-        append_token_text=args.append_token_text,
-        append_token_name=args.append_token_name,
+        append_token_text=None,
+        append_token_name=None,
         pool_max_tokens=args.pool_max_tokens,
-        pooling_mode=args.pooling_mode,
+        pooling_mode="mean",
     )
     event_df = pd.read_parquet(args.unique_events_path)
     required_cols = {"event_id", "omop_table", "event_type", "code", "description", "value", "unit"}
@@ -164,8 +164,7 @@ def build_sequence_rows(
     event_text_map: Dict[int, str],
     max_events: Optional[int],
     truncate_side: str,
-    event_separator: str,
-) -> List[Tuple[str, int]]:
+) -> List[Tuple[List[str], int]]:
     seq_rows = []
     dropped = 0
     for event_ids, label in rows:
@@ -173,9 +172,9 @@ def build_sequence_rows(
         parts = [event_text_map[int(eid)] for eid in kept_ids if int(eid) in event_text_map]
         if not parts:
             dropped += 1
-            seq_rows.append(("", label))
+            seq_rows.append(([], label))
             continue
-        seq_rows.append((event_separator.join(parts), label))
+        seq_rows.append((parts, label))
     if dropped:
         logger.info("Encountered %d rows with no encodable events after truncation.", dropped)
     return seq_rows
@@ -209,37 +208,82 @@ def get_sequence_embeddings(outputs, enc, tokenizer, encoder):
 
 @torch.inference_mode()
 def encode_sequence_rows(
-    seq_rows: List[Tuple[str, int]],
+    seq_rows: List[Tuple[List[str], int]],
     model,
     tokenizer,
     encoder,
     batch_size: int,
+    event_separator: str,
     device: torch.device,
     desc: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    texts = [text for text, _ in seq_rows]
+    event_lists = [events for events, _ in seq_rows]
     labels = np.asarray([float(label) for _, label in seq_rows], dtype=np.float32)
     hidden_size = int(model.config.hidden_size)
-    features = np.zeros((len(texts), hidden_size), dtype=np.float32)
+    features = np.zeros((len(event_lists), hidden_size), dtype=np.float32)
     encoder.resolve_append_token(tokenizer)
     if encoder.append_token_text:
         ok = encoder._set_append_token_id_from_existing_vocab(tokenizer)
         if not ok:
             raise ValueError("Sequence benchmark requires append token to already exist in tokenizer vocab.")
 
-    for start in tqdm(range(0, len(texts), batch_size), desc=desc, dynamic_ncols=True):
-        batch_texts = texts[start:start + batch_size]
-        enc = tokenizer(
-            batch_texts,
-            padding=True,
-            truncation=False,
-            add_special_tokens=encoder.ADD_SPECIAL_TOKENS,
-            return_tensors="pt",
-        ).to(device)
+    sep_ids = []
+    if event_separator:
+        sep_ids = tokenizer(
+            event_separator,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )["input_ids"]
+
+    for start in tqdm(range(0, len(event_lists), batch_size), desc=desc, dynamic_ncols=True):
+        batch_events = event_lists[start:start + batch_size]
+        batch_ids = []
+        for events in batch_events:
+            flat_ids = []
+            for event_idx, event_text in enumerate(events):
+                event_ids = tokenizer(
+                    event_text,
+                    add_special_tokens=False,
+                    return_attention_mask=False,
+                )["input_ids"]
+                flat_ids.extend(event_ids)
+                if encoder.append_token_id is not None:
+                    flat_ids.append(int(encoder.append_token_id))
+                if sep_ids and event_idx != len(events) - 1:
+                    flat_ids.extend(sep_ids)
+            batch_ids.append(flat_ids)
+
+        max_len = max((len(ids) for ids in batch_ids), default=1)
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            raise ValueError("Tokenizer %s has no pad_token_id" % tokenizer.__class__.__name__)
+        input_ids = torch.full((len(batch_ids), max_len), pad_id, dtype=torch.long, device=device)
+        attention_mask = torch.zeros((len(batch_ids), max_len), dtype=torch.long, device=device)
+        for row_idx, ids in enumerate(batch_ids):
+            if not ids:
+                continue
+            input_ids[row_idx, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+            attention_mask[row_idx, :len(ids)] = 1
+
+        enc = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
         outputs = model(**enc, return_dict=True)
         batch_embs = get_sequence_embeddings(outputs, enc, tokenizer, encoder)
         batch_embs = encoder.postprocess_embeddings(batch_embs).cpu().numpy()
-        features[start:start + len(batch_texts)] = batch_embs
+        if encoder.pooling_mode == "all_suffix_mean":
+            suffix_counts = (input_ids == int(encoder.append_token_id)).sum(dim=1).tolist()
+            if start == 0:
+                logger.info(
+                    "First sequence batch suffix counts: min=%d p50=%d max=%d",
+                    int(min(suffix_counts)),
+                    int(sorted(suffix_counts)[len(suffix_counts) // 2]),
+                    int(max(suffix_counts)),
+                )
+            if min(suffix_counts) <= 0:
+                raise ValueError("all_suffix_mean encountered a sequence with no suffix tokens in the encoded batch")
+        features[start:start + len(batch_events)] = batch_embs
 
     return features, labels
 
@@ -342,6 +386,7 @@ def main():
                 tokenizer=tokenizer,
                 encoder=encoder,
                 batch_size=args.batch_size,
+                event_separator=args.event_separator,
                 device=device,
                 desc="%s train encode" % task,
             )
@@ -351,6 +396,7 @@ def main():
                 tokenizer=tokenizer,
                 encoder=encoder,
                 batch_size=args.batch_size,
+                event_separator=args.event_separator,
                 device=device,
                 desc="%s test encode" % task,
             )
