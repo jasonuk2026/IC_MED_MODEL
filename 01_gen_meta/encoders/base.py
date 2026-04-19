@@ -156,7 +156,7 @@ def build_pool_mask(
     max_tokens=None,
     pooling_mode="mean",
 ):
-    if pooling_mode not in {"mean", "suffix_only"}:
+    if pooling_mode not in {"mean", "suffix_only", "all_suffix_mean"}:
         raise ValueError("Unknown pooling_mode={!r}".format(pooling_mode))
 
     if pooling_mode == "suffix_only":
@@ -172,6 +172,19 @@ def build_pool_mask(
         if not bool(suffix_matches.all()):
             raise ValueError("suffix_only pooling expected the final valid token to be the configured append token")
         pool_mask[row_idx, valid_lengths] = True
+        return pool_mask
+
+    if pooling_mode == "all_suffix_mean":
+        if input_ids is None:
+            raise ValueError("all_suffix_mean pooling requires input_ids")
+        if suffix_token_id is None:
+            raise ValueError("all_suffix_mean pooling requires append_token_text or append_token_name")
+        pool_mask = attention_mask.bool() & (input_ids == suffix_token_id)
+        if max_tokens is not None:
+            if max_tokens <= 0:
+                raise ValueError("max_tokens must be positive, got {}".format(max_tokens))
+            token_ord = torch.cumsum(pool_mask.long(), dim=1)
+            pool_mask = pool_mask & (token_ord <= max_tokens)
         return pool_mask
 
     pool_mask = attention_mask.bool()

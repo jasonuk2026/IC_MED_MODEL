@@ -294,7 +294,7 @@ def parse_args():
                    help="Optional existing tokenizer token attribute to append, e.g. pad_token or eos_token.")
     p.add_argument("--pool_max_tokens", type=int, default=None,
                    help="Optional cap: mean-pool over only the first N valid tokens after masking.")
-    p.add_argument("--pooling_mode", default="mean", choices=["mean", "suffix_only"],
+    p.add_argument("--pooling_mode", default="mean", choices=["mean", "suffix_only", "all_suffix_mean"],
                    help="How to collapse token hidden states into one event embedding.")
     p.add_argument("--output_dir",   default="data/biolinkbert_embeddings")
     p.add_argument("--batch_size",   type=int, default=256,
