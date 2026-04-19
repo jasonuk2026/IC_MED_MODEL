@@ -348,10 +348,10 @@ def main():
         rows_cache[(task, "train")] = train_rows
         rows_cache[(task, "test")] = test_rows
         seq_rows_cache[(task, "train")] = build_sequence_rows(
-            train_rows, event_text_map, args.max_events, args.truncate_side, args.event_separator
+            train_rows, event_text_map, args.max_events, args.truncate_side
         )
         seq_rows_cache[(task, "test")] = build_sequence_rows(
-            test_rows, event_text_map, args.max_events, args.truncate_side, args.event_separator
+            test_rows, event_text_map, args.max_events, args.truncate_side
         )
 
     all_results = {}
