@@ -47,7 +47,7 @@ class DiseaseEventCrossAttentionClassifier(nn.Module):
         self.dropout_p = dropout
         self.dtype = dtype
 
-        self.register_buffer("task_text_embs", task_text_embs.to(dtype))
+        self.register_buffer("task_text_embs", task_text_embs.detach().clone().to(dtype))
 
         self.event_norm = nn.RMSNorm(bert_dim).to(dtype)
         self.event_proj = nn.Linear(bert_dim, hidden_size, bias=False).to(dtype)
