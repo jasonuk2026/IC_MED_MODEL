@@ -16,7 +16,7 @@ from tqdm import tqdm
 from model_concat_classifier import DiseaseEventConcatClassifier
 from model_cross_attention_classifier import DiseaseEventCrossAttentionClassifier
 from model_soft_token_classifier import DiseaseEventSoftTokenClassifier
-from train_embedding_disease_cond_v2 import (
+from train_disease_soft_token_classifier import (
     TASK_2_DISEASE_NAME,
     TASK_2_IDX,
     EmbeddingStore,
@@ -43,6 +43,8 @@ def parse_args():
     p.add_argument("--eval_data_paths", nargs="+", required=True)
     p.add_argument("--bert_embeddings", required=True)
     p.add_argument("--disease_model_name", default="michiyasunaga/BioLinkBERT-base")
+    p.add_argument("--disease_model_path", default=None)
+    p.add_argument("--disease_tokenizer_name", default=None)
     p.add_argument("--tasks", nargs="+", default=list(sorted(TASK_2_DISEASE_NAME.keys())))
     p.add_argument("--output_dir", default="figures/classifier_score_distributions")
     p.add_argument("--output_name", default=None)
@@ -179,7 +181,7 @@ def main():
 
     logger.info("Loading embeddings from %s", args.bert_embeddings)
     store = EmbeddingStore(args.bert_embeddings)
-    task_text_embs = build_task_text_embs(args, device, rank=0, is_ddp=False)
+    task_text_embs = build_task_text_embs(args, device, rank=0, is_ddp=False, expected_dim=store.dim)
     model = _load_model(args, task_text_embs, device, dtype)
     model.eval()
 
