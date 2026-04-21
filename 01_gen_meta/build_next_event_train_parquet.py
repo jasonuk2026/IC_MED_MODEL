@@ -285,6 +285,14 @@ def main():
         "avg_events_per_row": sum(r["num_events"] for r in rows) / max(len(rows), 1),
     }
     meta_path.write_text(json.dumps(meta, indent=2))
+    print(
+        "Summary: samples=%s  patients=%s  events=%s"
+        % (
+            f"{meta['num_rows']:,}",
+            f"{meta['num_patients']:,}",
+            f"{sum(r['num_events'] for r in rows):,}",
+        )
+    )
     print(f"Metadata -> {meta_path}")
     print("Done.")
 
