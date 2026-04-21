@@ -38,6 +38,7 @@ _INCLUDE_CONDITION_OCCURRENCE = False
 _EVENT_TOKEN_MAP: dict[tuple[str, str, str, str], list[int]] = {}
 _EOS_TOKEN_ID = None
 _EVENTS_PER_ROW = None
+_APPEND_EOS_PER_EVENT = True
 
 
 def normalize_optional_str(x) -> str | None:
@@ -94,13 +95,15 @@ def _init_worker(
     include_condition_occurrence: bool,
     eos_token_id: int,
     events_per_row: int,
+    append_eos_per_event: bool,
 ):
-    global _PATIENT_GROUPS, _EVENT_TOKEN_MAP, _INCLUDE_CONDITION_OCCURRENCE, _EOS_TOKEN_ID, _EVENTS_PER_ROW
+    global _PATIENT_GROUPS, _EVENT_TOKEN_MAP, _INCLUDE_CONDITION_OCCURRENCE, _EOS_TOKEN_ID, _EVENTS_PER_ROW, _APPEND_EOS_PER_EVENT
     _PATIENT_GROUPS = patient_groups
     _EVENT_TOKEN_MAP = event_token_map
     _INCLUDE_CONDITION_OCCURRENCE = include_condition_occurrence
     _EOS_TOKEN_ID = eos_token_id
     _EVENTS_PER_ROW = events_per_row
+    _APPEND_EOS_PER_EVENT = append_eos_per_event
 
 
 def chunk_event_lists(xs: list[list[int]], chunk_size: int) -> list[list[list[int]]]:
@@ -122,7 +125,9 @@ def _process_patient(patient_id: int) -> list[dict]:
                 f"(patient_id={patient_id}, omop_table={ev['omop_table']!r}, code={ev['code']!r}, "
                 f"value={ev['value']!r}, unit={ev['unit']!r})."
             )
-        ids = [int(x) for x in token_ids] + [int(_EOS_TOKEN_ID)]
+        ids = [int(x) for x in token_ids]
+        if _APPEND_EOS_PER_EVENT:
+            ids.append(int(_EOS_TOKEN_ID))
         event_token_ids.append(ids)
 
     if len(event_token_ids) < _EVENTS_PER_ROW:
@@ -150,8 +155,13 @@ def parse_args():
     p.add_argument("--ehr_csv", default=None)
     p.add_argument("--unique_event_parquet", default="data/01_outputs/unique_events.parquet")
     p.add_argument("--output_path", default="data/next_event_train/qwen3_0.6b_patient_events.parquet")
-    p.add_argument("--template_path", default="encode_events/event_to_text.j2")
+    p.add_argument("--template_path", default="01_gen_meta/templates/biolinkbert_event.j2")
     p.add_argument("--include_condition_occurrence", action="store_true")
+    p.add_argument(
+        "--no_append_eos_per_event",
+        action="store_true",
+        help="Do not append tokenizer pad/eos token at the end of each event.",
+    )
     p.add_argument("--max_patients", type=int, default=None)
     p.add_argument("--events_per_row", type=int, default=1024)
     p.add_argument("--local_files_only", action="store_true")
@@ -243,6 +253,7 @@ def main():
             args.include_condition_occurrence,
             int(eos_token_id),
             args.events_per_row,
+            (not args.no_append_eos_per_event),
         ),
     ) as pool:
         for patient_rows in tqdm(
@@ -277,6 +288,7 @@ def main():
         "tokenize_batch_size": args.tokenize_batch_size,
         "eos_token": eos_token,
         "eos_token_id": int(eos_token_id),
+        "append_eos_per_event": bool(not args.no_append_eos_per_event),
         "include_condition_occurrence": bool(args.include_condition_occurrence),
         "events_per_row": args.events_per_row,
         "num_unique_events": len(event_token_map),
