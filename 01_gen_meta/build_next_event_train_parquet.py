@@ -28,6 +28,7 @@ OMOP_TABLE_PREFIX = {
 
 OUTPUT_SCHEMA = pa.schema([
     pa.field("patient_id", pa.int64()),
+    pa.field("chunk_idx", pa.int32()),
     pa.field("num_events", pa.int32()),
     pa.field("event_token_ids", pa.list_(pa.list_(pa.int32()))),
 ])
@@ -36,7 +37,7 @@ _PATIENT_GROUPS: dict[int, pd.DataFrame] = {}
 _INCLUDE_CONDITION_OCCURRENCE = False
 _EVENT_TOKEN_MAP: dict[tuple[str, str, str, str], list[int]] = {}
 _EOS_TOKEN_ID = None
-_MAX_EVENTS_PER_PATIENT = None
+_EVENTS_PER_ROW = None
 
 
 def normalize_optional_str(x) -> str | None:
@@ -92,17 +93,22 @@ def _init_worker(
     event_token_map: dict[tuple[str, str, str, str], list[int]],
     include_condition_occurrence: bool,
     eos_token_id: int,
-    max_events_per_patient: int | None,
+    events_per_row: int,
 ):
-    global _PATIENT_GROUPS, _EVENT_TOKEN_MAP, _INCLUDE_CONDITION_OCCURRENCE, _EOS_TOKEN_ID, _MAX_EVENTS_PER_PATIENT
+    global _PATIENT_GROUPS, _EVENT_TOKEN_MAP, _INCLUDE_CONDITION_OCCURRENCE, _EOS_TOKEN_ID, _EVENTS_PER_ROW
     _PATIENT_GROUPS = patient_groups
     _EVENT_TOKEN_MAP = event_token_map
     _INCLUDE_CONDITION_OCCURRENCE = include_condition_occurrence
     _EOS_TOKEN_ID = eos_token_id
-    _MAX_EVENTS_PER_PATIENT = max_events_per_patient
+    _EVENTS_PER_ROW = events_per_row
 
 
-def _process_patient(patient_id: int) -> dict | None:
+def chunk_event_lists(xs: list[list[int]], chunk_size: int) -> list[list[list[int]]]:
+    n_full = len(xs) // chunk_size
+    return [xs[i * chunk_size : (i + 1) * chunk_size] for i in range(n_full)]
+
+
+def _process_patient(patient_id: int) -> list[dict]:
     events_df = _PATIENT_GROUPS[int(patient_id)]
     event_token_ids: list[list[int]] = []
     for _, ev in events_df.iterrows():
@@ -119,22 +125,24 @@ def _process_patient(patient_id: int) -> dict | None:
         ids = [int(x) for x in token_ids] + [int(_EOS_TOKEN_ID)]
         event_token_ids.append(ids)
 
-    if _MAX_EVENTS_PER_PATIENT is not None and len(event_token_ids) > _MAX_EVENTS_PER_PATIENT:
-        event_token_ids = event_token_ids[-_MAX_EVENTS_PER_PATIENT:]
+    if len(event_token_ids) < _EVENTS_PER_ROW:
+        return []
 
-    if len(event_token_ids) < 2:
-        return None
-
-    return {
-        "patient_id": int(patient_id),
-        "num_events": int(len(event_token_ids)),
-        "event_token_ids": event_token_ids,
-    }
+    chunks = chunk_event_lists(event_token_ids, _EVENTS_PER_ROW)
+    return [
+        {
+            "patient_id": int(patient_id),
+            "chunk_idx": int(chunk_idx),
+            "num_events": int(len(chunk)),
+            "event_token_ids": chunk,
+        }
+        for chunk_idx, chunk in enumerate(chunks)
+    ]
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Build patient-level event-token parquet for next-event prediction training.",
+        description="Build fixed-event-count patient chunks for next-event prediction training.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--tokenizer_name", default="Qwen/Qwen3-0.6B")
@@ -145,7 +153,7 @@ def parse_args():
     p.add_argument("--template_path", default="encode_events/event_to_text.j2")
     p.add_argument("--include_condition_occurrence", action="store_true")
     p.add_argument("--max_patients", type=int, default=None)
-    p.add_argument("--max_events_per_patient", type=int, default=None)
+    p.add_argument("--events_per_row", type=int, default=1024)
     p.add_argument("--local_files_only", action="store_true")
     p.add_argument("--num_workers", type=int, default=16)
     p.add_argument("--tokenize_batch_size", type=int, default=4096)
@@ -234,25 +242,26 @@ def main():
             event_token_map,
             args.include_condition_occurrence,
             int(eos_token_id),
-            args.max_events_per_patient,
+            args.events_per_row,
         ),
     ) as pool:
-        for row in tqdm(
+        for patient_rows in tqdm(
             pool.imap(_process_patient, patient_groups.keys(), chunksize=chunksize),
             total=len(patient_groups),
             desc="patients",
             dynamic_ncols=True,
         ):
-            if row is not None:
-                rows.append(row)
+            if patient_rows:
+                rows.extend(patient_rows)
 
     if not rows:
         raise ValueError("No patient rows were created. Check input paths and filtering options.")
 
-    print(f"Writing {len(rows):,} patient rows to {output_path}")
+    print(f"Writing {len(rows):,} chunk rows to {output_path}")
     table = pa.table(
         {
             "patient_id": pa.array([r["patient_id"] for r in rows], type=pa.int64()),
+            "chunk_idx": pa.array([r["chunk_idx"] for r in rows], type=pa.int32()),
             "num_events": pa.array([r["num_events"] for r in rows], type=pa.int32()),
             "event_token_ids": pa.array([r["event_token_ids"] for r in rows], type=pa.list_(pa.list_(pa.int32()))),
         },
@@ -269,10 +278,11 @@ def main():
         "eos_token": eos_token,
         "eos_token_id": int(eos_token_id),
         "include_condition_occurrence": bool(args.include_condition_occurrence),
-        "max_events_per_patient": args.max_events_per_patient,
+        "events_per_row": args.events_per_row,
         "num_unique_events": len(event_token_map),
-        "num_patients": len(rows),
-        "avg_events_per_patient": sum(r["num_events"] for r in rows) / max(len(rows), 1),
+        "num_rows": len(rows),
+        "num_patients": len({r["patient_id"] for r in rows}),
+        "avg_events_per_row": sum(r["num_events"] for r in rows) / max(len(rows), 1),
     }
     meta_path.write_text(json.dumps(meta, indent=2))
     print(f"Metadata -> {meta_path}")
