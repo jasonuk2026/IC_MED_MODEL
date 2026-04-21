@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import logging
 import math
 import os
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -31,7 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class CPTDataset(Dataset):
+class PatientEventDataset(Dataset):
     def __init__(self, parquet_path: str):
         pf = pq.ParquetFile(parquet_path)
         meta = pf.metadata
@@ -42,7 +40,7 @@ class CPTDataset(Dataset):
         self.path = parquet_path
         self.row_group_offsets = offsets
         self.total_rows = total
-        logger.info("Dataset: %s blocks across %d row groups", f"{total:,}", len(offsets))
+        logger.info("Dataset: %s patient rows across %d row groups", f"{total:,}", len(offsets))
         self._pf = None
         self._cached_rg_idx = -1
         self._cached_col = None
@@ -50,7 +48,7 @@ class CPTDataset(Dataset):
     def __len__(self) -> int:
         return self.total_rows
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(self, idx: int) -> list[list[int]]:
         offsets = self.row_group_offsets
         lo, hi = 0, len(offsets) - 1
         while lo < hi:
@@ -64,24 +62,10 @@ class CPTDataset(Dataset):
         if self._pf is None:
             self._pf = pq.ParquetFile(self.path)
         if rg_idx != self._cached_rg_idx:
-            rg = self._pf.read_row_group(rg_idx, columns=["input_ids"])
-            self._cached_col = rg.column("input_ids")
+            rg = self._pf.read_row_group(rg_idx, columns=["event_token_ids"])
+            self._cached_col = rg.column("event_token_ids")
             self._cached_rg_idx = rg_idx
-        return torch.tensor(self._cached_col[row_in_rg].as_py(), dtype=torch.long)
-
-
-def split_events(input_ids: torch.Tensor, eos_token_id: int) -> list[list[int]]:
-    ids = input_ids.tolist()
-    events = []
-    start = 0
-    for pos, tok in enumerate(ids):
-        if tok == eos_token_id:
-            if pos >= start:
-                event = ids[start : pos + 1]
-                if event:
-                    events.append(event)
-            start = pos + 1
-    return events
+        return [[int(x) for x in ev] for ev in self._cached_col[row_in_rg].as_py()]
 
 
 def truncate_event_tokens(event_ids: list[int], max_event_tokens: int, eos_token_id: int) -> list[int]:
@@ -94,19 +78,18 @@ def truncate_event_tokens(event_ids: list[int], max_event_tokens: int, eos_token
 
 
 def collate_event_sequences(
-    batch: list[torch.Tensor],
+    batch: list[list[list[int]]],
     *,
-    eos_token_id: int,
     max_events: int,
     max_event_tokens: int,
     truncate_side: str,
 ):
     patient_events = []
     for sample in batch:
-        events = split_events(sample, eos_token_id)
+        events = sample
         if max_events is not None and len(events) > max_events:
             events = events[-max_events:] if truncate_side == "last" else events[:max_events]
-        events = [truncate_event_tokens(ev, max_event_tokens, eos_token_id) for ev in events]
+        events = [truncate_event_tokens(ev, max_event_tokens, ev[-1]) for ev in events if ev]
         if len(events) < 2:
             events = []
         patient_events.append(events)
@@ -127,7 +110,8 @@ def collate_event_sequences(
 
     if flat_events:
         max_len = max(len(ev) for ev in flat_events)
-        event_input_ids = torch.full((len(flat_events), max_len), eos_token_id, dtype=torch.long)
+        pad_token_id = flat_events[0][-1]
+        event_input_ids = torch.full((len(flat_events), max_len), pad_token_id, dtype=torch.long)
         event_attention_mask = torch.zeros((len(flat_events), max_len), dtype=torch.long)
         event_last_pos = torch.zeros(len(flat_events), dtype=torch.long)
         for row_idx, event_ids in enumerate(flat_events):
@@ -136,7 +120,7 @@ def collate_event_sequences(
             event_attention_mask[row_idx, :n] = 1
             event_last_pos[row_idx] = n - 1
     else:
-        event_input_ids = torch.full((1, 1), eos_token_id, dtype=torch.long)
+        event_input_ids = torch.zeros((1, 1), dtype=torch.long)
         event_attention_mask = torch.zeros((1, 1), dtype=torch.long)
         event_last_pos = torch.zeros(1, dtype=torch.long)
 
@@ -359,12 +343,7 @@ def main():
             config=vars(args),
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, local_files_only=args.local_files_only)
-    eos_token_id = tokenizer.pad_token_id
-    if eos_token_id is None:
-        raise ValueError("Tokenizer %s has no pad_token_id/eos delimiter configured" % args.model_name)
-
-    dataset = CPTDataset(args.data_path)
+    dataset = PatientEventDataset(args.data_path)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
     loader = DataLoader(
         dataset,
@@ -376,7 +355,6 @@ def main():
         drop_last=True,
         collate_fn=lambda batch: collate_event_sequences(
             batch,
-            eos_token_id=eos_token_id,
             max_events=args.max_events,
             max_event_tokens=args.max_event_tokens,
             truncate_side=args.truncate_side,
