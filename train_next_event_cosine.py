@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -16,8 +17,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, logging as hf_logging
-from transformers.models.qwen3.modeling_qwen3 import create_causal_mask, create_sliding_window_causal_mask
+from transformers import AutoModel, AutoTokenizer, logging as hf_logging
 
 hf_logging.set_verbosity_warning()
 
@@ -40,7 +40,7 @@ class PatientEventDataset(Dataset):
         self.path = parquet_path
         self.row_group_offsets = offsets
         self.total_rows = total
-        logger.info("Dataset: %s patient rows across %d row groups", f"{total:,}", len(offsets))
+        logger.info("Dataset: %s rows across %d row groups", f"{total:,}", len(offsets))
         self._pf = None
         self._cached_rg_idx = -1
         self._cached_col = None
@@ -68,90 +68,97 @@ class PatientEventDataset(Dataset):
         return [[int(x) for x in ev] for ev in self._cached_col[row_in_rg].as_py()]
 
 
-def truncate_event_tokens(event_ids: list[int], max_event_tokens: int, eos_token_id: int) -> list[int]:
-    if len(event_ids) <= max_event_tokens:
-        return event_ids
-    trimmed = event_ids[-max_event_tokens:]
-    if trimmed[-1] != eos_token_id:
-        trimmed[-1] = eos_token_id
-    return trimmed
+def _truncate_tokens(token_ids: list[int], max_event_tokens: int, truncate_side: str) -> list[int]:
+    if len(token_ids) <= max_event_tokens:
+        return token_ids
+    if truncate_side == "last":
+        return token_ids[-max_event_tokens:]
+    return token_ids[:max_event_tokens]
 
 
 def collate_event_sequences(
     batch: list[list[list[int]]],
     *,
+    pad_token_id: int,
     max_events: int,
     max_event_tokens: int,
-    truncate_side: str,
+    sequence_truncate_side: str,
+    event_truncate_side: str,
 ):
-    patient_events = []
-    for sample in batch:
-        events = sample
-        if max_events is not None and len(events) > max_events:
-            events = events[-max_events:] if truncate_side == "last" else events[:max_events]
-        events = [truncate_event_tokens(ev, max_event_tokens, ev[-1]) for ev in events if ev]
-        if len(events) < 2:
-            events = []
-        patient_events.append(events)
+    batch_size = len(batch)
+    event_input_ids = torch.full((batch_size, max_events, max_event_tokens), pad_token_id, dtype=torch.long)
+    event_attention_mask = torch.zeros((batch_size, max_events, max_event_tokens), dtype=torch.long)
+    event_last_pos = torch.zeros((batch_size, max_events), dtype=torch.long)
+    sequence_event_mask = torch.zeros((batch_size, max_events), dtype=torch.long)
+    num_real_events = 0
 
-    batch_size = len(patient_events)
-    max_num_events = max((len(events) for events in patient_events), default=0)
-    if max_num_events == 0:
-        max_num_events = 1
-
-    flat_events = []
-    flat_to_sample = []
-    flat_to_event_idx = []
-    for sample_idx, events in enumerate(patient_events):
-        for event_idx, event_ids in enumerate(events):
-            flat_events.append(event_ids)
-            flat_to_sample.append(sample_idx)
-            flat_to_event_idx.append(event_idx)
-
-    if flat_events:
-        max_len = max(len(ev) for ev in flat_events)
-        pad_token_id = flat_events[0][-1]
-        event_input_ids = torch.full((len(flat_events), max_len), pad_token_id, dtype=torch.long)
-        event_attention_mask = torch.zeros((len(flat_events), max_len), dtype=torch.long)
-        event_last_pos = torch.zeros(len(flat_events), dtype=torch.long)
-        for row_idx, event_ids in enumerate(flat_events):
-            n = len(event_ids)
-            event_input_ids[row_idx, :n] = torch.tensor(event_ids, dtype=torch.long)
-            event_attention_mask[row_idx, :n] = 1
-            event_last_pos[row_idx] = n - 1
-    else:
-        event_input_ids = torch.zeros((1, 1), dtype=torch.long)
-        event_attention_mask = torch.zeros((1, 1), dtype=torch.long)
-        event_last_pos = torch.zeros(1, dtype=torch.long)
-
-    sequence_event_mask = torch.zeros((batch_size, max_num_events), dtype=torch.long)
-    sequence_index_map = torch.full((batch_size, max_num_events), -1, dtype=torch.long)
-    for flat_idx, (sample_idx, event_idx) in enumerate(zip(flat_to_sample, flat_to_event_idx)):
-        sequence_event_mask[sample_idx, event_idx] = 1
-        sequence_index_map[sample_idx, event_idx] = flat_idx
+    for sample_idx, sample_events in enumerate(batch):
+        events = sample_events
+        if len(events) > max_events:
+            events = events[-max_events:] if sequence_truncate_side == "last" else events[:max_events]
+        for event_idx, event_ids in enumerate(events[:max_events]):
+            if not event_ids:
+                continue
+            ids = _truncate_tokens(event_ids, max_event_tokens, event_truncate_side)
+            n = len(ids)
+            event_input_ids[sample_idx, event_idx, :n] = torch.tensor(ids, dtype=torch.long)
+            event_attention_mask[sample_idx, event_idx, :n] = 1
+            event_last_pos[sample_idx, event_idx] = n - 1
+            sequence_event_mask[sample_idx, event_idx] = 1
+            num_real_events += 1
 
     return {
         "event_input_ids": event_input_ids,
         "event_attention_mask": event_attention_mask,
         "event_last_pos": event_last_pos,
         "sequence_event_mask": sequence_event_mask,
-        "sequence_index_map": sequence_index_map,
-        "num_real_events": int(len(flat_events)),
+        "num_real_events": int(num_real_events),
     }
 
 
-def build_mask_mapping(config, hidden_states, attention_mask, position_ids):
-    mask_kwargs = {
-        "config": config,
-        "inputs_embeds": hidden_states,
-        "attention_mask": attention_mask,
-        "past_key_values": None,
-        "position_ids": position_ids,
-    }
-    mask_map = {"full_attention": create_causal_mask(**mask_kwargs)}
-    if "sliding_attention" in config.layer_types:
-        mask_map["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
-    return mask_map
+class SmallCausalTransformerPredictor(nn.Module):
+    def __init__(
+        self,
+        *,
+        input_dim: int,
+        hidden_dim: int,
+        num_heads: int,
+        ffn_dim: int,
+        num_layers: int,
+        max_events: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.position_embed = nn.Embedding(max_events, hidden_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=ffn_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.output_proj = nn.Linear(hidden_dim, input_dim)
+
+    def forward(self, event_embeddings: torch.Tensor, sequence_event_mask: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = event_embeddings.shape
+        position_ids = torch.arange(seq_len, device=event_embeddings.device).unsqueeze(0).expand(batch_size, -1)
+        hidden = self.input_proj(event_embeddings) + self.position_embed(position_ids)
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=event_embeddings.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        hidden = self.encoder(
+            hidden,
+            mask=causal_mask,
+            src_key_padding_mask=(sequence_event_mask == 0),
+        )
+        hidden = self.norm(hidden)
+        return self.output_proj(hidden)
 
 
 class NextEventCosineModel(nn.Module):
@@ -159,96 +166,107 @@ class NextEventCosineModel(nn.Module):
         self,
         *,
         model_name: str,
-        event_encoder_layers: int,
+        max_events: int,
+        predictor_hidden_size: int,
+        predictor_num_heads: int,
+        predictor_ffn_dim: int,
+        predictor_num_layers: int,
+        predictor_dropout: float,
+        freeze_event_encoder: bool,
+        event_encoder_batch_size: int,
         torch_dtype: torch.dtype,
         attn_implementation: str,
         local_files_only: bool,
     ):
         super().__init__()
-        self.backbone = AutoModelForCausalLM.from_pretrained(
+        self.event_encoder = AutoModel.from_pretrained(
             model_name,
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
             local_files_only=local_files_only,
         )
-        self.model = self.backbone.model
-        self.event_encoder_layers = event_encoder_layers
-        self.hidden_size = self.backbone.config.hidden_size
+        self.hidden_size = int(self.event_encoder.config.hidden_size)
+        self.freeze_event_encoder = bool(freeze_event_encoder)
+        self.event_encoder_batch_size = int(event_encoder_batch_size)
+        if self.freeze_event_encoder:
+            for p in self.event_encoder.parameters():
+                p.requires_grad = False
+            self.event_encoder.eval()
 
-        total_layers = len(self.model.layers)
-        if event_encoder_layers <= 0 or event_encoder_layers >= total_layers:
-            raise ValueError(
-                "event_encoder_layers must be in [1, %d), got %d" % (total_layers, event_encoder_layers)
-            )
-        self.total_layers = total_layers
+        if predictor_hidden_size <= 0:
+            raise ValueError("predictor_hidden_size must be > 0")
+        if predictor_hidden_size % predictor_num_heads != 0:
+            raise ValueError("predictor_hidden_size must be divisible by predictor_num_heads")
+        predictor_ffn_dim = predictor_hidden_size if predictor_ffn_dim <= 0 else predictor_ffn_dim
 
-    def save_checkpoint(self, save_dir: Path):
+        self.predictor = SmallCausalTransformerPredictor(
+            input_dim=self.hidden_size,
+            hidden_dim=predictor_hidden_size,
+            num_heads=predictor_num_heads,
+            ffn_dim=predictor_ffn_dim,
+            num_layers=predictor_num_layers,
+            max_events=max_events,
+            dropout=predictor_dropout,
+        )
+
+    def save_checkpoint(self, save_dir: Path, args_dict: dict):
         save_dir.mkdir(parents=True, exist_ok=True)
-        self.backbone.save_pretrained(save_dir)
+        payload = {
+            "state_dict": self.state_dict(),
+            "args": args_dict,
+            "event_encoder_config": self.event_encoder.config.to_dict(),
+        }
+        torch.save(payload, save_dir / "model.pt")
+        (save_dir / "training_args.json").write_text(json.dumps(args_dict, indent=2, sort_keys=True))
         logger.info("Saved checkpoint -> %s", save_dir)
 
-    def _run_layers(self, hidden_states, attention_mask, position_ids, start_idx: int, end_idx: int):
-        mask_map = build_mask_mapping(self.backbone.config, hidden_states, attention_mask, position_ids)
-        position_embeddings = self.model.rotary_emb(hidden_states, position_ids)
-        for layer_idx in range(start_idx, end_idx):
-            layer = self.model.layers[layer_idx]
-            hidden_states = layer(
-                hidden_states,
-                attention_mask=mask_map[self.backbone.config.layer_types[layer_idx]],
-                position_embeddings=position_embeddings,
-                position_ids=position_ids,
-                past_key_values=None,
-                use_cache=False,
-            )
-        return hidden_states
-
-    def encode_events(self, event_input_ids, event_attention_mask, event_last_pos):
-        hidden_states = self.model.embed_tokens(event_input_ids)
-        position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
-        hidden_states = self._run_layers(
-            hidden_states,
-            event_attention_mask,
-            position_ids,
-            0,
-            self.event_encoder_layers,
+    def _encode_event_batch(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, last_pos: torch.Tensor) -> torch.Tensor:
+        outputs = self.event_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=True,
         )
+        hidden_states = outputs.last_hidden_state
         row_idx = torch.arange(hidden_states.shape[0], device=hidden_states.device)
-        return hidden_states[row_idx, event_last_pos]
+        return hidden_states[row_idx, last_pos]
 
-    def model_event_sequence(self, event_embeddings, sequence_event_mask):
-        position_ids = torch.arange(event_embeddings.shape[1], device=event_embeddings.device).unsqueeze(0)
-        hidden_states = self._run_layers(
-            event_embeddings,
-            sequence_event_mask,
-            position_ids,
-            self.event_encoder_layers,
-            self.total_layers,
-        )
-        return hidden_states
+    def encode_events(
+        self,
+        event_input_ids: torch.Tensor,
+        event_attention_mask: torch.Tensor,
+        event_last_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, num_events, max_event_tokens = event_input_ids.shape
+        flat_input_ids = event_input_ids.reshape(batch_size * num_events, max_event_tokens)
+        flat_attention_mask = event_attention_mask.reshape(batch_size * num_events, max_event_tokens)
+        flat_last_pos = event_last_pos.reshape(batch_size * num_events)
+        chunk_size = self.event_encoder_batch_size or flat_input_ids.shape[0]
+        chunks = []
+        encoder_ctx = torch.no_grad() if self.freeze_event_encoder else torch.enable_grad()
+        with encoder_ctx:
+            for start in range(0, flat_input_ids.shape[0], chunk_size):
+                end = min(start + chunk_size, flat_input_ids.shape[0])
+                chunk_embs = self._encode_event_batch(
+                    flat_input_ids[start:end],
+                    flat_attention_mask[start:end],
+                    flat_last_pos[start:end],
+                )
+                if self.freeze_event_encoder:
+                    chunk_embs = chunk_embs.detach()
+                chunks.append(chunk_embs)
+        flat_event_embeddings = torch.cat(chunks, dim=0)
+        return flat_event_embeddings.reshape(batch_size, num_events, self.hidden_size)
 
     def forward(
         self,
         *,
-        event_input_ids,
-        event_attention_mask,
-        event_last_pos,
-        sequence_event_mask,
-        sequence_index_map,
-    ):
-        real_event_embeddings = self.encode_events(event_input_ids, event_attention_mask, event_last_pos)
-        batch_size, max_num_events = sequence_index_map.shape
-        event_embeddings = torch.zeros(
-            batch_size,
-            max_num_events,
-            self.hidden_size,
-            dtype=real_event_embeddings.dtype,
-            device=real_event_embeddings.device,
-        )
-        valid = sequence_index_map >= 0
-        if valid.any():
-            event_embeddings[valid] = real_event_embeddings[sequence_index_map[valid]]
-
-        seq_hidden = self.model_event_sequence(event_embeddings, sequence_event_mask)
+        event_input_ids: torch.Tensor,
+        event_attention_mask: torch.Tensor,
+        event_last_pos: torch.Tensor,
+        sequence_event_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor | float]:
+        event_embeddings = self.encode_events(event_input_ids, event_attention_mask, event_last_pos)
+        seq_hidden = self.predictor(event_embeddings, sequence_event_mask)
         pred = seq_hidden[:, :-1, :]
         target = event_embeddings[:, 1:, :].detach()
         valid_pairs = (sequence_event_mask[:, :-1] > 0) & (sequence_event_mask[:, 1:] > 0)
@@ -259,7 +277,6 @@ class NextEventCosineModel(nn.Module):
                 "mean_cosine": zero,
                 "num_pairs": 0.0,
             }
-
         cosine = F.cosine_similarity(pred[valid_pairs], target[valid_pairs], dim=-1)
         loss = -cosine.mean()
         return {
@@ -275,12 +292,13 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, total_steps: i
             return step / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
+
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Train a next-event predictor by splitting Qwen into event encoder layers and sequence modeling layers.",
+        description="Train a next-event predictor with a full Qwen event encoder and a lightweight sequence model.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--data_path", required=True)
@@ -290,20 +308,28 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--grad_accum", type=int, default=1)
-    p.add_argument("--lr", type=float, default=2e-5)
-    p.add_argument("--weight_decay", type=float, default=0.1)
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--warmup_ratio", type=float, default=0.05)
-    p.add_argument("--event_encoder_layers", type=int, default=2)
     p.add_argument("--max_event_tokens", type=int, default=128)
     p.add_argument("--max_events", type=int, default=1024)
-    p.add_argument("--truncate_side", choices=["first", "last"], default="last")
+    p.add_argument("--sequence_truncate_side", choices=["first", "last"], default="last")
+    p.add_argument("--event_truncate_side", choices=["first", "last"], default="last")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--flash_attn", action="store_true")
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--fp16", action="store_true")
+    p.add_argument("--freeze_event_encoder", action="store_true")
     p.add_argument("--event_encoder_batch_size", type=int, default=0,
-                   help="Reserved for future chunking; 0 means encode all events in a training batch together.")
+                   help="How many flattened events to encode per backbone forward. 0 means encode the whole training batch at once.")
+    p.add_argument("--predictor_hidden_size", type=int, default=128)
+    p.add_argument("--predictor_num_heads", type=int, default=4)
+    p.add_argument("--predictor_ffn_dim", type=int, default=0, help="0 means use predictor_hidden_size.")
+    p.add_argument("--predictor_num_layers", type=int, default=1)
+    p.add_argument("--predictor_dropout", type=float, default=0.0)
+    p.add_argument("--compile", action="store_true")
+    p.add_argument("--compile_mode", default="default", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--save_every_epoch", action="store_true")
     p.add_argument("--log_steps", type=int, default=10)
     p.add_argument("--wandb_project", default=None)
@@ -320,7 +346,6 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_ddp = world_size > 1
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    synchronize = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
 
     if is_ddp:
         dist.init_process_group(backend="nccl", device_id=device)
@@ -336,12 +361,18 @@ def main():
     wandb_run = None
     if use_wandb:
         import wandb
+
         wandb_run = wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name or f"next-event-cosine-{datetime.now().strftime('%m%d-%H%M')}",
             tags=args.wandb_tags,
             config=vars(args),
         )
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, local_files_only=args.local_files_only)
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        raise ValueError(f"Tokenizer {args.model_name} has no pad_token_id")
 
     dataset = PatientEventDataset(args.data_path)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
@@ -355,38 +386,59 @@ def main():
         drop_last=True,
         collate_fn=lambda batch: collate_event_sequences(
             batch,
+            pad_token_id=pad_token_id,
             max_events=args.max_events,
             max_event_tokens=args.max_event_tokens,
-            truncate_side=args.truncate_side,
+            sequence_truncate_side=args.sequence_truncate_side,
+            event_truncate_side=args.event_truncate_side,
         ),
     )
 
     torch_dtype = torch.float32
+    autocast_dtype = None
     if args.bf16:
         torch_dtype = torch.bfloat16
+        autocast_dtype = torch.bfloat16
     elif args.fp16:
         torch_dtype = torch.float16
+        autocast_dtype = torch.float16
 
     attn_implementation = "flash_attention_2" if args.flash_attn else "eager"
-    logger.info("Loading backbone: %s", args.model_name)
+    logger.info("Loading event encoder backbone: %s", args.model_name)
     model = NextEventCosineModel(
         model_name=args.model_name,
-        event_encoder_layers=args.event_encoder_layers,
+        max_events=args.max_events,
+        predictor_hidden_size=args.predictor_hidden_size,
+        predictor_num_heads=args.predictor_num_heads,
+        predictor_ffn_dim=args.predictor_ffn_dim,
+        predictor_num_layers=args.predictor_num_layers,
+        predictor_dropout=args.predictor_dropout,
+        freeze_event_encoder=args.freeze_event_encoder,
+        event_encoder_batch_size=args.event_encoder_batch_size,
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
         local_files_only=args.local_files_only,
     ).to(device)
+
+    if args.compile:
+        model = torch.compile(model, mode=args.compile_mode)
     if is_ddp:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
-    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+    total_params = sum(p.numel() for p in model.parameters()) / 1e6
     if rank == 0:
         logger.info(
-            "Next-event cosine model: params=%.1fM event_encoder_layers=%d max_event_tokens=%d max_events=%d",
-            n_params,
-            args.event_encoder_layers,
-            args.max_event_tokens,
+            "Model: total_params=%.1fM trainable_params=%.3fM freeze_event_encoder=%s predictor_hidden=%d predictor_layers=%d predictor_heads=%d max_events=%d max_event_tokens=%d compile=%s",
+            total_params,
+            trainable_params,
+            args.freeze_event_encoder,
+            args.predictor_hidden_size,
+            args.predictor_num_layers,
+            args.predictor_num_heads,
             args.max_events,
+            args.max_event_tokens,
+            args.compile,
         )
 
     optimizer = torch.optim.AdamW(
@@ -401,11 +453,16 @@ def main():
 
     global_step = 0
     best_loss = float("inf")
+    raw_model = model.module if isinstance(model, DDP) else model
+    if raw_model.freeze_event_encoder:
+        raw_model.event_encoder.eval()
     model.train()
 
     for epoch in range(args.epochs):
         if is_ddp:
             sampler.set_epoch(epoch)
+        if raw_model.freeze_event_encoder:
+            raw_model.event_encoder.eval()
         optimizer.zero_grad()
         run_loss = 0.0
         run_cos = 0.0
@@ -418,14 +475,16 @@ def main():
         for batch_idx, batch in enumerate(pbar):
             if batch["num_real_events"] == 0:
                 continue
-            outputs = model(
-                event_input_ids=batch["event_input_ids"].to(device),
-                event_attention_mask=batch["event_attention_mask"].to(device),
-                event_last_pos=batch["event_last_pos"].to(device),
-                sequence_event_mask=batch["sequence_event_mask"].to(device),
-                sequence_index_map=batch["sequence_index_map"].to(device),
-            )
-            loss = outputs["loss"] / args.grad_accum
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            autocast_enabled = torch.cuda.is_available() and (autocast_dtype is not None)
+            with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_enabled):
+                outputs = model(
+                    event_input_ids=batch["event_input_ids"],
+                    event_attention_mask=batch["event_attention_mask"],
+                    event_last_pos=batch["event_last_pos"],
+                    sequence_event_mask=batch["sequence_event_mask"],
+                )
+                loss = outputs["loss"] / args.grad_accum
             loss.backward()
 
             run_loss += float(outputs["loss"].item())
@@ -480,14 +539,14 @@ def main():
                 epoch_avg_cos,
             )
             if args.save_every_epoch:
-                raw_model.save_checkpoint(output_dir / f"epoch_{epoch + 1}")
+                raw_model.save_checkpoint(output_dir / f"epoch_{epoch + 1}", vars(args))
             if epoch_avg_loss < best_loss:
                 best_loss = epoch_avg_loss
-                raw_model.save_checkpoint(output_dir / "best")
+                raw_model.save_checkpoint(output_dir / "best", vars(args))
 
     if rank == 0:
         raw_model = model.module if isinstance(model, DDP) else model
-        raw_model.save_checkpoint(output_dir / "final")
+        raw_model.save_checkpoint(output_dir / "final", vars(args))
         if wandb_run is not None:
             wandb_run.finish()
 
