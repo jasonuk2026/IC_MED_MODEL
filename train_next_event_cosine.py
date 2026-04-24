@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO,
+    stream=sys.stdout,
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
