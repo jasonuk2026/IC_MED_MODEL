@@ -181,9 +181,14 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, local_files_only=args.local_files_only)
     eos_token = tokenizer.pad_token
     eos_token_id = tokenizer.pad_token_id
-    if eos_token_id is None:
+    append_eos_per_event = not args.no_append_eos_per_event
+    if append_eos_per_event and eos_token_id is None:
         raise ValueError("Tokenizer has no pad_token_id; cannot append end-of-event token.")
-    print(f"Using end-of-event token: {eos_token!r} (id={eos_token_id})")
+    print(f"Tokenizer pad/eos token: {eos_token!r} (id={eos_token_id})")
+    if append_eos_per_event:
+        print("Append end-of-event token to each event: yes")
+    else:
+        print("Append end-of-event token to each event: no")
 
     event_template = load_event_template(args.template_path)
 
@@ -253,7 +258,7 @@ def main():
             args.include_condition_occurrence,
             int(eos_token_id),
             args.events_per_row,
-            (not args.no_append_eos_per_event),
+            append_eos_per_event,
         ),
     ) as pool:
         for patient_rows in tqdm(
@@ -288,7 +293,7 @@ def main():
         "tokenize_batch_size": args.tokenize_batch_size,
         "eos_token": eos_token,
         "eos_token_id": int(eos_token_id),
-        "append_eos_per_event": bool(not args.no_append_eos_per_event),
+        "append_eos_per_event": bool(append_eos_per_event),
         "include_condition_occurrence": bool(args.include_condition_occurrence),
         "events_per_row": args.events_per_row,
         "num_unique_events": len(event_token_map),
