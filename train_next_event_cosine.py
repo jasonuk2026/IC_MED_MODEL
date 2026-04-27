@@ -13,14 +13,14 @@ import pyarrow.parquet as pq
 import torch
 torch._dynamo.config.capture_scalar_outputs = True
 torch._dynamo.config.allow_unspec_int_on_nn_module = True
+
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer, Qwen3Config, logging as hf_logging
-from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RMSNorm
+from transformers import AutoModel, AutoTokenizer, logging as hf_logging
 
 hf_logging.set_verbosity_warning()
 
@@ -32,6 +32,14 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger(__name__)
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    if isinstance(model, DDP):
+        model = model.module
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+    return model
 
 
 class PatientEventDataset(Dataset):
@@ -121,7 +129,7 @@ def collate_event_sequences(
     }
 
 
-class SmallCausalQwen3Predictor(nn.Module):
+class SmallCausalTransformerPredictor(nn.Module):
     def __init__(
         self,
         *,
@@ -135,47 +143,35 @@ class SmallCausalQwen3Predictor(nn.Module):
     ):
         super().__init__()
         self.input_proj = nn.Linear(input_dim, hidden_dim)
-        config = Qwen3Config(
-            hidden_size=hidden_dim,
-            num_attention_heads=num_heads,
-            num_key_value_heads=num_heads,
-            intermediate_size=ffn_dim,
-            num_hidden_layers=num_layers,
-            max_position_embeddings=max_events,
-            attention_dropout=dropout,
-            rms_norm_eps=1e-6,
+        self.position_embed = nn.Embedding(max_events, hidden_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=ffn_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
         )
-        self.layers = nn.ModuleList([
-            Qwen3DecoderLayer(config, layer_idx=i) for i in range(num_layers)
-        ])
-        self.norm = Qwen3RMSNorm(hidden_dim, eps=1e-6)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers, enable_nested_tensor=False)
+        self.norm = nn.LayerNorm(hidden_dim)
         self.output_proj = nn.Linear(hidden_dim, input_dim)
 
     def forward(self, event_embeddings: torch.Tensor, sequence_event_mask: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = event_embeddings.shape
-        hidden = self.input_proj(event_embeddings)
-        position_ids = torch.arange(seq_len, device=hidden.device).unsqueeze(0).expand(batch_size, -1)
-
-        # 4D additive mask: causal (upper tri = -inf) + padding (-inf for pad cols)
-        causal = torch.triu(
-            torch.full((seq_len, seq_len), float("-inf"), device=hidden.device, dtype=hidden.dtype),
+        position_ids = torch.arange(seq_len, device=event_embeddings.device).unsqueeze(0).expand(batch_size, -1)
+        hidden = self.input_proj(event_embeddings) + self.position_embed(position_ids)
+        causal_mask = torch.triu(
+            torch.ones(seq_len, seq_len, device=event_embeddings.device, dtype=torch.bool),
             diagonal=1,
-        ).unsqueeze(0).unsqueeze(0)  # [1, 1, seq, seq]
-        pad_bias = ((1 - sequence_event_mask.float()) * float("-inf")
-                    ).unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq]
-        attn_mask = causal + pad_bias  # [batch, 1, seq, seq]
-
-        for layer in self.layers:
-            hidden = layer(
-                hidden,
-                attention_mask=attn_mask,
-                position_ids=position_ids,
-                past_key_value=None,
-                output_attentions=False,
-                use_cache=False,
-            )[0]
-
-        return self.output_proj(self.norm(hidden))
+        )
+        hidden = self.encoder(
+            hidden,
+            mask=causal_mask,
+            src_key_padding_mask=(sequence_event_mask == 0),
+        )
+        hidden = self.norm(hidden)
+        return self.output_proj(hidden)
 
 
 class NextEventCosineModel(nn.Module):
@@ -217,7 +213,7 @@ class NextEventCosineModel(nn.Module):
             raise ValueError("predictor_hidden_size must be divisible by predictor_num_heads")
         predictor_ffn_dim = predictor_hidden_size if predictor_ffn_dim <= 0 else predictor_ffn_dim
 
-        self.predictor = SmallCausalQwen3Predictor(
+        self.predictor = SmallCausalTransformerPredictor(
             input_dim=self.hidden_size,
             hidden_dim=predictor_hidden_size,
             num_heads=predictor_num_heads,
@@ -229,10 +225,13 @@ class NextEventCosineModel(nn.Module):
 
     def save_checkpoint(self, save_dir: Path, args_dict: dict):
         save_dir.mkdir(parents=True, exist_ok=True)
+        event_encoder = self.event_encoder
+        if hasattr(event_encoder, "_orig_mod"):
+            event_encoder = event_encoder._orig_mod
         payload = {
             "state_dict": self.state_dict(),
             "args": args_dict,
-            "event_encoder_config": self.event_encoder.config.to_dict(),
+            "event_encoder_config": event_encoder.config.to_dict(),
         }
         torch.save(payload, save_dir / "model.pt")
         (save_dir / "training_args.json").write_text(json.dumps(args_dict, indent=2, sort_keys=True))
@@ -349,6 +348,12 @@ def parse_args():
     p.add_argument("--compile", action="store_true")
     p.add_argument("--compile_mode", default="default", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--save_every_epoch", action="store_true")
+    p.add_argument(
+        "--num_checkpoints",
+        type=int,
+        default=0,
+        help="Save this many evenly spaced step checkpoints across total optimizer steps. 0 disables step checkpointing.",
+    )
     p.add_argument("--log_steps", type=int, default=10)
     p.add_argument("--wandb_project", default=None)
     p.add_argument("--wandb_run_name", default=None)
@@ -468,10 +473,24 @@ def main():
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    checkpoint_steps = set()
+    if args.num_checkpoints > 0:
+        checkpoint_steps = {
+            max(1, min(total_steps, round(i * total_steps / args.num_checkpoints)))
+            for i in range(1, args.num_checkpoints + 1)
+        }
+        if rank == 0:
+            logger.info(
+                "Step checkpoints: requested=%d unique=%d total_steps=%d steps=%s",
+                args.num_checkpoints,
+                len(checkpoint_steps),
+                total_steps,
+                ",".join(str(x) for x in sorted(checkpoint_steps)),
+            )
 
     global_step = 0
     best_loss = float("inf")
-    raw_model = model.module if isinstance(model, DDP) else model
+    raw_model = unwrap_model(model)
     if raw_model.freeze_event_encoder:
         raw_model.event_encoder.eval()
     model.train()
@@ -485,6 +504,7 @@ def main():
         run_loss = 0.0
         run_cos = 0.0
         run_pairs = 0.0
+        run_batches = 0
         epoch_loss_sum = 0.0
         epoch_cos_sum = 0.0
         epoch_batches = 0
@@ -508,6 +528,7 @@ def main():
             run_loss += float(outputs["loss"].item())
             run_cos += float(outputs["mean_cosine"].item())
             run_pairs += float(outputs["num_pairs"])
+            run_batches += 1
             epoch_loss_sum += float(outputs["loss"].item())
             epoch_cos_sum += float(outputs["mean_cosine"].item())
             epoch_batches += 1
@@ -522,9 +543,14 @@ def main():
                 optimizer.zero_grad()
                 global_step += 1
 
+                if rank == 0 and global_step in checkpoint_steps:
+                    unwrap_model(model).save_checkpoint(output_dir / f"step_{global_step:06d}", vars(args))
+                    if wandb_run is not None:
+                        wandb_run.log({"checkpoint/saved_step": global_step}, step=global_step)
+
                 if rank == 0 and global_step % args.log_steps == 0:
-                    avg_loss = run_loss / max(args.log_steps, 1)
-                    avg_cos = run_cos / max(args.log_steps, 1)
+                    avg_loss = run_loss / max(run_batches, 1)
+                    avg_cos = run_cos / max(run_batches, 1)
                     pbar.set_postfix(
                         loss=f"{avg_loss:.4f}",
                         cosine=f"{avg_cos:.4f}",
@@ -536,7 +562,7 @@ def main():
                             {
                                 "train/loss": avg_loss,
                                 "train/mean_cosine": avg_cos,
-                                "train/num_pairs": run_pairs / max(args.log_steps, 1),
+                                "train/num_pairs": run_pairs / max(run_batches, 1),
                                 "train/lr": scheduler.get_last_lr()[0],
                             },
                             step=global_step,
@@ -544,9 +570,10 @@ def main():
                     run_loss = 0.0
                     run_cos = 0.0
                     run_pairs = 0.0
+                    run_batches = 0
 
         if rank == 0:
-            raw_model = model.module if isinstance(model, DDP) else model
+            raw_model = unwrap_model(model)
             epoch_avg_loss = epoch_loss_sum / max(epoch_batches, 1)
             epoch_avg_cos = epoch_cos_sum / max(epoch_batches, 1)
             logger.info(
@@ -563,7 +590,7 @@ def main():
                 raw_model.save_checkpoint(output_dir / "best", vars(args))
 
     if rank == 0:
-        raw_model = model.module if isinstance(model, DDP) else model
+        raw_model = unwrap_model(model)
         raw_model.save_checkpoint(output_dir / "final", vars(args))
         if wandb_run is not None:
             wandb_run.finish()

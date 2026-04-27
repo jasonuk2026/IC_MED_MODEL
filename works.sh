@@ -322,7 +322,7 @@ CUDA_VISIBLE_DEVICES=0 python train_next_event_cosine.py \
   --data_path hx1/qwen3_0.6b_patient_events.parquet \
   --model_name Qwen/Qwen3-0.6B \
   --output_dir hx1/next_event_cosine_single_gpu \
-  --epochs 5 \
+  --epochs 1 \
   --batch_size 2 \
   --grad_accum 8 \
   --lr 2e-4 \
@@ -343,7 +343,9 @@ CUDA_VISIBLE_DEVICES=0 python train_next_event_cosine.py \
   --bf16 \
   --flash_attn \
   --compile \
-  --log_steps 20
+  --log_steps 20 \
+  --num_checkpoints 10 \
+  --wandb_project mepa_trial
 
 git annex initremote jotta type=rclone rcloneremotename=jotta rcloneprefix=annex  encryption=none chunk=500MiB  --whatelse
 
