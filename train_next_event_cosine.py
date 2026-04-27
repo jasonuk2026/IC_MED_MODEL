@@ -274,6 +274,18 @@ class NextEventCosineModel(nn.Module):
         flat_event_embeddings = torch.cat(chunks, dim=0)
         return flat_event_embeddings.reshape(batch_size, num_events, self.hidden_size)
 
+    def encode_sequence_embeddings(
+        self,
+        *,
+        event_input_ids: torch.Tensor,
+        event_attention_mask: torch.Tensor,
+        event_last_pos: torch.Tensor,
+        sequence_event_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        event_embeddings = self.encode_events(event_input_ids, event_attention_mask, event_last_pos)
+        seq_embeddings = self.predictor(event_embeddings, sequence_event_mask)
+        return seq_embeddings, event_embeddings
+
     def forward(
         self,
         *,
@@ -282,8 +294,12 @@ class NextEventCosineModel(nn.Module):
         event_last_pos: torch.Tensor,
         sequence_event_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor | float]:
-        event_embeddings = self.encode_events(event_input_ids, event_attention_mask, event_last_pos)
-        seq_hidden = self.predictor(event_embeddings, sequence_event_mask)
+        seq_hidden, event_embeddings = self.encode_sequence_embeddings(
+            event_input_ids=event_input_ids,
+            event_attention_mask=event_attention_mask,
+            event_last_pos=event_last_pos,
+            sequence_event_mask=sequence_event_mask,
+        )
         pred = seq_hidden[:, :-1, :]
         target = event_embeddings[:, 1:, :].detach()
         valid_pairs = (sequence_event_mask[:, :-1] > 0) & (sequence_event_mask[:, 1:] > 0)
