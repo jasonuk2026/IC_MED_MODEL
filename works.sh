@@ -159,7 +159,10 @@ torchrun --nproc_per_node=4 train_disease_soft_token_classifier.py \
   --wandb_project medical_cond_embed \
   --wandb_tags soft_token_classifier
 
-torchrun --nproc_per_node=4 train_disease_soft_token_classifier.py   --train_data_dir data/llm_data_ixc_patch   --eval_data_paths data/llm_eval_data_ixc/new_acutemi/val.parquet data/llm_eval_data_ixc/new_celiac/val.parquet data/llm_eval_data_ixc/new_hyperlipidemia/val.parquet data/llm_eval_data_ixc/new_hypertension/val.parquet data/llm_eval_data_ixc/new_lupus/val.parquet data/llm_eval_data_ixc/new_pancan/val.parquet   --bert_embeddings data/embeddings.npy   --bf16   --batch_size 32   --eval_batch_size 32   --pad_to_num_events 1000   --num_workers 4   --prefetch_factor 8   --lr 2e-4   --warmup_ratio 0.1   --weight_decay 0.005   --grad_clip 1.0   --hidden_size 768   --num_layers 2   --num_heads 4   --head_layers 1   --pos_weight 1.0   --wandb_project medical_cond_embed   --wandb_tags soft_token_classifier --position_type learned --attention_type bidirectional --aux_loss_weight 0.2 --align_loss_weight 0.1
+torchrun --nproc_per_node=4 train_disease_soft_token_classifier.py   --train_data_dir data/02_collect_train_data_results   --eval_data_paths data/eval_data_latest/*/val.parquet   --bert_embeddings data/01_outputs/01_outputs_biolinkbert_embeddings/embeddings.npy   --bf16   --batch_size 32   --eval_batch_size 32   --pad_to_num_events 1000   --num_workers 4   --prefetch_factor 8   --lr 2e-4   --warmup_ratio 0.1   --weight_decay 0.005   --grad_clip 1.0   --hidden_size 768   --num_layers 2   --num_heads 4   --head_layers 1   --pos_weight 1.0   --wandb_project medical_cond_embed   --wandb_tags soft_token_classifier --position_type learned --attention_type bidirectional --aux_loss_weight 0.2 --align_loss_weight 0.1
+
+
+torchrun --nproc_per_node=4 train_disease_soft_token_classifier.py   --train_data_dir data/llm_data_ixc_patch   --eval_data_paths data/llm_eval_data_ixc/new_acutemi/val.parquet data/llm_eval_data_ixc/new_celiac/val.parquet data/llm_eval_data_ixc/new_hyperlipidemia/val.parquet data/llm_eval_data_ixc/new_hypertension/val.parquet data/llm_eval_data_ixc/new_lupus/val.parquet data/llm_eval_data_ixc/new_pancan/val.parquet   --bert_embeddings ./embeddings.npy   --bf16   --batch_size 32   --eval_batch_size 32   --pad_to_num_events 1000   --num_workers 4   --prefetch_factor 8   --lr 2e-4   --warmup_ratio 0.1   --weight_decay 0.005   --grad_clip 1.0   --hidden_size 768   --num_layers 2   --num_heads 4   --head_layers 1   --pos_weight 1.0   --wandb_project medical_cond_embed   --wandb_tags soft_token_classifier --position_type learned --attention_type bidirectional --aux_loss_weight 0.2 --align_loss_weight 0.1
 
 
 conda run -n torch python plot_classifier_score_distributions.py \
@@ -185,10 +188,125 @@ conda run -n torch python inspect_soft_token_attention.py \
   --top_k 4
 
 train_disease_soft_token_classifier.py --train_data_dir llm_data_ixc_patch --eval_data_paths llm_eval_data_ixc/new_*/val.parquet --bert_embeddings maybe_best_retrieval/embeddings.npy --bf16 --batch_size 32 --eval_batch_size 32 --pad_to_num_events 1000 --num_workers 4 --prefetch_factor 8 --lr 2e-4 --warmup_ratio 0.1 --weight_decay 0.005 --grad_clip 1.0 --hidden_size 768 --num_layers 2 --num_heads 4 --head_layers 1 --pos_weight 1.0 --wandb_project medical_cond_embed --wandb_tags soft_token_classifier --position_type learned --attention_type bidirectional --aux_loss_weight 0.2 --align_loss_weight 0.1 --train_data_epochs 0 1 2 3
-torchrun --standalone --nproc_per_node=2 train_disease_soft_token_classifier.py --train_data_dir data/02_collect_train_data_results --eval_data_paths data/llm_eval_data_ixc/new_*/val.parquet --bert_embeddings data/01_results/embeddings.npy --bf16 --batch_size 32 --eval_batch_size 32 --pad_to_num_events 1000 --num_workers 4 --prefetch_factor 8 --lr 2e-4 --warmup_ratio 0.1 --weight_decay 0.005 --grad_clip 1.0 --hidden_size 768 --num_layers 2 --num_heads 4 --head_layers 1 --pos_weight 1.0 --wandb_project medical_cond_embed --wandb_tags soft_token_classifier --position_type learned --attention_type bidirectional --aux_loss_weight 0.2 --align_loss_weight 0.1 --train_data_epochs 0
+torchrun --standalone --nproc_per_node=2 train_disease_soft_token_classifier.py --train_data_dir data/02_outputs --eval_data_paths data/02_outputs/new_*/val.parquet --bert_embeddings data/01_outputs/01_outputs_biolinkbert_embeddings/embeddings.npy --bf16 --batch_size 32 --eval_batch_size 32 --pad_to_num_events 1000 --num_workers 4 --prefetch_factor 8 --lr 2e-4 --warmup_ratio 0.1 --weight_decay 0.005 --grad_clip 1.0 --hidden_size 768 --num_layers 2 --num_heads 4 --head_layers 1 --pos_weight 1.0 --wandb_project medical_cond_embed --wandb_tags soft_token_classifier --position_type learned --attention_type bidirectional --aux_loss_weight 0.2 --align_loss_weight 0.1 --train_data_epochs 0 --disease_model_name michiyasunaga/BioLinkBERT-base
+
+
+torchrun --standalone --nproc_per_node=2 train_disease_soft_token_classifier.py --train_data_dir data/02_outputs --eval_data_paths data/02_outputs/new_*/val.parquet --bert_embeddings data/01_outputs/qwen3_0.6b_embs/embeddings.npy --bf16 --batch_size 32 --eval_batch_size 32 --pad_to_num_events 1000 --num_workers 4 --prefetch_factor 8 --lr 2e-4 --warmup_ratio 0.1 --weight_decay 0.005 --grad_clip 1.0 --hidden_size 768 --num_layers 2 --num_heads 4 --head_layers 1 --pos_weight 1.0 --wandb_project medical_cond_embed --wandb_tags soft_token_classifier --position_type learned --attention_type bidirectional --aux_loss_weight 0.2 --align_loss_weight 0.1 --disease_model_name Qwen/Qwen3-0.6B --train_data_epochs 0
 
 python 01_gen_meta/extract_event_emb.py \
   --unique_events_path data/01_outputs/unique_events.parquet \
   --encoder biolinkbert \
   --output_dir data/01_outputs_biolinkbert_embeddings \
   --preview_tokenization_n 5
+
+python 01_gen_meta/extract_event_emb.py --model_name Qwen/Qwen3-0.6B --encoder qwen3 --bf16 --output_dir data/01_outputs/qwen3_0.6b_uncpt_direct_mepa_embs --model_path data/qwen3_0.6b_uncpt_direct_mepa --tokenizer_name Qwen/Qwen3-0.6B
+
+torchrun --standalone --nproc_per_node=2 train_disease_soft_token_classifier.py --train_data_dir data/02_outputs --eval_data_paths data/02_outputs/new_*/val.parquet --bert_embeddings data/01_outputs/qwen3_0.6b_uncpt_direct_mepa_embs/embeddings.npy --bf16 --batch_size 32 --eval_batch_size 32 --pad_to_num_events 1000 --num_workers 4 --prefetch_factor 8 --lr 2e-4 --warmup_ratio 0.1 --weight_decay 0.005 --grad_clip 1.0 --hidden_size 768 --num_layers 2 --num_heads 4 --head_layers 1 --pos_weight 1.0 --wandb_project medical_cond_embed --wandb_tags soft_token_classifier --position_type learned --attention_type bidirectional --aux_loss_weight 0.2 --align_loss_weight 0.1 --disease_model_name Qwen/Qwen3-0.6B --disease_model_path data/qwen3_0.6b_uncpt_direct_mepa --disease_tokenizer_name Qwen/Qwen3-0.6B --train_data_epochs 0
+
+python 01_gen_meta/extract_event_emb.py --model_name Qwen/Qwen3-0.6B --encoder qwen3 --bf16 --output_dir data/01_outputs/qwen3_0.6b_cpt_1000_embs --model_path data/cpt_outputs/Qwen3-0.6B/checkpoint-1000 --tokenizer_name Qwen/Qwen3-0.6B
+
+torchrun --standalone --nproc_per_node=2 train_disease_soft_token_classifier.py --train_data_dir data/02_outputs --eval_data_paths data/02_outputs/new_*/val.parquet --bert_embeddings data/01_outputs/qwen3_0.6b_uncpt_direct_mepa_embs/embeddings.npy --bf16 --batch_size 64 --eval_batch_size 32 --pad_to_num_events 1000 --num_workers 4 --prefetch_factor 8 --lr 2e-4 --warmup_ratio 0.1 --weight_decay 0.005 --grad_clip 1.0 --hidden_size 768 --num_layers 2 --num_heads 4 --head_layers 1 --pos_weight 1.0 --wandb_project medical_cond_embed --wandb_tags soft_token_classifier --position_type learned --attention_type bidirectional --aux_loss_weight 0.2 --align_loss_weight 0.1 --disease_model_name Qwen/Qwen3-0.6B --train_data_epochs 0
+
+python 01_gen_meta/extract_event_emb.py \
+  --encoder qwen3 \
+  --model_name Qwen/Qwen3-0.6B \
+  --model_path data/qwen3_0.6b_uncpt_direct_mepa \
+  --tokenizer_name Qwen/Qwen3-0.6B \
+  --append_token_text "<EVENT_END>" \
+  --output_dir data/01_outputs/qwen_with_suffix
+
+CUDA_VISIBLE_DEVICES=1 python 01_gen_meta/extract_event_emb.py \
+  --encoder qwen3 \
+  --model_name Qwen/Qwen3-0.6B \
+  --model_path output/stage2_qwen3_0.6b_single_local01/checkpoint-250 \
+  --tokenizer_name Qwen/Qwen3-0.6B \
+  --output_dir data/01_outputs/qwen3_0.6b_uncpt_2nd_mepa_last_tokemb_local_250_lambdared_0.2_mlpr_1 --append_token_name pad_token --pooling_mode suffix_only
+
+CUDA_VISIBLE_DEVICES=0 python 01_gen_meta/extract_event_emb.py \
+  --encoder qwen3 \
+  --model_name Qwen/Qwen3-0.6B \
+  --model_path output/stage2_qwen3_evalwrap_test04/best \
+  --tokenizer_name Qwen/Qwen3-0.6B \
+  --append_token_name pad_token \
+  --pooling_mode suffix_only \
+  --output_dir data/01_outputs/run_temp_test/qwen --bf16 --attn_implementation flash_attention_2 && python3 benchmark_foundation_simple_classifier.py \
+  --embedding_dirs run_temp_test/qwen \
+  --eval_data_dir data/eval_data_latest \
+  --train_split val \
+  --test_split test \
+  --max_events 1000 \
+  --truncate_side first
+
+
+
+torchrun --nproc_per_node=2 01_gen_meta/extract_event_emb.py \
+  --encoder qwen3 \
+  --model_name Qwen/Qwen3-0.6B \
+  --model_path data/cpt_outputs/Qwen3-0.6B/final \
+  --tokenizer_name Qwen/Qwen3-0.6B \
+  --output_dir data/01_outputs/Qwen3-0.6B/final_cpt_nopad_mean_ddp
+
+bash run_one.sh --model_path test --output_name qwen3_0.6b_uncpt_2nd_mepa_last_tokemb_local_125_lambdared_0.2_mlpr_1 && bash run_one.sh --model_path test --output_name qwen3_0.6b_uncpt_2nd_mepa_last_tokemb_local_250_lambdared_0.2_mlpr_1
+
+torchrun --standalone --nproc_per_node=2 train_stage2.py \
+  --data_path data/verified_cpt_inputs_from_spike/qwen3_0.6b_block2048.parquet \
+  --model_name Qwen/Qwen3-0.6B \
+  --output_dir output/stage2_qwen3_0.6b_single_local01 \
+  --batch_size 2 \
+  --grad_accum 8 --num_mask_events 4 --flash_attn --compile --save_at_steps 125 250 1000 \
+  --ema_decay 0.996 --lambda_red 0 --lambda_jepa 0
+
+python3 benchmark_foundation_simple_classifier.py \
+  --embedding_dirs \
+    qwen3_0.6b_embs \
+    qwen3_0.6b_uncpt_direct_mepa_embs \
+    qwen3_0.6b_uncpt_2nd_mepa_last_tokemb \
+    qwen3_0.6b_uncpt_2nd_mepa_last_tokemb_local_1000_lambdared_0.2_mlpr_1 \
+    qwen3_0.6b_uncpt_2nd_mepa_last_tokemb_local_125_lambdared_0.2_mlpr_1 \
+    qwen3_0.6b_uncpt_2nd_mepa_last_tokemb_local_250_lambdared_0.2_mlpr_1 \
+    qwen3_0.6b_uncpt_direct_mepa_embs_with_pad_token_last_tokemb \
+    qwen3_0.6b_uncpt_direct_mepa_wo_red_embs_wo_pad_token_avg \
+    stage2_qwen3_0.6b_single_local01/checkpoint-125_padt_lasttok_lambda_jepa0_red0 \
+  --eval_data_dir data/eval_data_latest \
+  --max_events 1000 \
+  --truncate_side last
+
+python3 benchmark_foundation_simple_classifier.py \
+  --embedding_dirs \
+    qwen3_0.6b_embs \
+    qwen3_0.6b_uncpt_direct_mepa_embs \
+    qwen3_0.6b_uncpt_2nd_mepa_last_tokemb \
+    qwen3_0.6b_uncpt_2nd_mepa_last_tokemb_local_1000_lambdared_0.2_mlpr_1 \
+    qwen3_0.6b_uncpt_2nd_mepa_last_tokemb_local_125_lambdared_0.2_mlpr_1 \
+    qwen3_0.6b_uncpt_2nd_mepa_last_tokemb_local_250_lambdared_0.2_mlpr_1 \
+    qwen3_0.6b_uncpt_direct_mepa_embs_with_pad_token_last_tokemb \
+    qwen3_0.6b_uncpt_direct_mepa_wo_red_embs_wo_pad_token_avg \
+    stage2_qwen3_0.6b_single_local01/checkpoint-125_padt_lasttok_lambda_jepa0_red0 \
+    Qwen3-0.6B/final_cpt_nopad_mean \
+    Qwen3-0.6B/final_cpt_pad_suffix \
+  --eval_data_dir data/eval_data_latest \
+  --max_events 2000 \
+  --truncate_side last
+
+
+python3 benchmark_foundation_sequence_classifier.py \
+  --model_paths output/stage2_qwen3_evalwrap_submit04/best \
+  --tokenizer_name Qwen/Qwen3-0.6B \
+  --encoder qwen3 \
+  --eval_data_dir data/eval_data_latest --max_events 1000 --batch_size 4
+  
+python3 benchmark_foundation_sequence_classifier.py \
+  --model_paths output/stage2_qwen3_evalwrap_local01/best \
+  --tokenizer_name Qwen/Qwen3-0.6B \
+  --encoder qwen3 \
+  --eval_data_dir data/eval_data_latest --max_events 1000 --batch_size 2
+
+python3 benchmark_foundation_sequence_classifier.py \
+  --model_paths output/stage2_qwen3_evalwrap_submit04/best \
+  --tokenizer_name Qwen/Qwen3-0.6B \
+  --encoder qwen3 \
+  --append_token_name pad_token \
+  --pooling_mode all_suffix_mean \
+  --eval_data_dir data/eval_data_latest --max_events 1000 --batch_size 2
+
+

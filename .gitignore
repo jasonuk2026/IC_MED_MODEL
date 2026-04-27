@@ -24,3 +24,7 @@ core
 
 logs
 wandb
+data/
+figures/
+output/
+embeddings.npy
