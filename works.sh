@@ -310,3 +310,48 @@ python3 benchmark_foundation_sequence_classifier.py \
   --eval_data_dir data/eval_data_latest --max_events 1000 --batch_size 2
 
 
+python 01_gen_meta/build_next_event_train_parquet.py \
+  --tokenizer_name Qwen/Qwen3-0.6B \
+  --data_dir EHRSHOT_ASSETS \
+  --unique_event_parquet hx1/unique_events.parquet \
+  --output_path hx1/qwen3_0.6b_patient_events.parquet \
+  --events_per_row 1024 \
+  --no_append_eos_per_event
+
+CUDA_VISIBLE_DEVICES=0 python train_next_event_cosine.py \
+  --data_path hx1/qwen3_0.6b_patient_events.parquet \
+  --model_name Qwen/Qwen3-0.6B \
+  --output_dir hx1/next_event_cosine_single_gpu \
+  --epochs 5 \
+  --batch_size 2 \
+  --grad_accum 8 \
+  --lr 2e-4 \
+  --weight_decay 0.01 \
+  --warmup_ratio 0.05 \
+  --max_events 1024 \
+  --max_event_tokens 128 \
+  --sequence_truncate_side last \
+  --event_truncate_side last \
+  --freeze_event_encoder \
+  --predictor_hidden_size 128 \
+  --predictor_num_heads 4 \
+  --predictor_num_layers 1 \
+  --predictor_ffn_dim 128 \
+  --predictor_dropout 0.0 \
+  --event_encoder_batch_size 512 \
+  --num_workers 4 \
+  --bf16 \
+  --flash_attn \
+  --compile \
+  --log_steps 20
+
+git annex initremote jotta type=rclone rcloneremotename=jotta rcloneprefix=annex  encryption=none chunk=500MiB  --whatelse
+
+git annex initremote jotta \
+  type=rclone \
+  rcloneremotename=jotta \
+  rcloneprefix=git-annex encryption=none               
+
+git annex add EHRSHOT_ASSETS/splits/person_id_map.csv EHRSHOT_ASSETS/benchmark/*/labeled_patients.csv EHRSHOT_ASSETS/models/clmbr/token_2_code.json EHRSHOT_ASSETS/models/clmbr/token_2_description.json
+
+git add EHRSHOT_ASSETS/splits/person_id_map.csv EHRSHOT_ASSETS/benchmark/*/labeled_patients.csv EHRSHOT_ASSETS/models/clmbr/token_2_code.json EHRSHOT_ASSETS/models/clmbr/token_2_description.json -f

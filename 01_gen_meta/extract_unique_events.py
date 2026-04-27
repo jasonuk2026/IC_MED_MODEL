@@ -61,9 +61,9 @@ OUTPUT_SCHEMA = pa.schema([
 
 def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--ehrshot_csv", default="data/EHRSHOT_ASSETS/data/ehrshot.csv")
-    p.add_argument("--concept_csv", default="data/EHRSHOT_ASSETS/femr/logs/omop_dir/concept.csv")
-    p.add_argument("--output_path", default="data/01_outputs/unique_events.parquet")
+    p.add_argument("--ehrshot_csv", default="EHRSHOT_ASSETS/data/ehrshot.csv")
+    p.add_argument("--concept_csv", default="EHRSHOT_ASSETS/femr/logs/omop_dir/concept.csv")
+    p.add_argument("--output_path", default="hx1/unique_events.parquet")
     p.add_argument(
         "--include_condition_occurrence",
         action="store_true",

@@ -11,13 +11,16 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 import torch
+torch._dynamo.config.capture_scalar_outputs = True
+torch._dynamo.config.allow_unspec_int_on_nn_module = True
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer, logging as hf_logging
+from transformers import AutoModel, AutoTokenizer, Qwen3Config, logging as hf_logging
+from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RMSNorm
 
 hf_logging.set_verbosity_warning()
 
@@ -118,7 +121,7 @@ def collate_event_sequences(
     }
 
 
-class SmallCausalTransformerPredictor(nn.Module):
+class SmallCausalQwen3Predictor(nn.Module):
     def __init__(
         self,
         *,
@@ -132,35 +135,47 @@ class SmallCausalTransformerPredictor(nn.Module):
     ):
         super().__init__()
         self.input_proj = nn.Linear(input_dim, hidden_dim)
-        self.position_embed = nn.Embedding(max_events, hidden_dim)
-        layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=ffn_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        config = Qwen3Config(
+            hidden_size=hidden_dim,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_heads,
+            intermediate_size=ffn_dim,
+            num_hidden_layers=num_layers,
+            max_position_embeddings=max_events,
+            attention_dropout=dropout,
+            rms_norm_eps=1e-6,
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.layers = nn.ModuleList([
+            Qwen3DecoderLayer(config, layer_idx=i) for i in range(num_layers)
+        ])
+        self.norm = Qwen3RMSNorm(hidden_dim, eps=1e-6)
         self.output_proj = nn.Linear(hidden_dim, input_dim)
 
     def forward(self, event_embeddings: torch.Tensor, sequence_event_mask: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = event_embeddings.shape
-        position_ids = torch.arange(seq_len, device=event_embeddings.device).unsqueeze(0).expand(batch_size, -1)
-        hidden = self.input_proj(event_embeddings) + self.position_embed(position_ids)
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=event_embeddings.device, dtype=torch.bool),
+        hidden = self.input_proj(event_embeddings)
+        position_ids = torch.arange(seq_len, device=hidden.device).unsqueeze(0).expand(batch_size, -1)
+
+        # 4D additive mask: causal (upper tri = -inf) + padding (-inf for pad cols)
+        causal = torch.triu(
+            torch.full((seq_len, seq_len), float("-inf"), device=hidden.device, dtype=hidden.dtype),
             diagonal=1,
-        )
-        hidden = self.encoder(
-            hidden,
-            mask=causal_mask,
-            src_key_padding_mask=(sequence_event_mask == 0),
-        )
-        hidden = self.norm(hidden)
-        return self.output_proj(hidden)
+        ).unsqueeze(0).unsqueeze(0)  # [1, 1, seq, seq]
+        pad_bias = ((1 - sequence_event_mask.float()) * float("-inf")
+                    ).unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq]
+        attn_mask = causal + pad_bias  # [batch, 1, seq, seq]
+
+        for layer in self.layers:
+            hidden = layer(
+                hidden,
+                attention_mask=attn_mask,
+                position_ids=position_ids,
+                past_key_value=None,
+                output_attentions=False,
+                use_cache=False,
+            )[0]
+
+        return self.output_proj(self.norm(hidden))
 
 
 class NextEventCosineModel(nn.Module):
@@ -186,6 +201,7 @@ class NextEventCosineModel(nn.Module):
             torch_dtype=torch_dtype,
             attn_implementation=attn_implementation,
             local_files_only=local_files_only,
+            use_cache=False
         )
         self.hidden_size = int(self.event_encoder.config.hidden_size)
         self.freeze_event_encoder = bool(freeze_event_encoder)
@@ -201,7 +217,7 @@ class NextEventCosineModel(nn.Module):
             raise ValueError("predictor_hidden_size must be divisible by predictor_num_heads")
         predictor_ffn_dim = predictor_hidden_size if predictor_ffn_dim <= 0 else predictor_ffn_dim
 
-        self.predictor = SmallCausalTransformerPredictor(
+        self.predictor = SmallCausalQwen3Predictor(
             input_dim=self.hidden_size,
             hidden_dim=predictor_hidden_size,
             num_heads=predictor_num_heads,

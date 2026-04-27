@@ -1,0 +1,15 @@
+{
+  "tokenizer_name": "Qwen/Qwen3-0.6B",
+  "template_path": "01_gen_meta/templates/biolinkbert_event.j2",
+  "unique_event_parquet": "hx1/unique_events.parquet",
+  "tokenize_batch_size": 4096,
+  "eos_token": "<|endoftext|>",
+  "eos_token_id": 151643,
+  "append_eos_per_event": false,
+  "include_condition_occurrence": false,
+  "events_per_row": 1024,
+  "num_unique_events": 290181,
+  "num_rows": 36530,
+  "num_patients": 4547,
+  "avg_events_per_row": 1024.0
+}
