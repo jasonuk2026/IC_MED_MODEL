@@ -405,3 +405,10 @@ python generate_llm_ehr_prompts.py \
   --max_negative_samples 20 \
   --include_label \
   --output_path text_query/new_lupus_test_pos10_neg10.jsonl
+
+python query_openai_compatible_prompts.py \
+  --input_path text_query/new_lupus_test_pos10_neg10.jsonl \
+  --output_path text_query/new_lupus_test_pos10_neg10.jsonl \
+  --api_mode chat_completions \
+  --temperature 0.0 \
+  --resume
