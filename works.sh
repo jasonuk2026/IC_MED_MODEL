@@ -370,3 +370,16 @@ python benchmark_next_event_sequence_classifier.py \
 --encode_batch_size 8 \
 --classifier_epochs 20 \
 --device auto
+
+torchrun --n_proc_per_node=4 benchmark_next_event_sequence_classifier.py \
+--checkpoint_paths hx1/next_event_cosine_single_gpu/step_001370 \
+--unique_events_path hx1/unique_events.parquet \
+--eval_data_dir data/eval_data_latest \
+--train_split val \
+--test_split test \
+--max_events 1000 \
+--truncate_side last \
+--sequence_pooling mean \
+--encode_batch_size 8 \
+--classifier_epochs 20 \
+--device auto
