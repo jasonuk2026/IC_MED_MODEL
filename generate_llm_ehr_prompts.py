@@ -37,11 +37,12 @@ def parse_args():
     p.add_argument("--split", default="test", choices=["val", "test"])
     p.add_argument("--unique_events_path", default="data/01_outputs/unique_events.parquet")
     p.add_argument("--encoder", default="qwen3")
-    p.add_argument("--model_name", default="Qwen/Qwen3-0.6B")
+    p.add_argument("--model_name", default=None,
+                   help="Optional encoder model name. Not required when only using the event template.")
     p.add_argument("--template_path", default=None)
-    p.add_argument("--max_events", type=int, default=1000)
+    p.add_argument("--max_events", type=int, default=1024)
     p.add_argument("--truncate_side", choices=["first", "last"], default="last")
-    p.add_argument("--max_samples", type=int, default=None)
+    p.add_argument("--max_samples", type=int, default=10)
     p.add_argument("--output_path", default=None)
     p.add_argument("--include_label", action="store_true",
                    help="Include the ground-truth label in the output JSONL metadata.")
