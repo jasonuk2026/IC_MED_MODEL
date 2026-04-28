@@ -398,7 +398,7 @@ python generate_llm_ehr_prompts.py \
   --task new_lupus \
   --split test \
   --eval_data_dir data/eval_data_latest \
-  --unique_events_path data/01_outputs/unique_events.parquet \
+  --unique_events_path hx1/unique_events.parquet \
   --max_events 1000 \
   --truncate_side last \
   --max_positive_samples 20 \
