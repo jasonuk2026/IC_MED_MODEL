@@ -71,7 +71,9 @@ def load_existing_patient_ids(output_path: Path) -> set[int]:
                 continue
             try:
                 obj = json.loads(line)
-                if "patient_id" in obj:
+                # Only treat a row as completed if it already contains a model
+                # response or an explicit terminal error from a prior query run.
+                if "patient_id" in obj and ("response_text" in obj or "error" in obj):
                     seen.add(int(obj["patient_id"]))
             except Exception:
                 continue
@@ -157,6 +159,11 @@ def main():
     args = parse_args()
     input_path = Path(args.input_path)
     output_path = Path(args.output_path)
+    if input_path.resolve() == output_path.resolve():
+        raise ValueError(
+            "--input_path and --output_path must be different files. "
+            "Use the prompt JSONL as input and write model responses to a separate output JSONL."
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     client = build_client(args)
