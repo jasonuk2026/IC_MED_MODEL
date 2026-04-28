@@ -106,12 +106,16 @@ def build_prompt(task: str, event_texts: list[str]) -> str:
         "Use only the evidence in these events.\n\n"
         "Patient EHR events:\n"
         f"{event_lines}\n\n"
-        f"Question: Based on the EHR above, does this patient likely have {disease_name}?\n"
+        "Your task has two stages.\n\n"
+        "Stage 1: Review the EHR and identify which events are potentially relevant to the target disease.\n"
+        "For each relevant event, briefly explain why it may support, weaken, or contextualize the diagnosis.\n\n"
+        f"Stage 2: Based on the relevant events above, give a final conclusion about whether this patient likely has {disease_name}.\n\n"
         "Please answer in JSON with the following keys:\n"
-        '  "answer": "yes" or "no"\n'
+        '  "relevant_events": a list of objects, each with keys "event_number", "event_text", and "relevance_reason"\n'
+        '  "reasoning_summary": a concise summary that synthesizes the relevant evidence\n'
+        '  "final_answer": "yes" or "no"\n'
         '  "confidence": a number between 0 and 1\n'
-        '  "evidence": a short list of the most relevant clues from the EHR\n'
-        '  "reasoning": a concise clinical rationale\n'
+        "Make sure the reasoning appears before the final conclusion, and keep the final conclusion in `final_answer`.\n"
     )
 
 
