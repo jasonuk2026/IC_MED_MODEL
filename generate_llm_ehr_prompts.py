@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import sys
 from pathlib import Path
 
@@ -43,6 +44,9 @@ def parse_args():
     p.add_argument("--max_events", type=int, default=1024)
     p.add_argument("--truncate_side", choices=["first", "last"], default="last")
     p.add_argument("--max_samples", type=int, default=10)
+    p.add_argument("--max_positive_samples", type=int, default=None)
+    p.add_argument("--max_negative_samples", type=int, default=None)
+    p.add_argument("--sample_seed", type=int, default=42)
     p.add_argument("--output_path", default=None)
     p.add_argument("--include_label", action="store_true",
                    help="Include the ground-truth label in the output JSONL metadata.")
@@ -119,6 +123,30 @@ def build_prompt(task: str, event_texts: list[str]) -> str:
     )
 
 
+def select_rows(df: pd.DataFrame, args) -> pd.DataFrame:
+    if args.max_positive_samples is None and args.max_negative_samples is None:
+        if args.max_samples is not None:
+            return df.head(args.max_samples).copy()
+        return df.copy()
+
+    rng = random.Random(args.sample_seed)
+    pos_df = df[df["label"] == 1].copy()
+    neg_df = df[df["label"] == 0].copy()
+
+    if args.max_positive_samples is not None:
+        n = min(args.max_positive_samples, len(pos_df))
+        pos_idx = rng.sample(list(pos_df.index), n) if n < len(pos_df) else list(pos_df.index)
+        pos_df = pos_df.loc[pos_idx]
+
+    if args.max_negative_samples is not None:
+        n = min(args.max_negative_samples, len(neg_df))
+        neg_idx = rng.sample(list(neg_df.index), n) if n < len(neg_df) else list(neg_df.index)
+        neg_df = neg_df.loc[neg_idx]
+
+    out = pd.concat([pos_df, neg_df], axis=0).sort_index().reset_index(drop=True)
+    return out
+
+
 def main():
     args = parse_args()
     eval_path = Path(args.eval_data_dir) / args.task / f"{args.split}.parquet"
@@ -132,10 +160,12 @@ def main():
 
     event_text_map = build_event_text_map(args)
     df = pd.read_parquet(eval_path)
-    if args.max_samples is not None:
-        df = df.head(args.max_samples).copy()
+    df = select_rows(df, args)
 
     logger.info("Generating prompts from %s (%d rows)", eval_path, len(df))
+    if "label" in df.columns:
+        label_counts = df["label"].value_counts().to_dict()
+        logger.info("Selected label counts: %s", label_counts)
     count_written = 0
     with output_path.open("w") as f:
         for row in df.itertuples(index=False):
