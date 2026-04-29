@@ -13,6 +13,9 @@ from pathlib import Path
 
 import pyarrow.parquet as pq
 import torch
+torch._dynamo.config.capture_scalar_outputs = True
+torch._dynamo.config.allow_unspec_int_on_nn_module = True
+torch.set_float32_matmul_precision('high')
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
@@ -207,7 +210,7 @@ class NextEventConcatMeanModel(nn.Module):
         super().__init__()
         self.event_encoder = AutoModel.from_pretrained(
             model_name,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             attn_implementation=attn_implementation,
             local_files_only=local_files_only,
             use_cache=False,
@@ -370,6 +373,12 @@ def parse_args():
     p.add_argument("--compile", action="store_true")
     p.add_argument("--compile_mode", default="default", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--save_every_epoch", action="store_true")
+    p.add_argument(
+        "--save_n_ckpts",
+        type=int,
+        default=0,
+        help="Save this many evenly spaced step checkpoints across total optimizer steps. 0 disables step checkpointing.",
+    )
     p.add_argument("--log_steps", type=int, default=10)
     p.add_argument("--wandb_project", default=None)
     p.add_argument("--wandb_run_name", default=None)
@@ -488,6 +497,20 @@ def main():
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    checkpoint_steps = set()
+    if args.save_n_ckpts > 0:
+        checkpoint_steps = {
+            max(1, min(total_steps, round(i * total_steps / args.save_n_ckpts)))
+            for i in range(1, args.save_n_ckpts + 1)
+        }
+        if rank == 0:
+            logger.info(
+                "Step checkpoints: requested=%d unique=%d total_steps=%d steps=%s",
+                args.save_n_ckpts,
+                len(checkpoint_steps),
+                total_steps,
+                ",".join(str(x) for x in sorted(checkpoint_steps)),
+            )
 
     global_step = 0
     best_loss = float("inf")
@@ -543,6 +566,11 @@ def main():
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
+
+                if rank == 0 and global_step in checkpoint_steps:
+                    unwrap_model(model).save_checkpoint(output_dir / f"step_{global_step:06d}", vars(args))
+                    if wandb_run is not None:
+                        wandb_run.log({"checkpoint/saved_step": global_step}, step=global_step)
 
                 if rank == 0 and global_step % args.log_steps == 0:
                     avg_loss = run_loss / max(run_batches, 1)

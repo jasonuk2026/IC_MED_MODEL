@@ -1,0 +1,25 @@
+exps/hx1/scripts/submit.sh -j ehr_next_event_mean -g 1 -t 10:00:00 python train_next_event_concat_mean.py \
+--data_path hx1/qwen3_0.6b_patient_events.parquet \
+--model_name Qwen/Qwen3-0.6B \
+--epochs 1 \
+--batch_size 4 \
+--grad_accum 8 \
+--lr 2e-4 \
+--weight_decay 0.01 \
+--warmup_ratio 0.05 \
+--max_events 1024 \
+--max_event_tokens 64 \
+--sequence_truncate_side last \
+--event_truncate_side last \
+--freeze_event_encoder \
+--predictor_hidden_size 128 \
+--predictor_num_heads 4 \
+--predictor_num_layers 1 \
+--predictor_ffn_dim 128 \
+--predictor_dropout 0.0 \
+--num_workers 4 \
+--bf16 \
+--flash_attn \
+--save_n_ckpts 6 \
+--log_steps 10 \
+--output_dir 'exps/hx1/ckpts/$EHR_RUN_NAME'

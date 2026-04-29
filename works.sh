@@ -408,7 +408,37 @@ python generate_llm_ehr_prompts.py \
 
 python query_openai_compatible_prompts.py \
   --input_path text_query/new_lupus_test_pos10_neg10.jsonl \
-  --output_path text_query/new_lupus_test_pos10_neg10.jsonl \
+  --output_path text_query/new_lupus_test_pos10_neg10_query_results.jsonl \
   --api_mode chat_completions \
   --temperature 0.0 \
   --resume
+
+python evaluate_llm_prompt_outputs.py \
+  --input_path text_query/new_lupus_test_pos10_neg10_query_results.jsonl \
+  --output_csv text_query/new_lupus_test_pos10_neg10_query_eval.csv \
+  --output_json text_query/new_lupus_test_pos10_neg10_query_eval.json
+
+python train_next_event_concat_mean.py \
+--data_path hx1/qwen3_0.6b_patient_events.parquet \
+--model_name Qwen/Qwen3-0.6B \
+--epochs 1 \
+--batch_size 4 \
+--grad_accum 8 \
+--lr 2e-4 \
+--weight_decay 0.01 \
+--warmup_ratio 0.05 \
+--max_events 1024 \
+--max_event_tokens 64 \
+--sequence_truncate_side last \
+--event_truncate_side last \
+--freeze_event_encoder \
+--predictor_hidden_size 128 \
+--predictor_num_heads 4 \
+--predictor_num_layers 1 \
+--predictor_ffn_dim 128 \
+--predictor_dropout 0.0 \
+--num_workers 4 \
+--bf16 \
+--flash_attn \
+--log_steps 10 \
+--output_dir 'exps/hx1/ckpts/$EHR_RUN_NAME'
