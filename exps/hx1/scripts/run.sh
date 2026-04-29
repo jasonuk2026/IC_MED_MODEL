@@ -1,4 +1,4 @@
-exps/hx1/scripts/submit.sh -j ehr_next_event_mean -g 1 -t 10:00:00 python train_next_event_concat_mean.py \
+exps/hx1/scripts/submit.sh -j ehr_next_event_mean -g 1 -t 12:00:00 python train_next_event_concat_mean.py \
 --data_path hx1/qwen3_0.6b_patient_events.parquet \
 --model_name Qwen/Qwen3-0.6B \
 --epochs 1 \
