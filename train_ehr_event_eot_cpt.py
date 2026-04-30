@@ -13,12 +13,14 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from jinja2 import Environment, StrictUndefined
 from torch import nn
-from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset, IterableDataset, DistributedSampler, get_worker_info
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, logging as hf_logging
 
@@ -162,7 +164,6 @@ class EHRNextTokenIterableDataset(IterableDataset):
         include_condition_occurrence: bool,
         seq_len: int,
         pad_token_id: int,
-        estimate_num_samples: bool = True,
     ):
         super().__init__()
         self.patient_groups = patient_groups
@@ -171,7 +172,7 @@ class EHRNextTokenIterableDataset(IterableDataset):
         self.include_condition_occurrence = include_condition_occurrence
         self.seq_len = seq_len
         self.pad_token_id = int(pad_token_id)
-        self.num_samples = self._estimate_num_samples() if estimate_num_samples else None
+        self.num_samples = self._estimate_num_samples()
 
     def _estimate_num_samples(self) -> int:
         n = 0
@@ -190,8 +191,6 @@ class EHRNextTokenIterableDataset(IterableDataset):
         return n
 
     def __len__(self) -> int:
-        if self.num_samples is None:
-            raise TypeError("Dataset length is unavailable because sample estimation was skipped.")
         return self.num_samples
 
     def _iter_patient_ids(self) -> Iterable[int]:
@@ -244,6 +243,44 @@ class EHRNextTokenIterableDataset(IterableDataset):
                     "event_ids": event_ids,
                     "labels": labels,
                 }
+
+
+class EHRNextTokenParquetDataset(Dataset):
+    def __init__(self, parquet_path: str, max_samples: int | None = None):
+        logger.info("Loading training parquet: %s", parquet_path)
+        table = pq.read_table(
+            parquet_path,
+            columns=[
+                "input_ids",
+                "attention_mask",
+                "event_ids",
+                "labels",
+            ],
+        )
+        self.input_ids = table["input_ids"].to_pylist()
+        self.attention_mask = table["attention_mask"].to_pylist()
+        self.event_ids = table["event_ids"].to_pylist()
+        self.labels = table["labels"].to_pylist()
+        n = len(self.input_ids)
+        if max_samples is not None:
+            n = min(n, max_samples)
+            self.input_ids = self.input_ids[:n]
+            self.attention_mask = self.attention_mask[:n]
+            self.event_ids = self.event_ids[:n]
+            self.labels = self.labels[:n]
+        self.num_samples = n
+        logger.info("Loaded %s offline training samples", f"{self.num_samples:,}")
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return {
+            "input_ids": torch.tensor(self.input_ids[idx], dtype=torch.long),
+            "attention_mask": torch.tensor(self.attention_mask[idx], dtype=torch.long),
+            "event_ids": torch.tensor(self.event_ids[idx], dtype=torch.long),
+            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
+        }
 
 
 class EventEOTSummaryCPTModel(nn.Module):
@@ -342,17 +379,32 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, total_steps: i
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def get_constant_schedule(optimizer):
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+def maybe_init_distributed() -> tuple[int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1 and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+    return rank, local_rank, world_size
+
+
+def is_main_process() -> bool:
+    return (not dist.is_initialized()) or dist.get_rank() == 0
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, DDP) else model
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Single-GPU continue-pretraining over EHR event text with event-EOT summary attention.",
+        description="Continue-pretraining over EHR event text with event-EOT summary attention.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--model_name", default="Qwen/Qwen3-0.6B")
     p.add_argument("--data_dir", default="data/EHRSHOT_ASSETS")
+    p.add_argument("--train_parquet", default=None, help="Offline parquet built by build_ehr_event_eot_cpt_parquet.py")
     p.add_argument("--ehrshot_csv", default=None)
     p.add_argument("--concept_csv", default=None)
     p.add_argument("--template_path", default="01_gen_meta/templates/biolinkbert_event.j2")
@@ -364,17 +416,7 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--tokenize_batch_size", type=int, default=4096)
     p.add_argument("--max_patients", type=int, default=None)
-    p.add_argument(
-        "--skip_sample_estimate",
-        action="store_true",
-        help="Skip the full patient/event scan used only to estimate dataset length for progress and LR scheduling.",
-    )
-    p.add_argument(
-        "--total_training_steps",
-        type=int,
-        default=None,
-        help="Override optimizer steps for the LR schedule. Useful with --skip_sample_estimate to keep cosine decay.",
-    )
+    p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--weight_decay", type=float, default=0.1)
@@ -394,15 +436,21 @@ def parse_args():
 
 def main():
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    rank, local_rank, world_size = maybe_init_distributed()
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process():
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     data_dir = Path(args.data_dir)
     ehrshot_csv = Path(args.ehrshot_csv) if args.ehrshot_csv else data_dir / "data" / "ehrshot.csv"
     concept_csv = Path(args.concept_csv) if args.concept_csv else data_dir / "femr" / "logs" / "omop_dir" / "concept.csv"
 
-    logger.info("Device: %s", device)
+    logger.info("Rank %d/%d | device=%s", rank, world_size, device)
     logger.info("Loading tokenizer: %s", args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, local_files_only=args.local_files_only)
     pad_token_id = tokenizer.pad_token_id
@@ -410,59 +458,66 @@ def main():
         raise ValueError(f"Tokenizer {args.model_name} has no pad_token_id; needed as end-of-event token.")
     logger.info("Using end-of-event token: %r (id=%d)", tokenizer.pad_token, pad_token_id)
 
-    logger.info("Loading and sorting raw EHR CSV: %s", ehrshot_csv)
-    df_ehr = pd.read_csv(
-        ehrshot_csv,
-        usecols=["patient_id", "start", "omop_table", "code", "value", "unit"],
-        low_memory=False,
-        dtype={"value": str, "unit": str},
-    )
-    if df_ehr.columns[0] == "" or str(df_ehr.columns[0]).startswith("Unnamed"):
-        df_ehr = df_ehr.drop(columns=[df_ehr.columns[0]])
-    df_ehr["start"] = pd.to_datetime(df_ehr["start"])
-    df_ehr = df_ehr.sort_values(["patient_id", "start"], ascending=[True, True]).reset_index(drop=True)
-    logger.info("Loaded %s events across %s patients", f"{len(df_ehr):,}", f"{df_ehr['patient_id'].nunique():,}")
-
-    if args.max_patients is not None:
-        keep_ids = df_ehr["patient_id"].drop_duplicates().tolist()[: args.max_patients]
-        df_ehr = df_ehr[df_ehr["patient_id"].isin(keep_ids)].copy()
-        logger.info("Restricted to first %s patients", f"{len(keep_ids):,}")
-
-    code2desc = load_code_description_map(str(concept_csv))
-    for col in ["omop_table", "code", "value", "unit"]:
-        df_ehr[col] = df_ehr[col].fillna("").astype(str).str.strip()
-    df_ehr["description"] = df_ehr["code"].map(lambda code: normalize_optional_str(code2desc.get(code, "")) or "")
-    df_ehr["event_type"] = df_ehr["omop_table"].map(lambda x: OMOP_TABLE_PREFIX.get(x, x))
-
-    event_template = load_event_template(args.template_path)
-    event_token_map = build_event_token_cache(
-        df_ehr=df_ehr,
-        tokenizer=tokenizer,
-        event_template=event_template,
-        include_condition_occurrence=args.include_condition_occurrence,
-        append_eos_token_id=pad_token_id,
-        tokenize_batch_size=args.tokenize_batch_size,
-    )
-
-    patient_ids = df_ehr["patient_id"].drop_duplicates().tolist()
-    patient_groups = {int(pid): pdf for pid, pdf in df_ehr.groupby("patient_id", sort=False)}
-    dataset = EHRNextTokenIterableDataset(
-        patient_groups=patient_groups,
-        patient_ids=patient_ids,
-        event_token_map=event_token_map,
-        include_condition_occurrence=args.include_condition_occurrence,
-        seq_len=args.seq_len,
-        pad_token_id=pad_token_id,
-        estimate_num_samples=(not args.skip_sample_estimate),
-    )
-    if dataset.num_samples is None:
-        logger.info("Skipped training sample estimate")
+    if args.train_parquet:
+        dataset = EHRNextTokenParquetDataset(args.train_parquet, max_samples=args.max_samples)
     else:
-        logger.info("Estimated training samples: %s", f"{dataset.num_samples:,}")
+        if world_size > 1:
+            logger.warning("Online raw-EHR path with IterableDataset is not DDP-safe; prefer --train_parquet for multi-GPU runs.")
+        logger.info("Loading and sorting raw EHR CSV: %s", ehrshot_csv)
+        df_ehr = pd.read_csv(
+            ehrshot_csv,
+            usecols=["patient_id", "start", "omop_table", "code", "value", "unit"],
+            low_memory=False,
+            dtype={"value": str, "unit": str},
+        )
+        if df_ehr.columns[0] == "" or str(df_ehr.columns[0]).startswith("Unnamed"):
+            df_ehr = df_ehr.drop(columns=[df_ehr.columns[0]])
+        df_ehr["start"] = pd.to_datetime(df_ehr["start"])
+        df_ehr = df_ehr.sort_values(["patient_id", "start"], ascending=[True, True]).reset_index(drop=True)
+        logger.info("Loaded %s events across %s patients", f"{len(df_ehr):,}", f"{df_ehr['patient_id'].nunique():,}")
+
+        if args.max_patients is not None:
+            keep_ids = df_ehr["patient_id"].drop_duplicates().tolist()[: args.max_patients]
+            df_ehr = df_ehr[df_ehr["patient_id"].isin(keep_ids)].copy()
+            logger.info("Restricted to first %s patients", f"{len(keep_ids):,}")
+
+        code2desc = load_code_description_map(str(concept_csv))
+        for col in ["omop_table", "code", "value", "unit"]:
+            df_ehr[col] = df_ehr[col].fillna("").astype(str).str.strip()
+        df_ehr["description"] = df_ehr["code"].map(lambda code: normalize_optional_str(code2desc.get(code, "")) or "")
+        df_ehr["event_type"] = df_ehr["omop_table"].map(lambda x: OMOP_TABLE_PREFIX.get(x, x))
+
+        event_template = load_event_template(args.template_path)
+        event_token_map = build_event_token_cache(
+            df_ehr=df_ehr,
+            tokenizer=tokenizer,
+            event_template=event_template,
+            include_condition_occurrence=args.include_condition_occurrence,
+            append_eos_token_id=pad_token_id,
+            tokenize_batch_size=args.tokenize_batch_size,
+        )
+
+        patient_ids = df_ehr["patient_id"].drop_duplicates().tolist()
+        patient_groups = {int(pid): pdf for pid, pdf in df_ehr.groupby("patient_id", sort=False)}
+        dataset = EHRNextTokenIterableDataset(
+            patient_groups=patient_groups,
+            patient_ids=patient_ids,
+            event_token_map=event_token_map,
+            include_condition_occurrence=args.include_condition_occurrence,
+            seq_len=args.seq_len,
+            pad_token_id=pad_token_id,
+        )
+    logger.info("Estimated training samples: %s", f"{len(dataset):,}")
+
+    sampler = None
+    if world_size > 1 and not isinstance(dataset, IterableDataset):
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
 
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
+        shuffle=(sampler is None and not isinstance(dataset, IterableDataset)),
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=(args.num_workers > 0),
@@ -484,27 +539,19 @@ def main():
         attn_implementation=args.attn_implementation,
         local_files_only=args.local_files_only,
     ).to(device)
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None, output_device=local_rank if device.type == "cuda" else None)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     logger.info("Model params: %.1fM", n_params)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    if args.total_training_steps is not None:
-        total_steps = max(1, args.total_training_steps)
-        warmup_steps = max(1, int(total_steps * args.warmup_ratio))
-        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-        logger.info("Using overridden LR schedule steps: total=%s warmup=%s", f"{total_steps:,}", f"{warmup_steps:,}")
-    elif dataset.num_samples is not None:
-        steps_per_epoch = max(1, math.ceil(dataset.num_samples / max(args.batch_size, 1) / max(args.grad_accum, 1)))
-        total_steps = steps_per_epoch * args.epochs
-        warmup_steps = max(1, int(total_steps * args.warmup_ratio))
-        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-        logger.info("Using estimated LR schedule steps: total=%s warmup=%s", f"{total_steps:,}", f"{warmup_steps:,}")
-    else:
-        scheduler = get_constant_schedule(optimizer)
-        logger.info("Using constant LR schedule because sample estimation was skipped and --total_training_steps was not set")
+    steps_per_epoch = max(1, math.ceil(len(dataset) / max(args.batch_size, 1) / max(args.grad_accum, 1)))
+    total_steps = steps_per_epoch * args.epochs
+    warmup_steps = max(1, int(total_steps * args.warmup_ratio))
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     wandb_run = None
-    if args.wandb_project is not None:
+    if args.wandb_project is not None and is_main_process():
         import wandb
         wandb_run = wandb.init(
             project=args.wandb_project,
@@ -518,7 +565,9 @@ def main():
     best_loss = float("inf")
 
     for epoch in range(args.epochs):
-        pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.epochs}", dynamic_ncols=True)
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.epochs}", dynamic_ncols=True, disable=not is_main_process())
         optimizer.zero_grad()
         run_loss = 0.0
         run_batches = 0
@@ -551,7 +600,7 @@ def main():
                 optimizer.zero_grad()
                 global_step += 1
 
-                if global_step % args.log_steps == 0:
+                if global_step % args.log_steps == 0 and is_main_process():
                     avg_loss = run_loss / max(run_batches, 1)
                     pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
                     if wandb_run is not None:
@@ -573,16 +622,25 @@ def main():
             global_step += 1
 
         epoch_avg_loss = epoch_loss_sum / max(epoch_batches, 1)
-        logger.info("Epoch %d/%d summary: avg_loss=%.4f", epoch + 1, args.epochs, epoch_avg_loss)
-        if args.save_every_epoch:
-            model.save_checkpoint(output_dir / f"epoch_{epoch + 1}")
-        if epoch_avg_loss < best_loss:
+        if dist.is_initialized():
+            loss_tensor = torch.tensor([epoch_loss_sum, epoch_batches], dtype=torch.float64, device=device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            epoch_avg_loss = float(loss_tensor[0].item() / max(loss_tensor[1].item(), 1.0))
+        if is_main_process():
+            logger.info("Epoch %d/%d summary: avg_loss=%.4f", epoch + 1, args.epochs, epoch_avg_loss)
+        if args.save_every_epoch and is_main_process():
+            unwrap_model(model).save_checkpoint(output_dir / f"epoch_{epoch + 1}")
+        if epoch_avg_loss < best_loss and is_main_process():
             best_loss = epoch_avg_loss
-            model.save_checkpoint(output_dir / "best")
+            unwrap_model(model).save_checkpoint(output_dir / "best")
 
-    model.save_checkpoint(output_dir / "final")
+    if is_main_process():
+        unwrap_model(model).save_checkpoint(output_dir / "final")
     if wandb_run is not None:
         wandb_run.finish()
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
