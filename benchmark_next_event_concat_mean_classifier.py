@@ -244,7 +244,7 @@ def encode_sequence_rows(
     }
     if num_workers > 0:
         dl_kwargs["persistent_workers"] = True
-        dl_kwargs["prefetch_factor"] = 2
+        dl_kwargs["prefetch_factor"] = 8
     dl = DataLoader(**dl_kwargs)
 
     offset = 0

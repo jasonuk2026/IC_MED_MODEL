@@ -457,4 +457,19 @@ python benchmark_next_event_concat_mean_classifier.py \
 --encode_batch_size 8 \
 --classifier_epochs 20 \
 --device auto \
---num_workers 4
+--num_workers 8
+
+python benchmark_next_event_concat_mean_classifier.py \
+  --checkpoint_paths exps/hx1/ckpts/ehr_next_event_mean/553077/step_000761 \
+  --checkpoint_labels concat_mean_best \
+  --unique_events_path hx1/unique_events.parquet \
+  --eval_data_dir data/eval_data_latest \
+  --train_split val \
+  --test_split test \
+  --max_events 1000 \
+  --truncate_side last \
+  --sequence_pooling mean \
+  --encode_batch_size 8 \
+  --num_workers 8 \
+  --wandb_project concat_mean_benchmark \
+  --wandb_run_name concat_mean_profile
