@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
+from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer
 
 import benchmark_foundation_simple_classifier as bench
@@ -186,6 +187,18 @@ def mean_pool_hidden(hidden_states: torch.Tensor, mask: torch.Tensor) -> torch.T
     return summed / denom
 
 
+class SequenceRowsDataset(Dataset):
+    def __init__(self, seq_rows: List[Tuple[List[List[int]], int]]):
+        self.seq_rows = seq_rows
+
+    def __len__(self) -> int:
+        return len(self.seq_rows)
+
+    def __getitem__(self, idx: int) -> Tuple[List[List[int]], float]:
+        events, label = self.seq_rows[idx]
+        return events, float(label)
+
+
 @torch.inference_mode()
 def encode_sequence_rows(
     seq_rows: List[Tuple[List[List[int]], int]],
@@ -198,23 +211,41 @@ def encode_sequence_rows(
     batch_size: int,
     device: torch.device,
     desc: str,
+    num_workers: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    event_lists = [events for events, _ in seq_rows]
-    labels = np.asarray([float(label) for _, label in seq_rows], dtype=np.float32)
     hidden_size = int(model.hidden_size)
-    features = np.zeros((len(event_lists), hidden_size), dtype=np.float32)
+    features = np.zeros((len(seq_rows), hidden_size), dtype=np.float32)
+    labels = np.zeros(len(seq_rows), dtype=np.float32)
 
-    for start in tqdm(range(0, len(event_lists), batch_size), desc=desc, dynamic_ncols=True):
-        batch_events = event_lists[start:start + batch_size]
-        collated = collate_concat_event_sequences(
-            batch_events,
-            pad_token_id=pad_token_id,
-            max_events=max_events,
-            max_event_tokens=max_event_tokens,
-            sequence_truncate_side="last",
-            event_truncate_side=event_truncate_side,
-        )
-        collated = {k: v.to(device) if torch.is_tensor(v) else v for k, v in collated.items()}
+    ds = SequenceRowsDataset(seq_rows)
+    dl_kwargs = {
+        "dataset": ds,
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "collate_fn": lambda batch: {
+            **collate_concat_event_sequences(
+                [events for events, _ in batch],
+                pad_token_id=pad_token_id,
+                max_events=max_events,
+                max_event_tokens=max_event_tokens,
+                sequence_truncate_side="last",
+                event_truncate_side=event_truncate_side,
+            ),
+            "labels": torch.tensor([label for _, label in batch], dtype=torch.float32),
+        },
+    }
+    if num_workers > 0:
+        dl_kwargs["persistent_workers"] = True
+        dl_kwargs["prefetch_factor"] = 2
+    dl = DataLoader(**dl_kwargs)
+
+    offset = 0
+    for collated in tqdm(dl, desc=desc, dynamic_ncols=True):
+        batch_n = int(collated["labels"].shape[0])
+        labels[offset:offset + batch_n] = collated["labels"].numpy()
+        collated = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k, v in collated.items()}
         seq_embs, _ = model.encode_sequence_embeddings(
             input_ids=collated["input_ids"],
             attention_mask=collated["attention_mask"],
@@ -228,8 +259,8 @@ def encode_sequence_rows(
             pooled = seq_embs[row_idx, lengths]
         else:
             pooled = mean_pool_hidden(seq_embs, seq_mask)
-        features[start:start + len(batch_events)] = pooled.float().cpu().numpy()
-
+        features[offset:offset + batch_n] = pooled.float().cpu().numpy()
+        offset += batch_n
     return features, labels
 
 
@@ -363,6 +394,7 @@ def main():
                 batch_size=args.encode_batch_size,
                 device=device,
                 desc=f"{task} train encode",
+                num_workers=args.num_workers,
             )
             test_x, test_y = encode_sequence_rows(
                 seq_rows_cache[(task, "test")],
@@ -375,6 +407,7 @@ def main():
                 batch_size=args.encode_batch_size,
                 device=device,
                 desc=f"{task} test encode",
+                num_workers=args.num_workers,
             )
             train_x, [test_x], _, _ = bench.standardize(train_x, [test_x])
 
