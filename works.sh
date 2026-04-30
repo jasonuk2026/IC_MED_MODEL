@@ -442,3 +442,19 @@ python train_next_event_concat_mean.py \
 --flash_attn \
 --log_steps 10 \
 --output_dir 'exps/hx1/ckpts/$EHR_RUN_NAME'
+
+
+python benchmark_next_event_concat_mean_classifier.py \
+--checkpoint_paths exps/hx1/ckpts/ehr_next_event_mean/553077/step_000761 \
+--unique_events_path hx1/unique_events.parquet \
+--eval_data_dir data/eval_data_latest \
+--train_split val \
+--test_split test \
+--max_events 1000 \
+--truncate_side last \
+--sequence_pooling mean \
+--tasks new_celiac \
+--encode_batch_size 8 \
+--classifier_epochs 20 \
+--device auto \
+--num_workers 4
