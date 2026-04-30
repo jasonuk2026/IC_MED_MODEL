@@ -293,7 +293,9 @@ def train_single_task(
     best_state = copy.deepcopy(model.state_dict())
     best_epoch = 0
     best_train_auc = float("-inf")
+    best_eval_auc = float("-inf")
     best_train_metrics = None  # type: Optional[Dict[str, float]]
+    best_eval_metrics = None  # type: Optional[Dict[str, float]]
     patience = 0
 
     for epoch in range(1, args.epochs + 1):
@@ -322,13 +324,33 @@ def train_single_task(
             train_metrics["balanced_accuracy"],
         )
 
+        if test_x is not None and test_y is not None:
+            eval_metrics = evaluate_model(model, test_x, test_y, args.eval_batch_size, device)
+            logger.info(
+                "      epoch=%d test_auc=%.4f test_auprc=%.4f test_bal_acc=%.4f",
+                epoch,
+                eval_metrics["auc"],
+                eval_metrics["auprc"],
+                eval_metrics["balanced_accuracy"],
+            )
+            eval_auc = eval_metrics["auc"]
+            if math.isnan(eval_auc):
+                eval_auc = float("-inf")
+        else:
+            eval_metrics = train_metrics
+            eval_auc = train_metrics["auc"]
+            if math.isnan(eval_auc):
+                eval_auc = float("-inf")
+
         train_auc = train_metrics["auc"]
         if math.isnan(train_auc):
             train_auc = float("-inf")
-        if train_auc > best_train_auc:
-            best_train_auc = train_auc
+        if eval_auc > best_eval_auc:
+            best_eval_auc = eval_auc
             best_epoch = epoch
+            best_train_auc = train_auc
             best_train_metrics = train_metrics
+            best_eval_metrics = eval_metrics
             best_state = copy.deepcopy(model.state_dict())
             patience = 0
         else:
@@ -343,7 +365,7 @@ def train_single_task(
         "best_epoch": {"epoch": float(best_epoch)},
     }
     if test_x is not None and test_y is not None:
-        result["test"] = evaluate_model(model, test_x, test_y, args.eval_batch_size, device)
+        result["test"] = best_eval_metrics or evaluate_model(model, test_x, test_y, args.eval_batch_size, device)
     return result
 
 
