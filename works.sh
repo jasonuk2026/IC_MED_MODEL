@@ -510,5 +510,9 @@ python train_ehr_event_eot_cpt.py \
   --warmup_ratio 0.05 \
   --grad_accum 8 \
   --bf16 \
-  --attn_implementation eager \
+  --attn_implementation flash_attention_2 \
   --log_steps 10
+
+python test_qwen_custom_4d_mask.py \
+  --model_name Qwen/Qwen3-0.6B \
+  --bf16
