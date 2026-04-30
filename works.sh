@@ -473,3 +473,42 @@ python benchmark_next_event_concat_mean_classifier.py \
   --num_workers 8 \
   --wandb_project concat_mean_benchmark \
   --wandb_run_name concat_mean_profile
+
+python train_ehr_event_eot_cpt.py \
+  --model_name Qwen/Qwen3-0.6B \
+  --data_dir EHRSHOT_ASSETS \
+  --output_dir exps/hx1/ckpts/ehr_event_eot_cpt_qwen3 \
+  --seq_len 2048 \
+  --batch_size 1 \
+  --num_workers 0 \
+  --epochs 1 \
+  --lr 2e-5 \
+  --weight_decay 0.1 \
+  --warmup_ratio 0.05 \
+  --grad_accum 8 \
+  --bf16 \
+  --attn_implementation flash_attention_2 \
+  --log_steps 10
+
+python build_ehr_event_eot_cpt_parquet.py \
+  --model_name Qwen/Qwen3-0.6B \
+  --data_dir EHRSHOT_ASSETS \
+  --output_path exps/hx1/ckpts/ehr_event_eot_cpt/qwen3_0.6b_seq2048.parquet \
+  --seq_len 2048 \
+  --num_threads 8 \
+  --patients_per_task 4
+
+python train_ehr_event_eot_cpt.py \
+  --model_name Qwen/Qwen3-0.6B \
+  --train_parquet exps/hx1/ckpts/ehr_event_eot_cpt/qwen3_0.6b_seq2048.parquet \
+  --output_dir exps/hx1/ckpts/ehr_event_eot_cpt \
+  --batch_size 8 \
+  --num_workers 4 \
+  --epochs 1 \
+  --lr 2e-5 \
+  --weight_decay 0.1 \
+  --warmup_ratio 0.05 \
+  --grad_accum 8 \
+  --bf16 \
+  --attn_implementation eager \
+  --log_steps 10
