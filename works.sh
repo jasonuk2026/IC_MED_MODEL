@@ -510,7 +510,7 @@ python train_ehr_event_eot_cpt.py \
   --warmup_ratio 0.05 \
   --grad_accum 8 \
   --bf16 \
-  --attn_implementation flash_attention_2 \
+  --attn_implementation eager \
   --log_steps 10
 
 python test_qwen_custom_4d_mask.py \
