@@ -256,30 +256,31 @@ class EHRNextTokenParquetDataset(Dataset):
                 "event_ids",
                 "labels",
             ],
+            memory_map=True,
         )
-        self.input_ids = table["input_ids"].to_pylist()
-        self.attention_mask = table["attention_mask"].to_pylist()
-        self.event_ids = table["event_ids"].to_pylist()
-        self.labels = table["labels"].to_pylist()
-        n = len(self.input_ids)
+        n = table.num_rows
         if max_samples is not None:
             n = min(n, max_samples)
-            self.input_ids = self.input_ids[:n]
-            self.attention_mask = self.attention_mask[:n]
-            self.event_ids = self.event_ids[:n]
-            self.labels = self.labels[:n]
+            table = table.slice(0, n)
+        self.input_ids = table["input_ids"]
+        self.attention_mask = table["attention_mask"]
+        self.event_ids = table["event_ids"]
+        self.labels = table["labels"]
         self.num_samples = n
-        logger.info("Loaded %s offline training samples", f"{self.num_samples:,}")
+        logger.info(
+            "Loaded %s offline training samples from parquet with Arrow-backed columns",
+            f"{self.num_samples:,}",
+        )
 
     def __len__(self) -> int:
         return self.num_samples
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         return {
-            "input_ids": torch.tensor(self.input_ids[idx], dtype=torch.long),
-            "attention_mask": torch.tensor(self.attention_mask[idx], dtype=torch.long),
-            "event_ids": torch.tensor(self.event_ids[idx], dtype=torch.long),
-            "labels": torch.tensor(self.labels[idx], dtype=torch.long),
+            "input_ids": torch.tensor(self.input_ids[idx].as_py(), dtype=torch.long),
+            "attention_mask": torch.tensor(self.attention_mask[idx].as_py(), dtype=torch.long),
+            "event_ids": torch.tensor(self.event_ids[idx].as_py(), dtype=torch.long),
+            "labels": torch.tensor(self.labels[idx].as_py(), dtype=torch.long),
         }
 
 
