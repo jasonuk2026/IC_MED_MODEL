@@ -300,7 +300,6 @@ class EventEOTSummaryCPTModel(nn.Module):
             local_files_only=local_files_only,
         )
         self.model = self.backbone.model
-        self.lm_head = self.backbone.lm_head
         self.vocab_size = int(self.backbone.config.vocab_size)
 
     def save_checkpoint(self, save_dir: Path):
@@ -342,31 +341,15 @@ class EventEOTSummaryCPTModel(nn.Module):
         labels: torch.Tensor,
         eos_token_id: int,
     ) -> dict[str, torch.Tensor]:
-        hidden_states = self.model.embed_tokens(input_ids)
-        position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
         attn_mask = self.build_event_summary_attention_mask(input_ids, attention_mask, event_ids, eos_token_id)
-        position_embeddings = self.model.rotary_emb(hidden_states, position_ids)
-
-        for layer in self.model.layers:
-            hidden_states = layer(
-                hidden_states,
-                attention_mask=attn_mask,
-                position_embeddings=position_embeddings,
-                position_ids=position_ids,
-                past_key_values=None,
-                use_cache=False,
-            )
-        hidden_states = self.model.norm(hidden_states)
-        logits = self.lm_head(hidden_states)
-
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        loss = F.cross_entropy(
-            shift_logits.reshape(-1, self.vocab_size),
-            shift_labels.reshape(-1),
-            ignore_index=-100,
+        outputs = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            labels=labels,
+            use_cache=False,
+            return_dict=True,
         )
-        return {"loss": loss, "logits": logits}
+        return {"loss": outputs.loss, "logits": outputs.logits}
 
 
 def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, total_steps: int):
