@@ -59,6 +59,9 @@ def parse_args():
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--local_files_only", action="store_true")
+    p.add_argument("--print_attentions", action="store_true")
+    p.add_argument("--attention_layer", type=int, default=-1, help="Which layer attention to print when --print_attentions is set.")
+    p.add_argument("--attention_head", type=int, default=0, help="Which head attention to print when --print_attentions is set.")
     return p.parse_args()
 
 
@@ -126,6 +129,7 @@ def main():
                 attention_mask=attn_mask_4d,
                 use_cache=False,
                 return_dict=True,
+                output_attentions=args.print_attentions,
             )
             logits = outputs.logits
 
@@ -140,6 +144,33 @@ def main():
     logger.info("Forward succeeded.")
     logger.info("logits_shape=%s", tuple(logits.shape))
     logger.info("toy_next_token_loss=%.6f", float(loss.item()))
+
+    if args.print_attentions:
+        if outputs.attentions is None:
+            logger.warning("Model did not return attentions. This path may not support output_attentions.")
+            return
+        layer_idx = args.attention_layer
+        if layer_idx < 0:
+            layer_idx = len(outputs.attentions) + layer_idx
+        if layer_idx < 0 or layer_idx >= len(outputs.attentions):
+            raise ValueError(f"attention_layer={args.attention_layer} resolved to invalid index {layer_idx}")
+        attn = outputs.attentions[layer_idx]
+        # shape: [batch, heads, q_len, k_len]
+        head_idx = args.attention_head
+        if head_idx < 0:
+            head_idx = attn.shape[1] + head_idx
+        if head_idx < 0 or head_idx >= attn.shape[1]:
+            raise ValueError(f"attention_head={args.attention_head} resolved to invalid index {head_idx}")
+        head_attn = attn[0, head_idx].detach().float().cpu()
+        mean_attn = attn[0].detach().float().mean(dim=0).cpu()
+        logger.info(
+            "attention_tensor_shape=%s | printed_layer=%d printed_head=%d",
+            tuple(attn.shape),
+            layer_idx,
+            head_idx,
+        )
+        logger.info("attention_head_matrix=%s", json.dumps([[round(float(x), 6) for x in row] for row in head_attn.tolist()]))
+        logger.info("attention_mean_over_heads=%s", json.dumps([[round(float(x), 6) for x in row] for row in mean_attn.tolist()]))
 
 
 if __name__ == "__main__":
