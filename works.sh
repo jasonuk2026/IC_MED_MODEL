@@ -515,4 +515,6 @@ python train_ehr_event_eot_cpt.py \
 
 python test_qwen_custom_4d_mask.py \
   --model_name Qwen/Qwen3-0.6B \
-  --bf16
+  --attn_implementation eager \
+  --bf16 \
+  --print_attentions
