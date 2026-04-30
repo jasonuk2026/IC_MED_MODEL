@@ -78,6 +78,9 @@ def parse_args():
     p.add_argument("--torch_dtype", default="bf16", choices=["auto", "fp32", "fp16", "bf16"])
     p.add_argument("--local_files_only", action="store_true")
     p.add_argument("--output_dir", default="output/next-event-concat-mean-classifier-benchmark")
+    p.add_argument("--wandb_project", default=None)
+    p.add_argument("--wandb_run_name", default=None)
+    p.add_argument("--wandb_tags", nargs="+", default=None)
     return p.parse_args()
 
 
@@ -212,10 +215,13 @@ def encode_sequence_rows(
     device: torch.device,
     desc: str,
     num_workers: int,
+    wandb_run=None,
+    wandb_prefix: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     hidden_size = int(model.hidden_size)
     features = np.zeros((len(seq_rows), hidden_size), dtype=np.float32)
     labels = np.zeros(len(seq_rows), dtype=np.float32)
+    synchronize = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
 
     ds = SequenceRowsDataset(seq_rows)
     dl_kwargs = {
@@ -242,16 +248,20 @@ def encode_sequence_rows(
     dl = DataLoader(**dl_kwargs)
 
     offset = 0
-    for collated in tqdm(dl, desc=desc, dynamic_ncols=True):
+    for batch_idx, collated in enumerate(tqdm(dl, desc=desc, dynamic_ncols=True), start=1):
         batch_n = int(collated["labels"].shape[0])
         labels[offset:offset + batch_n] = collated["labels"].numpy()
         collated = {k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v for k, v in collated.items()}
+        synchronize()
+        t0 = datetime.now()
         seq_embs, _ = model.encode_sequence_embeddings(
             input_ids=collated["input_ids"],
             attention_mask=collated["attention_mask"],
             token_event_index=collated["token_event_index"],
             sequence_event_mask=collated["sequence_event_mask"],
         )
+        synchronize()
+        elapsed = (datetime.now() - t0).total_seconds()
         seq_mask = collated["sequence_event_mask"].bool()
         if sequence_pooling == "last":
             lengths = seq_mask.long().sum(dim=1).clamp(min=1) - 1
@@ -260,6 +270,14 @@ def encode_sequence_rows(
         else:
             pooled = mean_pool_hidden(seq_embs, seq_mask)
         features[offset:offset + batch_n] = pooled.float().cpu().numpy()
+        if wandb_run is not None and wandb_prefix is not None:
+            wandb_run.log(
+                {
+                    f"{wandb_prefix}/encode_step_seconds": elapsed,
+                    f"{wandb_prefix}/encode_step_batch_size": batch_n,
+                    f"{wandb_prefix}/encode_step_index": batch_idx,
+                }
+            )
         offset += batch_n
     return features, labels
 
@@ -332,6 +350,16 @@ def main():
     out_dir = Path(args.output_dir) / timestamp
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    wandb_run = None
+    if args.wandb_project is not None:
+        import wandb
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name or f"concat-mean-benchmark-{timestamp}",
+            tags=args.wandb_tags,
+            config=vars(args),
+        )
+
     checkpoint_labels = resolve_labels(args.checkpoint_paths, args.checkpoint_labels)
     rows_cache = {}
     for task in args.tasks:
@@ -395,6 +423,8 @@ def main():
                 device=device,
                 desc=f"{task} train encode",
                 num_workers=args.num_workers,
+                wandb_run=wandb_run,
+                wandb_prefix=f"{checkpoint_label}/{task}/train",
             )
             test_x, test_y = encode_sequence_rows(
                 seq_rows_cache[(task, "test")],
@@ -408,6 +438,8 @@ def main():
                 device=device,
                 desc=f"{task} test encode",
                 num_workers=args.num_workers,
+                wandb_run=wandb_run,
+                wandb_prefix=f"{checkpoint_label}/{task}/test",
             )
             train_x, [test_x], _, _ = bench.standardize(train_x, [test_x])
 
@@ -511,6 +543,8 @@ def main():
                 row.test_macro_auprc,
                 row.test_macro_balanced_accuracy,
             )
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
