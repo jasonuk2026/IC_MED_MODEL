@@ -345,19 +345,11 @@ class EventEOTSummaryCPTModel(nn.Module):
         outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attn_mask,
+            labels=labels,
             use_cache=False,
             return_dict=True,
         )
-        logits = outputs.logits
-
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
-        loss = F.cross_entropy(
-            shift_logits.reshape(-1, self.vocab_size),
-            shift_labels.reshape(-1),
-            ignore_index=-100,
-        )
-        return {"loss": loss, "logits": logits}
+        return {"loss": outputs.loss, "logits": outputs.logits}
 
 
 def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, total_steps: int):
