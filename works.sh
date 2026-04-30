@@ -473,3 +473,19 @@ python benchmark_next_event_concat_mean_classifier.py \
   --num_workers 8 \
   --wandb_project concat_mean_benchmark \
   --wandb_run_name concat_mean_profile
+
+python train_ehr_event_eot_cpt.py \
+  --model_name Qwen/Qwen3-0.6B \
+  --data_dir EHRSHOT_ASSETS \
+  --output_dir exps/hx1/ckpts/ehr_event_eot_cpt_qwen3 \
+  --seq_len 2048 \
+  --batch_size 1 \
+  --num_workers 0 \
+  --epochs 1 \
+  --lr 2e-5 \
+  --weight_decay 0.1 \
+  --warmup_ratio 0.05 \
+  --grad_accum 8 \
+  --bf16 \
+  --attn_implementation flash_attention_2 \
+  --log_steps 10

@@ -162,6 +162,7 @@ class EHRNextTokenIterableDataset(IterableDataset):
         include_condition_occurrence: bool,
         seq_len: int,
         pad_token_id: int,
+        estimate_num_samples: bool = True,
     ):
         super().__init__()
         self.patient_groups = patient_groups
@@ -170,7 +171,7 @@ class EHRNextTokenIterableDataset(IterableDataset):
         self.include_condition_occurrence = include_condition_occurrence
         self.seq_len = seq_len
         self.pad_token_id = int(pad_token_id)
-        self.num_samples = self._estimate_num_samples()
+        self.num_samples = self._estimate_num_samples() if estimate_num_samples else None
 
     def _estimate_num_samples(self) -> int:
         n = 0
@@ -189,6 +190,8 @@ class EHRNextTokenIterableDataset(IterableDataset):
         return n
 
     def __len__(self) -> int:
+        if self.num_samples is None:
+            raise TypeError("Dataset length is unavailable because sample estimation was skipped.")
         return self.num_samples
 
     def _iter_patient_ids(self) -> Iterable[int]:
@@ -339,6 +342,10 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, total_steps: i
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def get_constant_schedule(optimizer):
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="Single-GPU continue-pretraining over EHR event text with event-EOT summary attention.",
@@ -357,6 +364,17 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--tokenize_batch_size", type=int, default=4096)
     p.add_argument("--max_patients", type=int, default=None)
+    p.add_argument(
+        "--skip_sample_estimate",
+        action="store_true",
+        help="Skip the full patient/event scan used only to estimate dataset length for progress and LR scheduling.",
+    )
+    p.add_argument(
+        "--total_training_steps",
+        type=int,
+        default=None,
+        help="Override optimizer steps for the LR schedule. Useful with --skip_sample_estimate to keep cosine decay.",
+    )
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--weight_decay", type=float, default=0.1)
@@ -435,8 +453,12 @@ def main():
         include_condition_occurrence=args.include_condition_occurrence,
         seq_len=args.seq_len,
         pad_token_id=pad_token_id,
+        estimate_num_samples=(not args.skip_sample_estimate),
     )
-    logger.info("Estimated training samples: %s", f"{len(dataset):,}")
+    if dataset.num_samples is None:
+        logger.info("Skipped training sample estimate")
+    else:
+        logger.info("Estimated training samples: %s", f"{dataset.num_samples:,}")
 
     loader = DataLoader(
         dataset,
@@ -466,10 +488,20 @@ def main():
     logger.info("Model params: %.1fM", n_params)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    steps_per_epoch = max(1, math.ceil(len(dataset) / max(args.batch_size, 1) / max(args.grad_accum, 1)))
-    total_steps = steps_per_epoch * args.epochs
-    warmup_steps = max(1, int(total_steps * args.warmup_ratio))
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    if args.total_training_steps is not None:
+        total_steps = max(1, args.total_training_steps)
+        warmup_steps = max(1, int(total_steps * args.warmup_ratio))
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+        logger.info("Using overridden LR schedule steps: total=%s warmup=%s", f"{total_steps:,}", f"{warmup_steps:,}")
+    elif dataset.num_samples is not None:
+        steps_per_epoch = max(1, math.ceil(dataset.num_samples / max(args.batch_size, 1) / max(args.grad_accum, 1)))
+        total_steps = steps_per_epoch * args.epochs
+        warmup_steps = max(1, int(total_steps * args.warmup_ratio))
+        scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+        logger.info("Using estimated LR schedule steps: total=%s warmup=%s", f"{total_steps:,}", f"{warmup_steps:,}")
+    else:
+        scheduler = get_constant_schedule(optimizer)
+        logger.info("Using constant LR schedule because sample estimation was skipped and --total_training_steps was not set")
 
     wandb_run = None
     if args.wandb_project is not None:
