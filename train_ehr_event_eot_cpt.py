@@ -410,6 +410,8 @@ def parse_args():
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--attn_implementation", default="eager", choices=["eager", "sdpa", "flash_attention_2"])
+    p.add_argument("--compile", action="store_true")
+    p.add_argument("--compile_mode", default="default", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--save_every_epoch", action="store_true")
     p.add_argument("--log_steps", type=int, default=10)
     p.add_argument("--wandb_project", default=None)
@@ -523,6 +525,9 @@ def main():
         attn_implementation=args.attn_implementation,
         local_files_only=args.local_files_only,
     ).to(device)
+    if args.compile:
+        logger.info("Compiling model with torch.compile(mode=%s)", args.compile_mode)
+        model = torch.compile(model, mode=args.compile_mode)
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None, output_device=local_rank if device.type == "cuda" else None)
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
