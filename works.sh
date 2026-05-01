@@ -502,7 +502,7 @@ python train_ehr_event_eot_cpt.py \
   --model_name Qwen/Qwen3-0.6B \
   --train_parquet exps/hx1/ckpts/ehr_event_eot_cpt/qwen3_0.6b_seq2048.parquet \
   --output_dir exps/hx1/ckpts/ehr_event_eot_cpt \
-  --batch_size 8 \
+  --batch_size 2 \
   --num_workers 4 \
   --epochs 1 \
   --lr 2e-5 \
