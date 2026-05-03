@@ -518,3 +518,19 @@ python test_qwen_custom_4d_mask.py \
   --attn_implementation eager \
   --bf16 \
   --print_attentions
+
+torchrun --standalone --nproc_per_node=2 train_ehr_event_eot_cpt.py \
+  --model_name Qwen/Qwen3-0.6B \
+  --train_parquet exps/hx1/ckpts/ehr_event_eot_cpt/qwen3_0.6b_seq2048.parquet \
+  --output_dir exps/hx1/ckpts/ehr_event_eot_cpt \
+  --batch_size 2 \
+  --num_workers 4 \
+  --epochs 1 \
+  --lr 2e-5 \
+  --weight_decay 0.1 \
+  --warmup_ratio 0.05 \
+  --grad_accum 8 \
+  --bf16 \
+  --attn_implementation eager \
+  --compile \
+  --compile_mode default

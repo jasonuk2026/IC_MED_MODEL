@@ -15,6 +15,7 @@ from typing import Dict, Iterable, List, Tuple
 import pandas as pd
 import pyarrow.parquet as pq
 import torch
+torch.set_float32_matmul_precision("high")
 import torch.distributed as dist
 import torch.nn.functional as F
 from jinja2 import Environment, StrictUndefined
