@@ -534,3 +534,12 @@ torchrun --standalone --nproc_per_node=2 train_ehr_event_eot_cpt.py \
   --attn_implementation eager \
   --compile \
   --compile_mode default
+
+
+python build_eval_tokenized_eot_data.py \
+  --model_name Qwen/Qwen3-0.6B \
+  --data_dir EHRSHOT_ASSETS \
+  --output_dir hx1/eval_data_tokenized_eot_2048 \
+  --max_tokens 2048 \
+  --truncate_side last \
+  --num_workers 16

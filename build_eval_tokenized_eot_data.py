@@ -266,7 +266,7 @@ def parse_args():
     p.add_argument("--template_path", default="01_gen_meta/templates/biolinkbert_event.j2")
     p.add_argument("--output_dir", required=True)
     p.add_argument("--tasks", nargs="+", default=sorted(TASK_2_DISEASE_NAME.keys()), choices=sorted(TASK_2_DISEASE_NAME.keys()))
-    p.add_argument("--splits", nargs="+", default=["val", "test"], choices=["train", "val", "test"])
+    p.add_argument("--splits", nargs="+", default=["train", "val", "test"], choices=["train", "val", "test"])
     p.add_argument("--include_condition_occurrence", action="store_true")
     p.add_argument("--local_files_only", action="store_true")
     p.add_argument("--max_tokens", type=int, default=2048)
