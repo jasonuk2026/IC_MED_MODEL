@@ -543,3 +543,51 @@ python build_eval_tokenized_eot_data.py \
   --max_tokens 2048 \
   --truncate_side last \
   --num_workers 16
+
+
+python eval_eot_cpt_logistic.py \
+    --checkpoint_dir exps/hx1/ckpts/ehr_event_eot_cpt/ehr-event-eot-cpt/554535/final \
+    --eval_data_dir  hx1/eval_data_tokenized_eot_2048 \
+    --output_dir     exps/hx1/results/eot_cpt_probe_repeat \
+    --bf16 \
+    --batch_size 8
+
+python eval_eot_cpt_logistic.py \
+    --checkpoint_dir exps/hx1/ckpts/ehr_event_eot_cpt/ehr-event-eot-cpt/554535/final \
+    --eval_data_dir  hx1/eval_data_tokenized_eot_2048 \
+    --output_dir     exps/hx1/results/eot_cpt_last_eot_probe \
+    --bf16 \
+    --batch_size 8 \
+    --pool last_eot
+
+torchrun --standalone --nproc_per_node=2 train_ehr_event_eot_cpt.py \
+  --model_name Qwen/Qwen3-0.6B \
+  --train_parquet exps/hx1/ckpts/ehr_event_eot_cpt/qwen3_0.6b_seq2048.parquet \
+  --output_dir exps/hx1/ckpts/ehr_event_cpt \
+  --batch_size 2 \
+  --num_workers 4 \
+  --epochs 1 \
+  --lr 2e-5 \
+  --weight_decay 0.1 \
+  --warmup_ratio 0.05 \
+  --grad_accum 8 \
+  --bf16 \
+  --attn_implementation flash_attention_2 \
+  --compile \
+  --compile_mode default \
+  --attn_mask_type causal
+
+python eval_eot_cpt_logistic.py \
+    --checkpoint_dir exps/hx1/ckpts/ehr_event_cpt/final \
+    --eval_data_dir  hx1/eval_data_tokenized_eot_2048 \
+    --output_dir     exps/hx1/results/causal_cpt_eot_probe \
+    --attn_mask_type causal \
+    --pool eot --bf16
+
+python eval_eot_cpt_logistic.py \
+    --checkpoint_dir exps/hx1/ckpts/ehr_event_eot_cpt/ehr-event-eot-cpt/554535/final \
+    --eval_data_dir  hx1/eval_data_tokenized_eot_2048 \
+    --output_dir     exps/hx1/results/eot_cpt_last_eot_probe \
+    --bf16 \
+    --batch_size 8 \
+    --pool last_eot

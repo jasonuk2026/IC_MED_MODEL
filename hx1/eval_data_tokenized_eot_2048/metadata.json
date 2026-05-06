@@ -1,0 +1,24 @@
+{
+  "model_name": "Qwen/Qwen3-0.6B",
+  "ehrshot_csv": "EHRSHOT_ASSETS/data/ehrshot.csv",
+  "concept_csv": "EHRSHOT_ASSETS/femr/logs/omop_dir/concept.csv",
+  "template_path": "01_gen_meta/templates/biolinkbert_event.j2",
+  "tasks": [
+    "new_acutemi",
+    "new_celiac",
+    "new_hyperlipidemia",
+    "new_hypertension",
+    "new_lupus",
+    "new_pancan"
+  ],
+  "splits": [
+    "train",
+    "val",
+    "test"
+  ],
+  "include_condition_occurrence": false,
+  "max_tokens": 2048,
+  "truncate_side": "last",
+  "pad_token": "<|endoftext|>",
+  "pad_token_id": 151643
+}

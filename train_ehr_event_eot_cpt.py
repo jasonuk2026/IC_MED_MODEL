@@ -342,11 +342,19 @@ class EventEOTSummaryCPTModel(nn.Module):
         event_ids: torch.Tensor,
         labels: torch.Tensor,
         eos_token_id: int,
+        attn_mask_type: str = "event_eot",
     ) -> dict[str, torch.Tensor]:
-        attn_mask = self.build_event_summary_attention_mask(input_ids, attention_mask, event_ids, eos_token_id)
+        if attn_mask_type == "causal":
+            # Standard causal LM: pass 2-D attention_mask and let the backbone
+            # build its own causal mask internally.
+            effective_mask = attention_mask
+        else:
+            effective_mask = self.build_event_summary_attention_mask(
+                input_ids, attention_mask, event_ids, eos_token_id
+            )
         outputs = self.backbone(
             input_ids=input_ids,
-            attention_mask=attn_mask,
+            attention_mask=effective_mask,
             labels=labels,
             use_cache=False,
             return_dict=True,
@@ -411,6 +419,8 @@ def parse_args():
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--attn_implementation", default="eager", choices=["eager", "sdpa", "flash_attention_2"])
+    p.add_argument("--attn_mask_type", default="event_eot", choices=["event_eot", "causal"],
+                   help="'event_eot' = custom CPT mask; 'causal' = standard causal LM attention.")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--compile_mode", default="default", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--save_every_epoch", action="store_true")
@@ -573,6 +583,7 @@ def main():
                     event_ids=batch["event_ids"],
                     labels=batch["labels"],
                     eos_token_id=pad_token_id,
+                    attn_mask_type=args.attn_mask_type,
                 )
                 loss = outputs["loss"] / args.grad_accum
             loss.backward()

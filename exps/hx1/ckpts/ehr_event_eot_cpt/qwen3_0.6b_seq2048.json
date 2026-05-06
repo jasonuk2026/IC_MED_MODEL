@@ -1,0 +1,16 @@
+{
+  "model_name": "Qwen/Qwen3-0.6B",
+  "ehrshot_csv": "EHRSHOT_ASSETS/data/ehrshot.csv",
+  "concept_csv": "EHRSHOT_ASSETS/femr/logs/omop_dir/concept.csv",
+  "template_path": "01_gen_meta/templates/biolinkbert_event.j2",
+  "include_condition_occurrence": false,
+  "seq_len": 2048,
+  "tokenize_batch_size": 4096,
+  "num_threads": 8,
+  "patients_per_task": 4,
+  "pad_token": "<|endoftext|>",
+  "pad_token_id": 151643,
+  "samples": 638290,
+  "patients": 6739,
+  "events": 40442026
+}

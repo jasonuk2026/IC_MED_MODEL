@@ -1,0 +1,24 @@
+{
+  "num_rows": 40,
+  "num_with_label": 40,
+  "num_with_prediction": 40,
+  "num_valid_for_accuracy": 40,
+  "num_unparsed": 0,
+  "parse_source_counts": {
+    "json_final_answer": 40
+  },
+  "error_count": 0,
+  "accuracy": 0.525,
+  "tp": 4,
+  "tn": 17,
+  "fp": 3,
+  "fn": 16,
+  "label_counts": {
+    "1": 20,
+    "0": 20
+  },
+  "prediction_counts": {
+    "0": 33,
+    "1": 7
+  }
+}
