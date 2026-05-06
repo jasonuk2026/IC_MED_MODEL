@@ -600,3 +600,66 @@ python /gpfs/home/zduan/codes/ehr/build_mimic_cpt_parquet.py \
 --seq_len 8192 \
 --output_path /gpfs/home/zduan/codes/ehr/ordered_data/mimic_cpt_qwen_8192 \
 --num_threads 16
+
+python /gpfs/home/zduan/codes/ehr/train_ehr_event_eot_cpt.py \
+    --model_name Qwen/Qwen3-0.6B \
+    --train_parquet /gpfs/home/zduan/codes/ehr/ordered_data/mimic_cpt_qwen_8192 \
+    --output_dir /gpfs/home/zduan/codes/ehr/ordered_data/experiments/qwen3-0.6b-mimic-event-eot-8192 \
+    --attn_mask_type event_eot \
+    --attn_implementation sdpa \
+    --seq_len 8192 \
+    --bf16 \
+    --batch_size 4 \
+    --grad_accum 16 \
+    --epochs 1 \
+    --lr 2e-5 \
+    --warmup_ratio 0.05 \
+    --num_workers 4 \
+    --compile \
+    --log_steps 20 \
+    --save_every_epoch
+
+python /gpfs/home/zduan/codes/ehr/train_ehr_event_eot_cpt.py \
+    --model_name Qwen/Qwen3-0.6B \
+    --train_parquet exps/hx1/ckpts/ehr_event_eot_cpt/qwen3_0.6b_seq2048.parquet \
+    --output_dir /gpfs/home/zduan/codes/ehr/ordered_data/experiments/qwen3-0.6b-ehrshot-event-eot-2048 \
+    --attn_mask_type event_eot \
+    --attn_implementation sdpa \
+    --seq_len 2048 \
+    --bf16 \
+    --batch_size 4 \
+    --grad_accum 16 \
+    --epochs 1 \
+    --lr 2e-5 \
+    --warmup_ratio 0.05 \
+    --num_workers 4 \
+    --compile \
+    --log_steps 20 \
+    --save_every_epoch
+
+python train_ehr_event_eot_cpt.py \
+--model_name Qwen/Qwen3-0.6B \
+--train_parquet ordered_data/mimic_cpt_qwen_2048 \
+--output_dir ordered_data/experiments/qwen3-0.6b-ehrshot-event-eot-2048 \
+--attn_mask_type event_eot \
+--attn_implementation sdpa \
+--seq_len 2048 \
+--bf16 \
+--batch_size 8 \
+--global_batch_size 512 \
+--epochs 1 \
+--lr 2e-5 \
+--warmup_ratio 0.05 \
+--num_workers 4 \
+--compile \
+--log_steps 20 \
+--save_every_epoch
+
+python /gpfs/home/zduan/codes/ehr/build_mimic_cpt_parquet.py \
+--model_name Qwen/Qwen3-0.6B \
+--meds_dir /gpfs/home/zduan/codes/ethos-ares/mimic-2.2-meds/data \
+--mimic_raw_dir /gpfs/home/zduan/codes/ethos-ares/mimic-iv-2.2 \
+--split train \
+--seq_len 2048 \
+--output_path /gpfs/home/zduan/codes/ehr/ordered_data/mimic_cpt_qwen_2048 \
+--num_threads 16

@@ -318,16 +318,22 @@ class EventEOTSummaryCPTModel(nn.Module):
     ) -> torch.Tensor:
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
+
+        # Cache static masks that don't depend on batch content.
+        if not hasattr(self, "_causal_cache") or self._causal_cache.shape[-1] != seq_len or self._causal_cache.device != device:
+            pos = torch.arange(seq_len, device=device)
+            self._causal_cache = (pos.view(1, 1, seq_len) <= pos.view(1, seq_len, 1))  # (1, S, S)
+            self._eye_cache = torch.eye(seq_len, device=device, dtype=torch.bool).unsqueeze(0)  # (1, S, S)
+
+        causal = self._causal_cache
+        eye    = self._eye_cache
+
         valid = attention_mask.bool()
-        pos = torch.arange(seq_len, device=device)
-        causal = pos.view(1, 1, seq_len) <= pos.view(1, seq_len, 1)
         same_event = event_ids[:, :, None] == event_ids[:, None, :]
         eos_keys = ((input_ids == eos_token_id) & valid)[:, None, :]
         q_valid = valid[:, :, None]
         k_valid = valid[:, None, :]
         allowed = ((same_event & causal) | (eos_keys & causal)) & q_valid & k_valid
-
-        eye = torch.eye(seq_len, device=device, dtype=torch.bool).unsqueeze(0)
         allowed = allowed | ((~valid)[:, :, None] & eye)
 
         mask = torch.zeros((batch_size, 1, seq_len, seq_len), dtype=self.model.embed_tokens.weight.dtype, device=device)
@@ -414,13 +420,19 @@ def parse_args():
     p.add_argument("--lr", type=float, default=2e-5)
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--warmup_ratio", type=float, default=0.05)
-    p.add_argument("--grad_accum", type=int, default=1)
+    p.add_argument("--grad_accum", type=int, default=None,
+                   help="Gradient accumulation steps. Mutually exclusive with --global_batch_size.")
+    p.add_argument("--global_batch_size", type=int, default=None,
+                   help="Total batch size = batch_size * world_size * grad_accum. "
+                        "Auto-computes grad_accum; mutually exclusive with --grad_accum.")
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--attn_implementation", default="eager", choices=["eager", "sdpa", "flash_attention_2"])
     p.add_argument("--attn_mask_type", default="event_eot", choices=["event_eot", "causal"],
                    help="'event_eot' = custom CPT mask; 'causal' = standard causal LM attention.")
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                   help="Enable gradient checkpointing to save activation memory (recommended for seq_len>=4096).")
     p.add_argument("--compile", action="store_true")
     p.add_argument("--compile_mode", default="default", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--save_every_epoch", action="store_true")
@@ -433,6 +445,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.attn_implementation == "sdpa":
+        # Flash kernel rejects custom 4D float masks; route SDPA to xformers mem-efficient backend.
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
     rank, local_rank, world_size = maybe_init_distributed()
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
@@ -506,6 +522,18 @@ def main():
         )
     logger.info("Estimated training samples: %s", f"{len(dataset):,}")
 
+    # ── resolve grad_accum / global_batch_size ───────────────────────────────
+    if args.global_batch_size is not None and args.grad_accum is not None:
+        raise ValueError("--grad_accum and --global_batch_size are mutually exclusive.")
+    if args.global_batch_size is not None:
+        grad_accum = max(1, args.global_batch_size // (args.batch_size * world_size))
+    else:
+        grad_accum = args.grad_accum if args.grad_accum is not None else 1
+    effective_global_bs = args.batch_size * world_size * grad_accum
+    if is_main_process():
+        logger.info("batch_size=%d  world_size=%d  grad_accum=%d  → effective_global_bs=%d",
+                    args.batch_size, world_size, grad_accum, effective_global_bs)
+
     sampler = None
     if world_size > 1 and not isinstance(dataset, IterableDataset):
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
@@ -536,6 +564,9 @@ def main():
         attn_implementation=args.attn_implementation,
         local_files_only=args.local_files_only,
     ).to(device)
+    if args.gradient_checkpointing:
+        model.backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        logger.info("Gradient checkpointing enabled.")
     if args.compile:
         logger.info("Compiling model with torch.compile(mode=%s)", args.compile_mode)
         model = torch.compile(model, mode=args.compile_mode)
@@ -545,10 +576,13 @@ def main():
     logger.info("Model params: %.1fM", n_params)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    steps_per_epoch = max(1, math.ceil(len(dataset) / max(args.batch_size, 1) / max(args.grad_accum, 1)))
+    steps_per_epoch = max(1, math.ceil(len(dataset) / max(args.batch_size, 1) / max(world_size, 1) / max(grad_accum, 1)))
     total_steps = steps_per_epoch * args.epochs
     warmup_steps = max(1, int(total_steps * args.warmup_ratio))
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    if is_main_process():
+        logger.info("steps_per_epoch=%d  total_steps=%d  warmup_steps=%d",
+                    steps_per_epoch, total_steps, warmup_steps)
 
     wandb_run = None
     if args.wandb_project is not None and is_main_process():
@@ -567,13 +601,21 @@ def main():
     for epoch in range(args.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
-        pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.epochs}", dynamic_ncols=True, disable=not is_main_process())
+
+        # Progress bar tracks optimizer steps, not micro-batch steps.
+        pbar = tqdm(
+            total=steps_per_epoch,
+            desc=f"Epoch {epoch + 1}/{args.epochs}",
+            dynamic_ncols=True,
+            disable=not is_main_process(),
+        )
         optimizer.zero_grad()
         run_loss = 0.0
         run_batches = 0
         epoch_loss_sum = 0.0
         epoch_batches = 0
-        for batch_idx, batch in enumerate(pbar):
+
+        for batch_idx, batch in enumerate(loader):
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             autocast_enabled = torch.cuda.is_available() and (autocast_dtype is not None)
             with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_enabled):
@@ -585,7 +627,7 @@ def main():
                     eos_token_id=pad_token_id,
                     attn_mask_type=args.attn_mask_type,
                 )
-                loss = outputs["loss"] / args.grad_accum
+                loss = outputs["loss"] / grad_accum
             loss.backward()
 
             loss_value = float(outputs["loss"].item())
@@ -594,34 +636,35 @@ def main():
             epoch_loss_sum += loss_value
             epoch_batches += 1
 
-            if ((batch_idx + 1) % args.grad_accum == 0):
+            if (batch_idx + 1) % grad_accum == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
+                pbar.update(1)
 
                 if global_step % args.log_steps == 0 and is_main_process():
                     avg_loss = run_loss / max(run_batches, 1)
                     pbar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
                     if wandb_run is not None:
                         wandb_run.log(
-                            {
-                                "train/loss": avg_loss,
-                                "train/lr": scheduler.get_last_lr()[0],
-                            },
+                            {"train/loss": avg_loss, "train/lr": scheduler.get_last_lr()[0]},
                             step=global_step,
                         )
                     run_loss = 0.0
                     run_batches = 0
 
+        # Handle leftover micro-batches at end of epoch.
         if run_batches > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
             global_step += 1
+            pbar.update(1)
 
+        pbar.close()
         epoch_avg_loss = epoch_loss_sum / max(epoch_batches, 1)
         if dist.is_initialized():
             loss_tensor = torch.tensor([epoch_loss_sum, epoch_batches], dtype=torch.float64, device=device)

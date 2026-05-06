@@ -43,12 +43,13 @@ All others       : code itself (already semantic) or empty
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import multiprocessing as mp
 import sys
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import polars as pl
@@ -350,7 +351,103 @@ def load_meds_split(meds_dir: Path, split: str, desc_maps: dict) -> pd.DataFrame
     return df
 
 
-# ── event token cache (same as original) ─────────────────────────────────────
+# ── low-memory shard helpers ─────────────────────────────────────────────────
+
+def load_shard_flat(shard_file: Path, desc_maps: dict) -> pd.DataFrame:
+    """
+    Load and parse ONE MEDS parquet shard into a flat pandas DataFrame.
+    Releases the polars frame immediately after parsing to keep peak memory low.
+    """
+    df_pl = pl.read_parquet(
+        shard_file, columns=["subject_id", "time", "code", "numeric_value", "text_value"]
+    )
+    rows = []
+    for row in df_pl.iter_rows(named=True):
+        parsed = parse_meds_event(row["code"], row["numeric_value"], row["text_value"], desc_maps)
+        if parsed is None:
+            continue
+        omop_table, norm_code, desc, value, unit = parsed
+        t = row["time"]
+        if t is None:
+            t = pd.Timestamp("1970-01-01")
+        rows.append({
+            "patient_id":  int(row["subject_id"]),
+            "start":       pd.Timestamp(t),
+            "omop_table":  omop_table,
+            "code":        norm_code,
+            "description": desc,
+            "value":       value,
+            "unit":        unit,
+        })
+    del df_pl
+    if not rows:
+        return pd.DataFrame(columns=["patient_id","start","omop_table","code","description","value","unit"])
+    df = pd.DataFrame(rows)
+    df.sort_values(["patient_id", "start"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def build_event_token_cache_streaming(
+    shard_files: List[Path],
+    desc_maps: dict,
+    tokenizer,
+    event_template,
+    append_eos_token_id: int,
+    tokenize_batch_size: int,
+    keep_patient_ids: Optional[set] = None,
+) -> Dict[Tuple[str, str, str, str], List[int]]:
+    """
+    First-pass streaming scan: collect unique (omop_table, code, value, unit) keys
+    across ALL shards WITHOUT loading full data into memory, then tokenize once.
+
+    Peak memory: only the unique-event dict (typically a few hundred MB for MIMIC).
+    """
+    unique: Dict[Tuple[str, str, str, str], Tuple[str, str, str, str, str]] = {}
+
+    for shard_file in tqdm(shard_files, desc="scan shards (build cache)", dynamic_ncols=True):
+        df_pl = pl.read_parquet(
+            shard_file,
+            columns=["subject_id", "code", "numeric_value", "text_value"],
+        )
+        for row in df_pl.iter_rows(named=True):
+            if keep_patient_ids is not None and int(row["subject_id"]) not in keep_patient_ids:
+                continue
+            parsed = parse_meds_event(
+                row["code"], row["numeric_value"], row["text_value"], desc_maps
+            )
+            if parsed is None:
+                continue
+            omop_table, norm_code, desc, value, unit = parsed
+            key = unique_event_key(omop_table, norm_code, value, unit)
+            if key not in unique:
+                unique[key] = (omop_table, norm_code, desc, value, unit)
+        del df_pl
+
+    logger.info("Unique events to tokenize: %s", f"{len(unique):,}")
+
+    valid_keys: List[Tuple] = []
+    texts: List[str] = []
+    for key, (omop_table, norm_code, desc, value, unit) in unique.items():
+        text = format_event_text(omop_table, norm_code, desc, value, unit, event_template)
+        if text:
+            valid_keys.append(key)
+            texts.append(text)
+
+    event_token_map: Dict[Tuple, List[int]] = {}
+    for i in tqdm(range(0, len(texts), tokenize_batch_size),
+                  desc="tokenize unique events", dynamic_ncols=True):
+        batch_texts = texts[i : i + tokenize_batch_size]
+        batch_keys  = valid_keys[i : i + tokenize_batch_size]
+        enc = tokenizer(batch_texts, add_special_tokens=False, return_attention_mask=False)
+        for key, ids in zip(batch_keys, enc["input_ids"]):
+            event_token_map[key] = [int(x) for x in ids] + [int(append_eos_token_id)]
+
+    logger.info("Tokenized event cache: %s entries", f"{len(event_token_map):,}")
+    return event_token_map
+
+
+# ── event token cache (kept for API compatibility) ────────────────────────────
 
 def build_event_token_cache(
     df_ehr: pd.DataFrame,
@@ -557,69 +654,100 @@ def main():
 
     # Build description lookup tables
     desc_maps = build_mimic_description_maps(mimic_raw_dir)
-
-    # Load MEDS data
-    splits = ["train", "test"] if args.split == "all" else [args.split]
-    dfs = [load_meds_split(meds_dir, s, desc_maps) for s in splits]
-    df_ehr = pd.concat(dfs, ignore_index=True).sort_values(
-        ["patient_id", "start"], ascending=True
-    ).reset_index(drop=True)
-    logger.info("Total events: %s across %s patients",
-                f"{len(df_ehr):,}", f"{df_ehr['patient_id'].nunique():,}")
-
-    if args.max_patients is not None:
-        keep_ids = df_ehr["patient_id"].drop_duplicates().tolist()[: args.max_patients]
-        df_ehr = df_ehr[df_ehr["patient_id"].isin(keep_ids)].copy()
-        logger.info("Restricted to %s patients", f"{len(keep_ids):,}")
-
-    # Build event token cache
     event_template = load_event_template(args.template_path)
-    event_token_map = build_event_token_cache(
-        df_ehr=df_ehr,
+
+    # Collect shard files for requested splits
+    splits = ["train", "test"] if args.split == "all" else [args.split]
+    shard_files: List[Path] = []
+    for s in splits:
+        shard_files.extend(sorted((meds_dir / s).glob("*.parquet")))
+    logger.info("Found %d shard file(s) across split(s): %s", len(shard_files), splits)
+
+    # Optionally limit to first N patients.
+    # We need to know their IDs before processing — do a lightweight ID scan.
+    keep_patient_ids: Optional[set] = None
+    if args.max_patients is not None:
+        logger.info("Scanning patient IDs for max_patients=%d...", args.max_patients)
+        all_pids: List[int] = []
+        for sf in shard_files:
+            pids = pl.read_parquet(sf, columns=["subject_id"])["subject_id"].unique().to_list()
+            all_pids.extend(pids)
+            if len(set(all_pids)) >= args.max_patients:
+                break
+        keep_patient_ids = set(list(dict.fromkeys(all_pids))[: args.max_patients])
+        logger.info("Keeping %d patients", len(keep_patient_ids))
+
+    # ── Pass 1: stream through all shards to build event token cache ────────
+    # Only unique (omop_table, code, value, unit) keys are kept in memory —
+    # the full event data is NOT loaded into a DataFrame here.
+    logger.info("Pass 1: building event token cache (streaming, low memory)...")
+    event_token_map = build_event_token_cache_streaming(
+        shard_files=shard_files,
+        desc_maps=desc_maps,
         tokenizer=tokenizer,
         event_template=event_template,
         append_eos_token_id=pad_token_id,
         tokenize_batch_size=args.tokenize_batch_size,
+        keep_patient_ids=keep_patient_ids,
     )
 
-    # Process patients in parallel
-    patient_ranges = build_patient_ranges(df_ehr["patient_id"].tolist())
-    logger.info("Patients: %s, blocks of %s", f"{len(patient_ranges):,}", args.patients_per_task)
-    init_thread_globals(
-        df_ehr=df_ehr,
-        event_token_map=event_token_map,
-        seq_len=args.seq_len,
-        pad_token_id=pad_token_id,
-    )
-
+    # ── Pass 2: process shard by shard, write immediately, free each shard ──
+    # Peak memory per iteration: one shard's flat DataFrame + event_token_map.
+    # Pool is recreated per shard (fork inherits the current shard's globals).
+    logger.info("Pass 2: processing shards shard-by-shard...")
     sample_count = 0
     patient_count = 0
     event_count = 0
     example_rows: List[dict] = []
-    blocks = list(iter_blocks(patient_ranges, args.patients_per_task))
-    logger.info("Building parquet with %d worker(s), %d block(s), seq_len=%d",
-                args.num_threads, len(blocks), args.seq_len)
 
-    # Use multiprocessing.Pool (fork-based on Linux) for true CPU parallelism.
-    # Globals (_DF_EHR, _EVENT_TOKEN_MAP, etc.) are inherited by child processes
-    # via copy-on-write fork — no serialisation overhead for large objects.
     with pq.ParquetWriter(output_path, OUTPUT_SCHEMA) as writer:
-        with mp.Pool(processes=args.num_threads) as pool:
-            for result in tqdm(
-                pool.imap_unordered(process_patient_block, blocks),
-                total=len(blocks),
-                desc="patient blocks",
-                dynamic_ncols=True,
-            ):
-                rows = result["rows"]
-                patient_count += result["patients"]
-                event_count += result["events"]
-                if not rows:
-                    continue
-                if not example_rows:
-                    example_rows = rows[:1]
-                writer.write_table(rows_to_table(rows))
-                sample_count += len(rows)
+        for shard_idx, shard_file in enumerate(shard_files):
+            logger.info("[%d/%d] Loading shard: %s", shard_idx + 1, len(shard_files), shard_file.name)
+            df_shard = load_shard_flat(shard_file, desc_maps)
+
+            if keep_patient_ids is not None:
+                df_shard = df_shard[df_shard["patient_id"].isin(keep_patient_ids)].copy()
+
+            if len(df_shard) == 0:
+                del df_shard
+                continue
+
+            logger.info("  events=%s  patients=%s",
+                        f"{len(df_shard):,}", f"{df_shard['patient_id'].nunique():,}")
+
+            # Set globals before fork so workers inherit this shard's data
+            init_thread_globals(
+                df_ehr=df_shard,
+                event_token_map=event_token_map,
+                seq_len=args.seq_len,
+                pad_token_id=pad_token_id,
+            )
+
+            patient_ranges = build_patient_ranges(df_shard["patient_id"].tolist())
+            blocks = list(iter_blocks(patient_ranges, args.patients_per_task))
+
+            with mp.Pool(processes=args.num_threads) as pool:
+                for result in tqdm(
+                    pool.imap_unordered(process_patient_block, blocks),
+                    total=len(blocks),
+                    desc=f"shard {shard_idx+1}/{len(shard_files)}",
+                    dynamic_ncols=True,
+                    leave=False,
+                ):
+                    rows = result["rows"]
+                    patient_count += result["patients"]
+                    event_count   += result["events"]
+                    if not rows:
+                        continue
+                    if not example_rows:
+                        example_rows = rows[:1]
+                    writer.write_table(rows_to_table(rows))
+                    sample_count += len(rows)
+
+            del df_shard
+            gc.collect()
+            logger.info("  cumulative: samples=%s patients=%s",
+                        f"{sample_count:,}", f"{patient_count:,}")
 
     metadata = {
         "model_name": args.model_name,
