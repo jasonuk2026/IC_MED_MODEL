@@ -653,7 +653,8 @@ python train_ehr_event_eot_cpt.py \
 --num_workers 4 \
 --compile \
 --log_steps 20 \
---save_every_epoch
+--save_every_epoch \
+--wandb_project mimic_qwen_0N6B_2048_eoe
 
 python /gpfs/home/zduan/codes/ehr/build_mimic_cpt_parquet.py \
 --model_name Qwen/Qwen3-0.6B \
