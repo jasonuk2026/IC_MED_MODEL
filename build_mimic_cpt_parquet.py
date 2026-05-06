@@ -45,8 +45,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import multiprocessing as mp
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -597,15 +597,20 @@ def main():
     event_count = 0
     example_rows: List[dict] = []
     blocks = list(iter_blocks(patient_ranges, args.patients_per_task))
-    logger.info("Building parquet with %d thread(s), %d block(s), seq_len=%d",
+    logger.info("Building parquet with %d worker(s), %d block(s), seq_len=%d",
                 args.num_threads, len(blocks), args.seq_len)
 
+    # Use multiprocessing.Pool (fork-based on Linux) for true CPU parallelism.
+    # Globals (_DF_EHR, _EVENT_TOKEN_MAP, etc.) are inherited by child processes
+    # via copy-on-write fork — no serialisation overhead for large objects.
     with pq.ParquetWriter(output_path, OUTPUT_SCHEMA) as writer:
-        with ThreadPoolExecutor(max_workers=args.num_threads) as ex:
-            futures = [ex.submit(process_patient_block, blk) for blk in blocks]
-            for fut in tqdm(as_completed(futures), total=len(futures),
-                            desc="patient blocks", dynamic_ncols=True):
-                result = fut.result()
+        with mp.Pool(processes=args.num_threads) as pool:
+            for result in tqdm(
+                pool.imap_unordered(process_patient_block, blocks),
+                total=len(blocks),
+                desc="patient blocks",
+                dynamic_ncols=True,
+            ):
                 rows = result["rows"]
                 patient_count += result["patients"]
                 event_count += result["events"]

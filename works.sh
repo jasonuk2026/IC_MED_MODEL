@@ -591,3 +591,12 @@ python eval_eot_cpt_logistic.py \
     --bf16 \
     --batch_size 8 \
     --pool last_eot
+
+python /gpfs/home/zduan/codes/ehr/build_mimic_cpt_parquet.py \
+--model_name Qwen/Qwen3-0.6B \
+--meds_dir /gpfs/home/zduan/codes/ethos-ares/mimic-2.2-meds/data \
+--mimic_raw_dir /gpfs/home/zduan/codes/ethos-ares/mimic-iv-2.2 \
+--split train \
+--seq_len 8192 \
+--output_path /gpfs/home/zduan/codes/ehr/ordered_data/mimic_cpt_qwen_8192 \
+--num_threads 16
