@@ -169,10 +169,12 @@ class MIMICClassifier(nn.Module):
         hidden_size: int,
         num_labels: int = 2,
         freeze_backbone: bool = True,
+        pooling: str = "last_token",
     ):
         super().__init__()
         self.backbone = backbone
         self.num_labels = num_labels
+        self.pooling = pooling
 
         if freeze_backbone:
             for p in self.backbone.parameters():
@@ -239,10 +241,19 @@ class MIMICClassifier(nn.Module):
             return_dict=True,
         )
         hidden = outputs.hidden_states[-1]                      # (B, L, H)
-        seq_lens = attention_mask.sum(dim=1) - 1               # index of last valid token
-        batch_size = hidden.size(0)
-        last_hidden = hidden[range(batch_size), seq_lens]       # (B, H)
-        return last_hidden
+
+        if self.pooling == "mean_eot":
+            # Average hidden states of all valid EOT tokens.
+            eot_mask = (input_ids == eos_token_id) & attention_mask.bool()  # (B, L)
+            eot_count = eot_mask.sum(dim=1, keepdim=True).float().clamp(min=1)
+            rep = (hidden * eot_mask.unsqueeze(-1)).sum(dim=1) / eot_count  # (B, H)
+            # print(f"[DEBUG] eot_mask hits per sample: {eot_mask.sum(dim=1).tolist()[:4]}")
+            # print(f"[DEBUG] rep std: {rep.float().std().item():.6f}")
+        else:
+            # last_token: hidden state of the last non-padding token.
+            seq_lens = attention_mask.sum(dim=1) - 1
+            rep = hidden[range(hidden.size(0)), seq_lens]       # (B, H)
+        return rep
 
     def forward(
         self,
@@ -343,6 +354,7 @@ def parse_args():
     p.add_argument("--task",             required=True,
                    help="Task name, e.g. icu_mortality or hospital_readmission_30d")
     p.add_argument("--output_dir",       required=True)
+    p.add_argument("--tokenizer",       default="Qwen/Qwen3-0.6B")
     p.add_argument("--train_split",      default="train")
     p.add_argument("--val_split",        default="test",
                    help="Used for early stopping (we only have train/test from extract_task_labels)")
@@ -354,6 +366,9 @@ def parse_args():
                    help="Freeze backbone, train only the linear head")
     p.add_argument("--no_freeze_backbone", dest="freeze_backbone", action="store_false")
     p.add_argument("--attn_mask_type",       default="event_eot", choices=["event_eot", "causal"])
+    p.add_argument("--pooling",              default="last_token", choices=["last_token", "mean_eot"],
+                   help="last_token: last valid token hidden state; "
+                        "mean_eot: average of all EOT token hidden states (recommended with event_eot mask).")
     p.add_argument("--attn_implementation",  default="sdpa",
                    choices=["eager", "sdpa", "flash_attention_2", "flash_attention_3"],
                    help="eager/sdpa work with event_eot mask; flash_attention_2 only for causal.")
@@ -419,7 +434,7 @@ def main():
     if is_main_process():
         logger.info("Loading tokenizer from %s", args.pretrained_dir)
     tokenizer = AutoTokenizer.from_pretrained(
-        args.pretrained_dir, local_files_only=args.local_files_only)
+        args.tokenizer, local_files_only=args.local_files_only)
     eos_token_id = tokenizer.pad_token_id
     if eos_token_id is None:
         raise ValueError("Tokenizer has no pad_token_id.")
@@ -476,6 +491,7 @@ def main():
         hidden_size=hidden_size,
         num_labels=2,
         freeze_backbone=args.freeze_backbone,
+        pooling=args.pooling,
     ).to(device)
 
     if world_size > 1:
