@@ -441,7 +441,10 @@ def build_event_token_cache_streaming(
         batch_keys  = valid_keys[i : i + tokenize_batch_size]
         enc = tokenizer(batch_texts, add_special_tokens=False, return_attention_mask=False)
         for key, ids in zip(batch_keys, enc["input_ids"]):
-            event_token_map[key] = [int(x) for x in ids] + [int(append_eos_token_id)]
+            tok = [int(x) for x in ids]
+            if append_eos_token_id is not None:
+                tok.append(int(append_eos_token_id))
+            event_token_map[key] = tok
 
     logger.info("Tokenized event cache: %s entries", f"{len(event_token_map):,}")
     return event_token_map
@@ -487,7 +490,8 @@ def build_event_token_cache(
         enc = tokenizer(batch_texts, add_special_tokens=False, return_attention_mask=False)
         for key, token_ids in zip(batch_keys, enc["input_ids"]):
             ids = [int(x) for x in token_ids]
-            ids.append(int(append_eos_token_id))
+            if append_eos_token_id is not None:
+                ids.append(int(append_eos_token_id))
             event_token_map[key] = ids
     logger.info("Token cache size: %s", f"{len(event_token_map):,}")
     return event_token_map
@@ -631,6 +635,8 @@ def parse_args():
     p.add_argument("--patients_per_task", type=int, default=64)
     p.add_argument("--max_patients", type=int, default=None)
     p.add_argument("--preview_tokens", type=int, default=128)
+    p.add_argument("--no_eot", action="store_true",
+                   help="Do not append EOT token between events (plain concatenation).")
     return p.parse_args()
 
 
@@ -650,7 +656,11 @@ def main():
     pad_token_id = tokenizer.pad_token_id
     if pad_token_id is None:
         raise ValueError(f"Tokenizer {args.model_name!r} has no pad_token_id.")
-    logger.info("End-of-event token: %r (id=%d)", tokenizer.pad_token, pad_token_id)
+    append_eos_token_id = None if args.no_eot else pad_token_id
+    if args.no_eot:
+        logger.info("--no_eot: events concatenated directly, no EOT token appended.")
+    else:
+        logger.info("End-of-event token: %r (id=%d)", tokenizer.pad_token, pad_token_id)
 
     # Build description lookup tables
     desc_maps = build_mimic_description_maps(mimic_raw_dir)
@@ -686,7 +696,7 @@ def main():
         desc_maps=desc_maps,
         tokenizer=tokenizer,
         event_template=event_template,
-        append_eos_token_id=pad_token_id,
+        append_eos_token_id=append_eos_token_id,
         tokenize_batch_size=args.tokenize_batch_size,
         keep_patient_ids=keep_patient_ids,
     )
@@ -759,8 +769,9 @@ def main():
         "tokenize_batch_size": args.tokenize_batch_size,
         "num_threads": args.num_threads,
         "patients_per_task": args.patients_per_task,
-        "pad_token": tokenizer.pad_token,
-        "pad_token_id": int(pad_token_id),
+        "no_eot": args.no_eot,
+        "pad_token": tokenizer.pad_token if not args.no_eot else None,
+        "pad_token_id": int(pad_token_id) if not args.no_eot else None,
         "samples": sample_count,
         "patients": patient_count,
         "events": event_count,

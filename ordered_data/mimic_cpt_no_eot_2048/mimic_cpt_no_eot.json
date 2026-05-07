@@ -1,0 +1,17 @@
+{
+  "model_name": "Qwen/Qwen3-0.6B",
+  "meds_dir": "/gpfs/home/zduan/codes/ethos-ares/mimic-2.2-meds/data",
+  "mimic_raw_dir": "/gpfs/home/zduan/codes/ethos-ares/mimic-iv-2.2",
+  "split": "all",
+  "template_path": "01_gen_meta/templates/biolinkbert_event.j2",
+  "seq_len": 2048,
+  "tokenize_batch_size": 4096,
+  "num_threads": 16,
+  "patients_per_task": 64,
+  "no_eot": true,
+  "pad_token": null,
+  "pad_token_id": null,
+  "samples": 2081319,
+  "patients": 299712,
+  "events": 161331925
+}
