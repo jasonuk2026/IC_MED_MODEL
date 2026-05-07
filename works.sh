@@ -685,3 +685,140 @@ python
 --log_steps 1 \
 --save_every_epoch \
 --wandb_project mimic_qwen_0N6B_2048_causal
+
+
+./run_sm.sh -n 1 -j cpt_qwen0N6B_mimic_causal_2048_test python finetune_mimic_classifier.py \
+--pretrained_dir ordered_data/experiments/qwen3-0N6B-MIMIC-causal-2048/final \
+--eval_parquet_dir ordered_data/mimic_eval \
+--task icu_mortality \
+--output_dir experiments/classifier/icu_mortality \
+--freeze_backbone \
+--epochs 10 \
+--batch_size 8 \
+--lr 1e-4 \
+--early_stopping_patience 5 \
+--bf16 \
+--attn_mask_type causal \
+--attn_implementation flash_attention_3 \
+--compile \
+--num_workers 4
+
+./run_sm.sh -n 1 -j ori_qwen0N6B_mimic_causal_2048_test python finetune_mimic_classifier.py \
+--pretrained_dir Qwen/Qwen3-0.6B \
+--eval_parquet_dir ordered_data/mimic_eval \
+--task icu_mortality \
+--output_dir experiments/classifier/icu_mortality \
+--freeze_backbone \
+--epochs 10 \
+--batch_size 8 \
+--lr 1e-4 \
+--early_stopping_patience 5 \
+--bf16 \
+--attn_mask_type causal \
+--attn_implementation flash_attention_3 \
+--compile \
+--num_workers 4
+
+./run_sm.sh -n 1 -j cpt_qwen0N6B_mimic_eoe_2048_test python finetune_mimic_classifier.py \
+--pretrained_dir ordered_data/experiments/qwen3-0N6B-MIMIC-EOE-2048/final \
+--eval_parquet_dir ordered_data/mimic_eval \
+--task icu_mortality \
+--output_dir experiments/classifier/icu_mortality \
+--freeze_backbone \
+--epochs 10 \
+--batch_size 8 \
+--lr 1e-4 \
+--early_stopping_patience 5 \
+--bf16 \
+--attn_mask_type event_eot \
+--attn_implementation sdpa \
+--compile \
+--num_workers 4
+
+
+./run_sm.sh -n 1 -j cpt_qwen0N6B_mimic_eoe_mean_2048_test python finetune_mimic_classifier.py \
+--pretrained_dir ordered_data/experiments/qwen3-0N6B-MIMIC-EOE-2048/final \
+--eval_parquet_dir ordered_data/mimic_eval \
+--task icu_mortality \
+--output_dir experiments/classifier/icu_mortality \
+--freeze_backbone \
+--epochs 10 \
+--batch_size 8 \
+--lr 1e-4 \
+--early_stopping_patience 5 \
+--bf16 \
+--pooling mean_eot \
+--attn_mask_type event_eot \
+--attn_implementation sdpa \
+--compile \
+--num_workers 4
+
+
+# eot finetuned, mean eot token
+./run_sm.sh -n 1 -j mimic_2048_eval_eoe_cpt_qwen0N6B_mean python finetune_mimic_classifier.py \
+--pretrained_dir ordered_data/experiments/qwen3-0N6B-MIMIC-EOE-2048/final \
+--eval_parquet_dir ordered_data/mimic_eval \
+--task icu_mortality \
+--output_dir experiments/classifier/icu_mortality \
+--freeze_backbone \
+--epochs 10 \
+--batch_size 8 \
+--lr 1e-4 \
+--early_stopping_patience 5 \
+--bf16 \
+--pooling mean_eot \
+--attn_mask_type event_eot \
+--attn_implementation sdpa \
+--compile \
+--num_workers 4
+# eot finetuned, last eot token
+./run_sm.sh -n 1 -j mimic_2048_eval_eoe_cpt_qwen0N6B_last_token python finetune_mimic_classifier.py \
+--pretrained_dir ordered_data/experiments/qwen3-0N6B-MIMIC-EOE-2048/final \
+--eval_parquet_dir ordered_data/mimic_eval \
+--task icu_mortality \
+--output_dir experiments/classifier/icu_mortality \
+--freeze_backbone \
+--epochs 10 \
+--batch_size 8 \
+--lr 1e-4 \
+--early_stopping_patience 5 \
+--bf16 \
+--pooling last_token \
+--attn_mask_type event_eot \
+--attn_implementation sdpa \
+--compile \
+--num_workers 4
+# causal finetuned, mean eot token
+./run_sm.sh -n 1 -j mimic_2048_eval_causal_cpt_qwen0N6B_mean python finetune_mimic_classifier.py \
+--pretrained_dir ordered_data/experiments/qwen3-0N6B-MIMIC-causal-2048/final \
+--eval_parquet_dir ordered_data/mimic_eval \
+--task icu_mortality \
+--output_dir experiments/classifier/icu_mortality \
+--freeze_backbone \
+--epochs 10 \
+--batch_size 8 \
+--lr 1e-4 \
+--early_stopping_patience 5 \
+--bf16 \
+--pooling mean_eot \
+--attn_mask_type causal \
+--attn_implementation sdpa \
+--compile \
+--num_workers 4
+# causal finetuned, last eot token
+./run_sm.sh -n 1 -j mimic_2048_eval_causal_cpt_qwen0N6B_last_token python finetune_mimic_classifier.py \
+--pretrained_dir ordered_data/experiments/qwen3-0N6B-MIMIC-causal-2048/final \
+--eval_parquet_dir ordered_data/mimic_eval \
+--task icu_mortality \
+--output_dir experiments/classifier/icu_mortality \
+--freeze_backbone \
+--epochs 10 \
+--batch_size 8 \
+--lr 1e-4 \
+--early_stopping_patience 5 \
+--bf16 \
+--pooling last_token \
+--attn_mask_type causal \
+--attn_implementation sdpa \
+--compile \
+--num_workers 4
