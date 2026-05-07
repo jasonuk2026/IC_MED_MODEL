@@ -10,8 +10,8 @@ export NCCL_TIMEOUT=1800
 # 默认值
 N_GPUS=1
 JOB_NAME="ehr"
-CPUS_PER_GPU=8
-MEM_PER_GPU="64G"
+CPUS_PER_GPU=16
+MEM_PER_GPU="100G"
 
 # 参数解析
 while getopts ":n:j:c:m:" opt; do
@@ -59,7 +59,7 @@ sbatch \
         echo \"CMD: $*\"
         echo \"DATE: \$(date)\"
         echo \"JOB_NAME: $JOB_NAME | GPUs: $N_GPUS\"
-        module load cuda/12.6·
+        module load cuda/12.6
         eval \"\$(~/miniforge3/bin/conda shell.bash hook)\"
         conda activate torch
         cd \"$SLURM_SUBMIT_DIR\"

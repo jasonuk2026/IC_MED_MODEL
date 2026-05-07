@@ -570,6 +570,8 @@ def main():
         logger.info("Gradient checkpointing enabled.")
     if args.compile:
         logger.info("Compiling model with torch.compile(mode=%s)", args.compile_mode)
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
         model = torch.compile(model, mode=args.compile_mode)
     if world_size > 1:
         model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None, output_device=local_rank if device.type == "cuda" else None)

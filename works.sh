@@ -637,7 +637,7 @@ python /gpfs/home/zduan/codes/ehr/train_ehr_event_eot_cpt.py \
     --log_steps 20 \
     --save_every_epoch
 
-python train_ehr_event_eot_cpt.py \
+torchrun --nproc_per_node=4 --standalone train_ehr_event_eot_cpt.py \
 --model_name Qwen/Qwen3-0.6B \
 --train_parquet ordered_data/mimic_cpt_qwen_2048 \
 --output_dir ordered_data/experiments/qwen3-0.6b-ehrshot-event-eot-2048 \
@@ -652,8 +652,9 @@ python train_ehr_event_eot_cpt.py \
 --warmup_ratio 0.05 \
 --num_workers 4 \
 --compile \
---log_steps 20 \
---save_every_epoch
+--log_steps 1 \
+--save_every_epoch \
+--wandb_project mimic_qwen_0N6B_2048_eoe
 
 python /gpfs/home/zduan/codes/ehr/build_mimic_cpt_parquet.py \
 --model_name Qwen/Qwen3-0.6B \
@@ -663,3 +664,24 @@ python /gpfs/home/zduan/codes/ehr/build_mimic_cpt_parquet.py \
 --seq_len 2048 \
 --output_path /gpfs/home/zduan/codes/ehr/ordered_data/mimic_cpt_qwen_2048 \
 --num_threads 16
+
+torchrun --nproc_per_node=4 --standalone 
+python 
+./run_sm.sh -n 4 -j cpt_qwen0N6B_mimic_causal_2048 torchrun --nproc_per_node=4 --standalone train_ehr_event_eot_cpt.py \
+--model_name Qwen/Qwen3-0.6B \
+--train_parquet ordered_data/mimic_cpt_qwen_2048 \
+--output_dir ordered_data/experiments/qwen3-0N6B-MIMIC-causal-2048 \
+--attn_mask_type causal \
+--attn_implementation sdpa \
+--seq_len 2048 \
+--bf16 \
+--batch_size 8 \
+--global_batch_size 512 \
+--epochs 1 \
+--lr 2e-5 \
+--warmup_ratio 0.05 \
+--num_workers 4 \
+--compile \
+--log_steps 1 \
+--save_every_epoch \
+--wandb_project mimic_qwen_0N6B_2048_causal
