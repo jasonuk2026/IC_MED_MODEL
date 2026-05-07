@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import math
@@ -618,17 +619,22 @@ def main():
         for batch_idx, batch in enumerate(loader):
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             autocast_enabled = torch.cuda.is_available() and (autocast_dtype is not None)
-            with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_enabled):
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    event_ids=batch["event_ids"],
-                    labels=batch["labels"],
-                    eos_token_id=pad_token_id,
-                    attn_mask_type=args.attn_mask_type,
-                )
-                loss = outputs["loss"] / grad_accum
-            loss.backward()
+            is_last_accum = (batch_idx + 1) % grad_accum == 0
+            # Skip gradient sync on intermediate accumulation steps to avoid
+            # redundant NCCL all-reduces (no_sync is a no-op for single-GPU).
+            sync_ctx = contextlib.nullcontext() if is_last_accum else model.no_sync() if isinstance(model, DDP) else contextlib.nullcontext()
+            with sync_ctx:
+                with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_enabled):
+                    outputs = model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        event_ids=batch["event_ids"],
+                        labels=batch["labels"],
+                        eos_token_id=pad_token_id,
+                        attn_mask_type=args.attn_mask_type,
+                    )
+                    loss = outputs["loss"] / grad_accum
+                loss.backward()
 
             loss_value = float(outputs["loss"].item())
             run_loss += loss_value
