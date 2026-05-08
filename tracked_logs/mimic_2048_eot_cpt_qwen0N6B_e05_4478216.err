@@ -1,0 +1,223 @@
+W0507 15:51:58.218000 178559 site-packages/torch/distributed/run.py:851] 
+W0507 15:51:58.218000 178559 site-packages/torch/distributed/run.py:851] *****************************************
+W0507 15:51:58.218000 178559 site-packages/torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0507 15:51:58.218000 178559 site-packages/torch/distributed/run.py:851] *****************************************
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  77%|███████▋  | 241/311 [00:00<00:00, 2340.27it/s]Loading weights:  83%|████████▎ | 258/311 [00:00<00:00, 2473.55it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 2504.72it/s]
+Loading weights: 100%|██████████| 311/311 [00:00<00:00, 2362.26it/s]
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 9426.02it/s]
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 6361.24it/s]
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/u6dk/zduan.u6dk/.netrc.
+wandb: Currently logged in as: jasonduk2026 (jasoncsic) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run hb4su6lq
+wandb: Tracking run with wandb version 0.25.1
+wandb: Run data is saved locally in /lus/lfs1aip2/scratch/u6dk/zduan.u6dk/codes/ehr/wandb/run-20260507_155516-hb4su6lq
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run ehr-event-eot-cpt-0507-1555
+wandb: ⭐️ View project at https://wandb.ai/jasoncsic/mimic_qwen_0N6B_2048_eoe
+wandb: 🚀 View run at https://wandb.ai/jasoncsic/mimic_qwen_0N6B_2048_eoe/runs/hb4su6lq
+Epoch 1/5:   0%|          | 0/3794 [00:00<?, ?it/s][rank2]: Traceback (most recent call last):
+[rank2]:   File "/lus/lfs1aip2/scratch/u6dk/zduan.u6dk/codes/ehr/train_ehr_event_eot_cpt.py", line 699, in <module>
+[rank2]:     main()
+[rank2]:     ~~~~^^
+[rank2]:   File "/lus/lfs1aip2/scratch/u6dk/zduan.u6dk/codes/ehr/train_ehr_event_eot_cpt.py", line 630, in main
+[rank2]:     outputs = model(
+[rank2]:         input_ids=batch["input_ids"],
+[rank2]:     ...<4 lines>...
+[rank2]:         attn_mask_type=args.attn_mask_type,
+[rank2]:     )
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/parallel/distributed.py", line 1699, in forward
+[rank2]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank2]:          ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/parallel/distributed.py", line 1524, in _run_ddp_forward
+[rank2]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank2]:            ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_dynamo/eval_frame.py", line 472, in __call__
+[rank2]:     return super().__call__(*args, **kwargs)
+[rank2]:            ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_dynamo/eval_frame.py", line 1024, in compile_wrapper
+[rank2]:     return fn(*args, **kwargs)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:   File "/lus/lfs1aip2/scratch/u6dk/zduan.u6dk/codes/ehr/train_ehr_event_eot_cpt.py", line 344, in forward
+[rank2]:     def forward(
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_dynamo/eval_frame.py", line 472, in __call__
+[rank2]:     return super().__call__(*args, **kwargs)
+[rank2]:            ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_dynamo/eval_frame.py", line 1263, in _fn
+[rank2]:     return fn(*args, **kwargs)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/fx/graph_module.py", line 949, in call_wrapped
+[rank2]:     return self._wrapped_call(self, *args, **kwargs)
+[rank2]:            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/fx/graph_module.py", line 461, in __call__
+[rank2]:     raise e
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/fx/graph_module.py", line 447, in __call__
+[rank2]:     return super(self.cls, obj).__call__(*args, **kwargs)  # type: ignore[misc]
+[rank2]:            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:   File "<eval_with_key>.392", line 328, in forward
+[rank2]:     submod_1 = self.compiled_submod_1(getitem, l_self_modules_model_modules_layers_modules_0_modules_mlp_modules_gate_proj_parameters_weight_, l_self_modules_model_modules_layers_modules_0_modules_mlp_modules_up_proj_parameters_weight_, l_self_modules_model_modules_layers_modules_0_modules_mlp_modules_down_proj_parameters_weight_, getitem_1, l_self_modules_model_modules_layers_modules_1_modules_input_layernorm_parameters_weight_, l_self_modules_model_modules_layers_modules_1_modules_self_attn_modules_q_proj_parameters_weight_, l_self_modules_model_modules_layers_modules_1_modules_self_attn_modules_q_norm_parameters_weight_, l_self_modules_model_modules_layers_modules_1_modules_self_attn_modules_k_proj_parameters_weight_, l_self_modules_model_modules_layers_modules_1_modules_self_attn_modules_k_norm_parameters_weight_, l_self_modules_model_modules_layers_modules_1_modules_self_attn_modules_v_proj_parameters_weight_, getitem_2, getitem_3, getitem_4, l_self_modules_model_modules_layers_modules_1_modules_self_attn_modules_o_proj_parameters_weight_, l_self_modules_model_modules_layers_modules_1_modules_post_attention_layernorm_parameters_weight_);  getitem = l_self_modules_model_modules_layers_modules_0_modules_mlp_modules_gate_proj_parameters_weight_ = l_self_modules_model_modules_layers_modules_0_modules_mlp_modules_up_proj_parameters_weight_ = l_self_modules_model_modules_layers_modules_0_modules_mlp_modules_down_proj_parameters_weight_ = getitem_1 = l_self_modules_model_modules_layers_modules_1_modules_input_layernorm_parameters_weight_ = l_self_modules_model_modules_layers_modules_1_modules_self_attn_modules_q_proj_parameters_weight_ = l_self_modules_model_modules_layers_modules_1_modules_self_attn_modules_q_norm_parameters_weight_ = l_self_modules_model_modules_layers_modules_1_modules_self_attn_modules_k_proj_parameters_weight_ = l_self_modules_model_modules_layers_modules_1_modules_self_attn_modules_k_norm_parameters_weight_ = l_self_modules_model_modules_layers_modules_1_modules_self_attn_modules_v_proj_parameters_weight_ = l_self_modules_model_modules_layers_modules_1_modules_self_attn_modules_o_proj_parameters_weight_ = l_self_modules_model_modules_layers_modules_1_modules_post_attention_layernorm_parameters_weight_ = None
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_dynamo/backends/distributed.py", line 215, in forward
+[rank2]:     x = self.submod(*args)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_dynamo/eval_frame.py", line 1263, in _fn
+[rank2]:     return fn(*args, **kwargs)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_functorch/aot_autograd.py", line 1200, in forward
+[rank2]:     return compiled_fn(full_args)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 566, in runtime_wrapper
+[rank2]:     all_outs = call_func_at_runtime_with_args(
+[rank2]:         compiled_fn, args_, disable_amp=disable_amp, steal_args=True
+[rank2]:     )
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_functorch/_aot_autograd/utils.py", line 138, in call_func_at_runtime_with_args
+[rank2]:     out = normalize_as_list(f(args))
+[rank2]:                             ~^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_functorch/_aot_autograd/utils.py", line 105, in g
+[rank2]:     return f(*args)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/autograd/function.py", line 596, in apply
+[rank2]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank2]:            ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2503, in forward
+[rank2]:     fw_outs = call_func_at_runtime_with_args(
+[rank2]:         CompiledFunction.compiled_fw,
+[rank2]:     ...<2 lines>...
+[rank2]:         disable_amp=disable_amp,
+[rank2]:     )
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_functorch/_aot_autograd/utils.py", line 138, in call_func_at_runtime_with_args
+[rank2]:     out = normalize_as_list(f(args))
+[rank2]:                             ~^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 894, in wrapper
+[rank2]:     return compiled_fn(runtime_args)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 783, in wrapper
+[rank2]:     return compiled_fn(runtime_args)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 1011, in inner_fn
+[rank2]:     outs = compiled_fn(args)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_inductor/output_code.py", line 656, in __call__
+[rank2]:     return self.current_callable(inputs)
+[rank2]:            ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_inductor/utils.py", line 3401, in run
+[rank2]:     out = model(new_inputs)
+[rank2]:   File "/local/user/1483804406/torchinductor_zduan.u6dk/ld/cldsmiloobw4ttbwadbz2npsg3gbuwqkv7abopuxzmmpfab3kxnd.py", line 619, in call
+[rank2]:     triton_per_fused__to_copy__unsafe_view_add_cat_mean_mul_neg_pow_rsqrt_slice_transpose_unsqueeze_view_3.run(buf13, buf11, primals_10, primals_12, primals_13, buf16, 131072, 128, stream=stream2)
+[rank2]:     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 1448, in run
+[rank2]:     self.autotune_to_one_config(*args, **kwargs)
+[rank2]:     ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 1176, in autotune_to_one_config
+[rank2]:     timings = self.benchmark_all_configs(*args, **kwargs)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 1139, in benchmark_all_configs
+[rank2]:     launcher: self.bench(launcher, *args, **kwargs)
+[rank2]:               ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_inductor/runtime/triton_heuristics.py", line 999, in bench
+[rank2]:     return benchmarker.benchmark(
+[rank2]:            ~~~~~~~~~~~~~~~~~~~~~^
+[rank2]:         fn=kernel_call,
+[rank2]:         ^^^^^^^^^^^^^^^
+[rank2]:         device=self.device_props.type,
+[rank2]:         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:         **benchmark_kwargs,  # type: ignore[arg-type]
+[rank2]:         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:     )
+[rank2]:     ^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_inductor/runtime/benchmarking.py", line 95, in wrapper
+[rank2]:     return fn(self, *args, **kwargs)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_inductor/runtime/benchmarking.py", line 206, in benchmark
+[rank2]:     return self.benchmark_gpu(_callable, warmup=warmup, rep=rep, **kwargs)
+[rank2]:            ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_inductor/runtime/benchmarking.py", line 95, in wrapper
+[rank2]:     return fn(self, *args, **kwargs)
+[rank2]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_inductor/runtime/benchmarking.py", line 383, in benchmark_gpu
+[rank2]:     buffer = torch.empty(self.L2_cache_size // 4, dtype=torch.int, device="cuda")
+[rank2]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 60.00 MiB. GPU 2 has a total capacity of 95.00 GiB of which 1.88 GiB is free. Including non-PyTorch memory, this process has 4.87 GiB memory in use. Of the allocated memory 3.33 GiB is allocated by PyTorch, and 18.55 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+W0507 15:56:26.066000 178559 site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 178641 closing signal SIGTERM
+W0507 15:56:26.071000 178559 site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 178642 closing signal SIGTERM
+W0507 15:56:26.072000 178559 site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 178644 closing signal SIGTERM
+E0507 15:56:26.077000 178559 site-packages/torch/distributed/elastic/multiprocessing/api.py:986] failed (exitcode: 1) local_rank: 2 (pid: 178643) of binary: /home/u6dk/zduan.u6dk/miniforge3/envs/torch/bin/python3.13
+Traceback (most recent call last):
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/run.py", line 990, in main
+    run(args)
+    ~~~^^^^^^
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/run.py", line 981, in run
+    elastic_launch(
+    ~~~~~~~~~~~~~~~
+        config=config,
+        ~~~~~~~~~~~~~~
+        entrypoint=cmd,
+        ~~~~~~~~~~~~~~~
+    )(*cmd_args)
+    ~^^^^^^^^^^^
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+    raise ChildFailedError(
+    ...<2 lines>...
+    )
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+train_ehr_event_eot_cpt.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-05-07_15:56:26
+  host      : nid011207
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 178641)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 178641
+[2]:
+  time      : 2026-05-07_15:56:26
+  host      : nid011207
+  rank      : 1 (local_rank: 1)
+  exitcode  : -15 (pid: 178642)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 178642
+[3]:
+  time      : 2026-05-07_15:56:26
+  host      : nid011207
+  rank      : 3 (local_rank: 3)
+  exitcode  : -15 (pid: 178644)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 178644
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-05-07_15:56:26
+  host      : nid011207
+  rank      : 2 (local_rank: 2)
+  exitcode  : 1 (pid: 178643)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

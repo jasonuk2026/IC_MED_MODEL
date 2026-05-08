@@ -1,0 +1,13 @@
+CMD: python finetune_mimic_classifier.py --pretrained_dir ordered_data/experiments/mimic_2048_[CPT]_eot_qwen0N6B_E05/epoch_2 --eval_parquet_dir ordered_data/mimic_eval --task icu_mortality --output_dir ordered_data/experiments/mimic_2048_[CPT]_eot_qwen0N6B_E05/epoch_2/classifier/icu_mortality --freeze_backbone --epochs 10 --batch_size 8 --lr 1e-4 --early_stopping_patience 5 --bf16 --pooling mean_eot --attn_mask_type event_eot --attn_implementation sdpa --compile --num_workers 4
+DATE: Fri May  8 09:05:10 UTC 2026
+JOB_NAME: mimic_2048_[eval]_eoe_cpt_qwen0N6B_mean_open_EP02 | GPUs: 1
+2026-05-08 09:06:00 [INFO] Loading tokenizer from ordered_data/experiments/mimic_2048_[CPT]_eot_qwen0N6B_E05/epoch_2
+2026-05-08 09:06:01 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-08 09:06:01 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-08 09:06:01 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-08 09:06:01 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-05-08 09:06:01 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-05-08 09:06:01 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-05-08 09:06:01 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B "HTTP/1.1 200 OK"
+2026-05-08 09:06:01 [INFO] EOT token: '<|endoftext|>' (id=151643)
+2026-05-08 09:06:01 [INFO] Loading eval parquet: ordered_data/mimic_eval/icu_mortality/train.parquet

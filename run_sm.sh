@@ -51,11 +51,11 @@ sbatch \
     --cpus-per-gpu="$CPUS_PER_GPU" \
     --mem-per-gpu="$MEM_PER_GPU" \
     --time=24:00:00 \
-    --output=logs/%x_%j.out \
-    --error=logs/%x_%j.err \
+    --output=tracked_logs/%x_%j.out \
+    --error=tracked_logs/%x_%j.err \
     --wrap="
         set -e
-        mkdir -p logs
+        mkdir -p tracked_logs
         echo \"CMD: $*\"
         echo \"DATE: \$(date)\"
         echo \"JOB_NAME: $JOB_NAME | GPUs: $N_GPUS\"

@@ -1,0 +1,93 @@
+W0507 16:41:47.868000 12873 site-packages/torch/distributed/run.py:851] 
+W0507 16:41:47.868000 12873 site-packages/torch/distributed/run.py:851] *****************************************
+W0507 16:41:47.868000 12873 site-packages/torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0507 16:41:47.868000 12873 site-packages/torch/distributed/run.py:851] *****************************************
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  65%|██████▌   | 203/311 [00:00<00:00, 2021.58it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 2119.38it/s]
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 10295.82it/s]
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 10174.71it/s]
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 9318.41it/s]
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/lus/lfs1aip2/scratch/u6dk/zduan.u6dk/codes/ehr/train_ehr_event_eot_cpt.py", line 704, in <module>
+[rank0]:     main()
+[rank0]:     ~~~~^^
+[rank0]:   File "/lus/lfs1aip2/scratch/u6dk/zduan.u6dk/codes/ehr/train_ehr_event_eot_cpt.py", line 582, in main
+[rank0]:     model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None, output_device=local_rank if device.type == "cuda" else None)
+[rank0]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/nn/parallel/distributed.py", line 881, in __init__
+[rank0]:     _verify_param_shape_across_processes(self.process_group, parameters)
+[rank0]:     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/utils.py", line 286, in _verify_param_shape_across_processes
+[rank0]:     return dist._verify_params_across_processes(process_group, tensors, logger)
+[rank0]:            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]: torch.distributed.DistBackendError: NCCL error in: /pytorch/torch/csrc/distributed/c10d/NCCLUtils.cpp:93, unhandled cuda error (run with NCCL_DEBUG=INFO for details), NCCL version 2.28.9
+[rank0]: ncclUnhandledCudaError: Call to CUDA function failed.
+[rank0]: Last error:
+[rank0]: Failed to CUDA calloc async 16 bytes
+[rank0]:[W507 16:45:29.877472488 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+W0507 16:45:31.573000 12873 site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 12958 closing signal SIGTERM
+W0507 16:45:31.575000 12873 site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 12959 closing signal SIGTERM
+W0507 16:45:31.576000 12873 site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 12960 closing signal SIGTERM
+E0507 16:45:32.405000 12873 site-packages/torch/distributed/elastic/multiprocessing/api.py:986] failed (exitcode: 1) local_rank: 0 (pid: 12957) of binary: /home/u6dk/zduan.u6dk/miniforge3/envs/torch/bin/python3.13
+Traceback (most recent call last):
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/run.py", line 990, in main
+    run(args)
+    ~~~^^^^^^
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/run.py", line 981, in run
+    elastic_launch(
+    ~~~~~~~~~~~~~~~
+        config=config,
+        ~~~~~~~~~~~~~~
+        entrypoint=cmd,
+        ~~~~~~~~~~~~~~~
+    )(*cmd_args)
+    ~^^^^^^^^^^^
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+    raise ChildFailedError(
+    ...<2 lines>...
+    )
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+train_ehr_event_eot_cpt.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-05-07_16:45:32
+  host      : nid010873
+  rank      : 1 (local_rank: 1)
+  exitcode  : -15 (pid: 12958)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 12958
+[2]:
+  time      : 2026-05-07_16:45:32
+  host      : nid010873
+  rank      : 2 (local_rank: 2)
+  exitcode  : -15 (pid: 12959)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 12959
+[3]:
+  time      : 2026-05-07_16:45:32
+  host      : nid010873
+  rank      : 3 (local_rank: 3)
+  exitcode  : -15 (pid: 12960)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 12960
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-05-07_16:45:31
+  host      : nid010873
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 12957)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

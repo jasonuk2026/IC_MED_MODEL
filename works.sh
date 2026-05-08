@@ -640,7 +640,7 @@ python /gpfs/home/zduan/codes/ehr/train_ehr_event_eot_cpt.py \
 torchrun --nproc_per_node=4 --standalone train_ehr_event_eot_cpt.py \
 --model_name Qwen/Qwen3-0.6B \
 --train_parquet ordered_data/mimic_cpt_qwen_2048 \
---output_dir ordered_data/experiments/qwen3-0.6b-ehrshot-event-eot-2048 \
+--output_dir ordered_data/experiments/qwen3-0N6B-MIMIC-EOE-2048 \
 --attn_mask_type event_eot \
 --attn_implementation sdpa \
 --seq_len 2048 \
@@ -819,6 +819,137 @@ python
 --bf16 \
 --pooling last_token \
 --attn_mask_type causal \
+--attn_implementation sdpa \
+--compile \
+--num_workers 4
+
+
+# cpt on no eot data
+./run_sm.sh -n 4 -j mimic_2048_no_eot_cpt_qwen0N6B torchrun --standalone --nproc_per_node=4 \
+train_ehr_event_eot_cpt.py \
+--model_name Qwen/Qwen3-0.6B \
+--train_parquet ordered_data/mimic_cpt_no_eot_2048/mimic_cpt_no_eot.parquet \
+--output_dir ordered_data/experiments/qwen3-0N6B-MIMIC-no-eot-2048 \
+--attn_mask_type causal \
+--attn_implementation flash_attention_3 \
+--seq_len 2048 \
+--bf16 \
+--batch_size 8 \
+--global_batch_size 512 \
+--epochs 1 \
+--lr 2e-5 \
+--warmup_ratio 0.05 \
+--num_workers 4 \
+--compile \
+--log_steps 1 \
+--save_every_epoch
+
+./run_sm.sh -n 4 -j mimic_2048_eot_cpt_qwen0N6B_e05 torchrun --nproc_per_node=4 --standalone train_ehr_event_eot_cpt.py \
+--model_name Qwen/Qwen3-0.6B \
+--train_parquet ordered_data/mimic_cpt_qwen_2048 \
+--output_dir ordered_data/experiments/qwen3-0N6B-MIMIC-EOE-2048-E05 \
+--attn_mask_type event_eot \
+--attn_implementation sdpa \
+--seq_len 2048 \
+--bf16 \
+--batch_size 4 \
+--global_batch_size 512 \
+--epochs 5 \
+--lr 2e-5 \
+--warmup_ratio 0.05 \
+--num_workers 4 \
+--compile \
+--log_steps 1 \
+--save_every_epoch \
+--wandb_project mimic_qwen_0N6B_2048_eoe
+
+
+# eot finetuned, mean eot token, open backbone
+./run_sm.sh -n 1 -j mimic_2048_eval_eoe_cpt_qwen0N6B_mean_open python finetune_mimic_classifier.py \
+--pretrained_dir ordered_data/experiments/qwen3-0N6B-MIMIC-EOE-2048/final \
+--eval_parquet_dir ordered_data/mimic_eval \
+--task icu_mortality \
+--output_dir experiments/classifier/icu_mortality \
+--no_freeze_backbone \
+--epochs 10 \
+--batch_size 8 \
+--lr 1e-4 \
+--early_stopping_patience 5 \
+--bf16 \
+--pooling mean_eot \
+--attn_mask_type event_eot \
+--attn_implementation sdpa \
+--compile \
+--num_workers 4
+
+# causal finetuned, mean eot token, open backbone
+./run_sm.sh -n 1 -j mimic_2048_eval_causal_cpt_qwen0N6B_mean_open python finetune_mimic_classifier.py \
+--pretrained_dir ordered_data/experiments/qwen3-0N6B-MIMIC-causal-2048/final \
+--eval_parquet_dir ordered_data/mimic_eval \
+--task icu_mortality \
+--output_dir experiments/classifier/icu_mortality \
+--no_freeze_backbone \
+--epochs 10 \
+--batch_size 8 \
+--lr 1e-4 \
+--early_stopping_patience 5 \
+--bf16 \
+--pooling mean_eot \
+--attn_mask_type causal \
+--attn_implementation sdpa \
+--compile \
+--num_workers 4
+# original,last token, open backbone
+./run_sm.sh -n 1 -j mimic_2048_eval_original_qwen0N6B_mean_open python finetune_mimic_classifier.py \
+--pretrained_dir Qwen/Qwen3-0.6B \
+--eval_parquet_dir ordered_data/mimic_eval \
+--task icu_mortality \
+--output_dir experiments/classifier/icu_mortality \
+--no_freeze_backbone \
+--epochs 10 \
+--batch_size 8 \
+--lr 1e-4 \
+--early_stopping_patience 5 \
+--bf16 \
+--pooling last_token \
+--attn_mask_type causal \
+--attn_implementation sdpa \
+--compile \
+--num_workers 4
+
+./run_sm.sh -n 4 -j mimic_2048_[CPT]_eot_qwen0N6B_E05 torchrun --nproc_per_node=4 --standalone train_ehr_event_eot_cpt.py \
+--model_name Qwen/Qwen3-0.6B \
+--train_parquet ordered_data/mimic_cpt_qwen_2048 \
+--output_dir ordered_data/experiments/mimic_2048_[CPT]_eot_qwen0N6B_E05 \
+--attn_mask_type event_eot \
+--attn_implementation sdpa \
+--seq_len 2048 \
+--bf16 \
+--batch_size 8 \
+--global_batch_size 512 \
+--epochs 5 \
+--lr 2e-5 \
+--warmup_ratio 0.05 \
+--num_workers 4 \
+--compile \
+--log_steps 1 \
+--save_every_epoch
+
+ordered_data/experiments/mimic_2048_[CPT]_eot_qwen0N6B_E05/epoch_2
+# eot finetuned, mean eot token, open backbone
+./run_sm.sh -n 1 -j mimic_2048_[eval]_eoe_cpt_qwen0N6B_mean_open_EP02 python finetune_mimic_classifier.py \
+--pretrained_dir ordered_data/experiments/mimic_2048_[CPT]_eot_qwen0N6B_E05/epoch_2 \
+--eval_parquet_dir ordered_data/mimic_eval \
+--task icu_mortality \
+--output_dir ordered_data/experiments/mimic_2048_[CPT]_eot_qwen0N6B_E05/epoch_2/classifier/icu_mortality \
+--freeze_backbone \
+--epochs 10 \
+--batch_size 8 \
+--lr 1e-4 \
+--early_stopping_patience 5 \
+--bf16 \
+--pooling mean_eot \
+--attn_mask_type event_eot \
 --attn_implementation sdpa \
 --compile \
 --num_workers 4

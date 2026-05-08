@@ -1,0 +1,43 @@
+CMD: python finetune_mimic_classifier.py --pretrained_dir Qwen/Qwen3-0.6B --eval_parquet_dir ordered_data/mimic_eval --task icu_mortality --output_dir experiments/classifier/icu_mortality --no_freeze_backbone --epochs 10 --batch_size 8 --lr 1e-4 --early_stopping_patience 5 --bf16 --pooling last_token --attn_mask_type causal --attn_implementation sdpa --compile --num_workers 4
+DATE: Thu May  7 16:05:00 UTC 2026
+JOB_NAME: mimic_2048_eval_original_qwen0N6B_mean_open | GPUs: 1
+2026-05-07 16:05:49 [INFO] Loading tokenizer from Qwen/Qwen3-0.6B
+2026-05-07 16:05:49 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:05:49 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:05:49 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:05:49 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-05-07 16:05:50 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-05-07 16:05:50 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-05-07 16:05:51 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B "HTTP/1.1 200 OK"
+2026-05-07 16:05:51 [INFO] EOT token: '<|endoftext|>' (id=151643)
+2026-05-07 16:05:51 [INFO] Loading eval parquet: ordered_data/mimic_eval/icu_mortality/train.parquet
+2026-05-07 16:07:28 [INFO]   65816 samples  pos=4867 (7.4%)  neg=60949
+2026-05-07 16:07:28 [INFO] Loading eval parquet: ordered_data/mimic_eval/icu_mortality/test.parquet
+2026-05-07 16:07:39 [INFO]   7365 samples  pos=532 (7.2%)  neg=6833
+2026-05-07 16:07:39 [INFO] Loading backbone from Qwen/Qwen3-0.6B  (attn_impl=sdpa)
+2026-05-07 16:07:39 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:07:39 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:07:44 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:07:44 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:07:45 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/generation_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:07:45 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/generation_config.json "HTTP/1.1 200 OK"
+2026-05-07 16:07:45 [INFO] Backbone trainable (full fine-tuning).
+2026-05-07 16:07:45 [INFO] Trainable parameters: 596.05M
+2026-05-07 16:07:46 [INFO] torch.compile(mode=default) …
+2026-05-07 16:07:48 [INFO] steps_per_epoch=8227  total_steps=82270  warmup=8227
+2026-05-07 17:00:24 [INFO] Epoch 1/10 | val_loss=0.3272  auroc=0.4915  auprc=0.0715  f1=0.0000
+2026-05-07 17:00:25 [INFO]   >> New best AUROC=0.4915 at epoch 1 — saved to experiments/classifier/icu_mortality/best
+2026-05-07 17:50:35 [INFO] Epoch 2/10 | val_loss=0.3546  auroc=0.5713  auprc=0.1027  f1=0.0000
+2026-05-07 17:50:37 [INFO]   >> New best AUROC=0.5713 at epoch 2 — saved to experiments/classifier/icu_mortality/best
+2026-05-07 18:40:47 [INFO] Epoch 3/10 | val_loss=0.3539  auroc=0.5428  auprc=0.0883  f1=0.0000
+2026-05-07 18:40:47 [INFO]   No improvement. Patience: 1/5
+2026-05-07 19:30:53 [INFO] Epoch 4/10 | val_loss=0.3486  auroc=0.5176  auprc=0.0763  f1=0.0000
+2026-05-07 19:30:53 [INFO]   No improvement. Patience: 2/5
+2026-05-07 20:20:57 [INFO] Epoch 5/10 | val_loss=0.3281  auroc=0.5436  auprc=0.0830  f1=0.0000
+2026-05-07 20:20:57 [INFO]   No improvement. Patience: 3/5
+2026-05-07 21:11:01 [INFO] Epoch 6/10 | val_loss=0.3607  auroc=0.5531  auprc=0.0845  f1=0.0000
+2026-05-07 21:11:01 [INFO]   No improvement. Patience: 4/5
+2026-05-07 22:01:05 [INFO] Epoch 7/10 | val_loss=0.3438  auroc=0.5484  auprc=0.0868  f1=0.0000
+2026-05-07 22:01:05 [INFO]   No improvement. Patience: 5/5
+2026-05-07 22:01:05 [INFO] Early stopping triggered at epoch 7 (best=2, AUROC=0.5713)
+2026-05-07 22:01:05 [INFO] Loading best checkpoint (epoch=2, AUROC=0.5713)…

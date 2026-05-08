@@ -1,0 +1,117 @@
+W0507 16:25:52.709000 71828 site-packages/torch/distributed/run.py:851] 
+W0507 16:25:52.709000 71828 site-packages/torch/distributed/run.py:851] *****************************************
+W0507 16:25:52.709000 71828 site-packages/torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0507 16:25:52.709000 71828 site-packages/torch/distributed/run.py:851] *****************************************
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights:  70%|██████▉   | 217/311 [00:00<00:00, 2160.41it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 2179.53it/s]
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 10056.89it/s]
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 5111.82it/s]
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 9852.40it/s]
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/u6dk/zduan.u6dk/.netrc.
+wandb: Currently logged in as: jasonduk2026 (jasoncsic) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run n91mraz7
+wandb: Tracking run with wandb version 0.25.1
+wandb: Run data is saved locally in /lus/lfs1aip2/scratch/u6dk/zduan.u6dk/codes/ehr/wandb/run-20260507_162950-n91mraz7
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run ehr-event-eot-cpt-0507-1629
+wandb: ⭐️ View project at https://wandb.ai/jasoncsic/mimic_qwen_0N6B_2048_eoe
+wandb: 🚀 View run at https://wandb.ai/jasoncsic/mimic_qwen_0N6B_2048_eoe/runs/n91mraz7
+Epoch 1/5:   0%|          | 0/3794 [00:00<?, ?it/s][rank1]: Traceback (most recent call last):
+[rank1]:   File "/lus/lfs1aip2/scratch/u6dk/zduan.u6dk/codes/ehr/train_ehr_event_eot_cpt.py", line 704, in <module>
+[rank1]:     main()
+[rank1]:     ~~~~^^
+[rank1]:   File "/lus/lfs1aip2/scratch/u6dk/zduan.u6dk/codes/ehr/train_ehr_event_eot_cpt.py", line 644, in main
+[rank1]:     loss.backward()
+[rank1]:     ~~~~~~~~~~~~~^^
+[rank1]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/_tensor.py", line 631, in backward
+[rank1]:     torch.autograd.backward(
+[rank1]:     ~~~~~~~~~~~~~~~~~~~~~~~^
+[rank1]:         self, gradient, retain_graph, create_graph, inputs=inputs
+[rank1]:         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:     )
+[rank1]:     ^
+[rank1]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/autograd/__init__.py", line 381, in backward
+[rank1]:     _engine_run_backward(
+[rank1]:     ~~~~~~~~~~~~~~~~~~~~^
+[rank1]:         tensors,
+[rank1]:         ^^^^^^^^
+[rank1]:     ...<5 lines>...
+[rank1]:         accumulate_grad=True,
+[rank1]:         ^^^^^^^^^^^^^^^^^^^^^
+[rank1]:     )
+[rank1]:     ^
+[rank1]:   File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/autograd/graph.py", line 869, in _engine_run_backward
+[rank1]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank1]:            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:         t_outputs, *args, **kwargs
+[rank1]:         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:     )  # Calls into the C++ engine to run the backward pass
+[rank1]:     ^
+[rank1]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.32 GiB. GPU 1 has a total capacity of 95.00 GiB of which 2.77 GiB is free. Including non-PyTorch memory, this process has 16.72 GiB memory in use. Of the allocated memory 15.18 GiB is allocated by PyTorch, and 18.08 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+W0507 16:31:01.463000 71828 site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 71934 closing signal SIGTERM
+W0507 16:31:01.466000 71828 site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 71936 closing signal SIGTERM
+W0507 16:31:01.469000 71828 site-packages/torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 71937 closing signal SIGTERM
+E0507 16:31:01.473000 71828 site-packages/torch/distributed/elastic/multiprocessing/api.py:986] failed (exitcode: 1) local_rank: 1 (pid: 71935) of binary: /home/u6dk/zduan.u6dk/miniforge3/envs/torch/bin/python3.13
+Traceback (most recent call last):
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/run.py", line 990, in main
+    run(args)
+    ~~~^^^^^^
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/run.py", line 981, in run
+    elastic_launch(
+    ~~~~~~~~~~~~~~~
+        config=config,
+        ~~~~~~~~~~~~~~
+        entrypoint=cmd,
+        ~~~~~~~~~~~~~~~
+    )(*cmd_args)
+    ~^^^^^^^^^^^
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/home/u6dk/zduan.u6dk/miniforge3/envs/torch/lib/python3.13/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+    raise ChildFailedError(
+    ...<2 lines>...
+    )
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+train_ehr_event_eot_cpt.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-05-07_16:31:01
+  host      : nid011042
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 71934)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 71934
+[2]:
+  time      : 2026-05-07_16:31:01
+  host      : nid011042
+  rank      : 2 (local_rank: 2)
+  exitcode  : -15 (pid: 71936)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 71936
+[3]:
+  time      : 2026-05-07_16:31:01
+  host      : nid011042
+  rank      : 3 (local_rank: 3)
+  exitcode  : -15 (pid: 71937)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 71937
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-05-07_16:31:01
+  host      : nid011042
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 71935)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

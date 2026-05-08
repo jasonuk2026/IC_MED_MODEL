@@ -1,0 +1,93 @@
+CMD: torchrun --nproc_per_node=4 --standalone train_ehr_event_eot_cpt.py --model_name Qwen/Qwen3-0.6B --train_parquet ordered_data/mimic_cpt_qwen_2048 --output_dir ordered_data/experiments/qwen3-0N6B-MIMIC-EOE-2048-E05 --attn_mask_type event_eot --attn_implementation sdpa --seq_len 2048 --bf16 --batch_size 4 --global_batch_size 512 --epochs 5 --lr 2e-5 --warmup_ratio 0.05 --num_workers 4 --compile --log_steps 1 --save_every_epoch --wandb_project mimic_qwen_0N6B_2048_eoe
+DATE: Thu May  7 16:11:18 UTC 2026
+JOB_NAME: mimic_2048_eot_cpt_qwen0N6B_e05 | GPUs: 4
+2026-05-07 16:12:36 [INFO] Rank 1/4 | device=cuda:1
+2026-05-07 16:12:36 [INFO] Loading tokenizer: Qwen/Qwen3-0.6B
+2026-05-07 16:12:37 [INFO] Rank 2/4 | device=cuda:2
+2026-05-07 16:12:37 [INFO] Loading tokenizer: Qwen/Qwen3-0.6B
+2026-05-07 16:12:37 [INFO] Rank 3/4 | device=cuda:3
+2026-05-07 16:12:37 [INFO] Loading tokenizer: Qwen/Qwen3-0.6B
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:12:37 [INFO] Rank 0/4 | device=cuda:0
+2026-05-07 16:12:37 [INFO] Loading tokenizer: Qwen/Qwen3-0.6B
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:12:37 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-05-07 16:12:37 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-05-07 16:12:37 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-05-07 16:12:37 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-05-07 16:12:37 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] Using end-of-event token: '<|endoftext|>' (id=151643)
+2026-05-07 16:12:37 [INFO] Loading training parquet: ordered_data/mimic_cpt_qwen_2048
+2026-05-07 16:12:37 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] Using end-of-event token: '<|endoftext|>' (id=151643)
+2026-05-07 16:12:37 [INFO] Loading training parquet: ordered_data/mimic_cpt_qwen_2048
+2026-05-07 16:12:37 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] Using end-of-event token: '<|endoftext|>' (id=151643)
+2026-05-07 16:12:37 [INFO] Loading training parquet: ordered_data/mimic_cpt_qwen_2048
+2026-05-07 16:12:37 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B "HTTP/1.1 200 OK"
+2026-05-07 16:12:37 [INFO] Using end-of-event token: '<|endoftext|>' (id=151643)
+2026-05-07 16:12:37 [INFO] Loading training parquet: ordered_data/mimic_cpt_qwen_2048
+2026-05-07 16:14:34 [INFO] Loaded 1,942,398 offline training samples from parquet with Arrow-backed columns
+2026-05-07 16:14:34 [INFO] Estimated training samples: 1,942,398
+2026-05-07 16:14:34 [INFO] Loading model: Qwen/Qwen3-0.6B
+2026-05-07 16:14:40 [INFO] Loaded 1,942,398 offline training samples from parquet with Arrow-backed columns
+2026-05-07 16:14:40 [INFO] Estimated training samples: 1,942,398
+2026-05-07 16:14:40 [INFO] batch_size=4  world_size=4  grad_accum=32  → effective_global_bs=512
+2026-05-07 16:14:40 [INFO] Loading model: Qwen/Qwen3-0.6B
+2026-05-07 16:14:40 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:14:40 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:14:41 [INFO] Loaded 1,942,398 offline training samples from parquet with Arrow-backed columns
+2026-05-07 16:14:41 [INFO] Estimated training samples: 1,942,398
+2026-05-07 16:14:41 [INFO] Loading model: Qwen/Qwen3-0.6B
+2026-05-07 16:14:41 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:14:41 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:14:43 [INFO] Loaded 1,942,398 offline training samples from parquet with Arrow-backed columns
+2026-05-07 16:14:43 [INFO] Estimated training samples: 1,942,398
+2026-05-07 16:14:43 [INFO] Loading model: Qwen/Qwen3-0.6B
+2026-05-07 16:14:44 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:14:44 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:14:44 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:14:44 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:14:45 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:14:45 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:14:45 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:14:45 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:14:46 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/generation_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:14:46 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/generation_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:14:46 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/generation_config.json "HTTP/1.1 200 OK"
+2026-05-07 16:14:46 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/generation_config.json "HTTP/1.1 200 OK"
+2026-05-07 16:14:47 [INFO] Compiling model with torch.compile(mode=default)
+2026-05-07 16:14:47 [INFO] Compiling model with torch.compile(mode=default)
+2026-05-07 16:14:47 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:14:47 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:14:47 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:14:47 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:14:47 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/generation_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:14:47 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/generation_config.json "HTTP/1.1 200 OK"
+2026-05-07 16:14:47 [INFO] Compiling model with torch.compile(mode=default)
+2026-05-07 16:14:48 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/generation_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:14:48 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/generation_config.json "HTTP/1.1 200 OK"
+2026-05-07 16:14:48 [INFO] Compiling model with torch.compile(mode=default)
+2026-05-07 16:14:53 [INFO] Model params: 596.0M
+2026-05-07 16:14:53 [INFO] Model params: 596.0M
+2026-05-07 16:14:53 [INFO] Model params: 596.0M
+2026-05-07 16:14:53 [INFO] Model params: 596.0M
+2026-05-07 16:14:53 [INFO] steps_per_epoch=3794  total_steps=18970  warmup_steps=948

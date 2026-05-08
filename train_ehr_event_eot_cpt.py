@@ -304,6 +304,11 @@ class EventEOTSummaryCPTModel(nn.Module):
         )
         self.model = self.backbone.model
         self.vocab_size = int(self.backbone.config.vocab_size)
+        # Placeholder buffers; resized lazily in build_event_summary_attention_mask.
+        # Stored as buffers so torch.compile sees them as stable tensor state.
+        self.register_buffer("_causal_cache", torch.zeros(1, 1, 1, dtype=torch.bool), persistent=False)
+        self.register_buffer("_eye_cache",    torch.zeros(1, 1, 1, dtype=torch.bool), persistent=False)
+        self._cache_seq_len: int = 0
 
     def save_checkpoint(self, save_dir: Path):
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -320,11 +325,11 @@ class EventEOTSummaryCPTModel(nn.Module):
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
-        # Cache static masks that don't depend on batch content.
-        if not hasattr(self, "_causal_cache") or self._causal_cache.shape[-1] != seq_len or self._causal_cache.device != device:
+        if self._cache_seq_len != seq_len:
             pos = torch.arange(seq_len, device=device)
-            self._causal_cache = (pos.view(1, 1, seq_len) <= pos.view(1, seq_len, 1))  # (1, S, S)
-            self._eye_cache = torch.eye(seq_len, device=device, dtype=torch.bool).unsqueeze(0)  # (1, S, S)
+            self._causal_cache = (pos.view(1, 1, seq_len) <= pos.view(1, seq_len, 1))
+            self._eye_cache    = torch.eye(seq_len, device=device, dtype=torch.bool).unsqueeze(0)
+            self._cache_seq_len = seq_len
 
         causal = self._causal_cache
         eye    = self._eye_cache
@@ -429,7 +434,7 @@ def parse_args():
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--fp16", action="store_true")
-    p.add_argument("--attn_implementation", default="eager", choices=["eager", "sdpa", "flash_attention_2"])
+    p.add_argument("--attn_implementation", default="eager", choices=["eager", "sdpa", "flash_attention_2",  "flash_attention_3"])
     p.add_argument("--attn_mask_type", default="event_eot", choices=["event_eot", "causal"],
                    help="'event_eot' = custom CPT mask; 'causal' = standard causal LM attention.")
     p.add_argument("--gradient_checkpointing", action="store_true",

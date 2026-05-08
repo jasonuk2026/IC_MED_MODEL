@@ -1,0 +1,35 @@
+CMD: python finetune_mimic_classifier.py --pretrained_dir ordered_data/experiments/qwen3-0N6B-MIMIC-causal-2048/final --eval_parquet_dir ordered_data/mimic_eval --task icu_mortality --output_dir experiments/classifier/icu_mortality --no_freeze_backbone --epochs 10 --batch_size 8 --lr 1e-4 --early_stopping_patience 5 --bf16 --pooling mean_eot --attn_mask_type causal --attn_implementation sdpa --compile --num_workers 4
+DATE: Thu May  7 16:03:24 UTC 2026
+JOB_NAME: mimic_2048_eval_causal_cpt_qwen0N6B_mean_open | GPUs: 1
+2026-05-07 16:04:30 [INFO] Loading tokenizer from ordered_data/experiments/qwen3-0N6B-MIMIC-causal-2048/final
+2026-05-07 16:04:30 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:04:30 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/config.json "HTTP/1.1 200 OK"
+2026-05-07 16:04:30 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+2026-05-07 16:04:30 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-0.6B/c1899de289a04d12100db370d81485cdf75e47ca/tokenizer_config.json "HTTP/1.1 200 OK"
+2026-05-07 16:04:31 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+2026-05-07 16:04:31 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+2026-05-07 16:04:31 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B "HTTP/1.1 200 OK"
+2026-05-07 16:04:31 [INFO] EOT token: '<|endoftext|>' (id=151643)
+2026-05-07 16:04:31 [INFO] Loading eval parquet: ordered_data/mimic_eval/icu_mortality/train.parquet
+2026-05-07 16:06:04 [INFO]   65816 samples  pos=4867 (7.4%)  neg=60949
+2026-05-07 16:06:04 [INFO] Loading eval parquet: ordered_data/mimic_eval/icu_mortality/test.parquet
+2026-05-07 16:06:14 [INFO]   7365 samples  pos=532 (7.2%)  neg=6833
+2026-05-07 16:06:14 [INFO] Loading backbone from ordered_data/experiments/qwen3-0N6B-MIMIC-causal-2048/final  (attn_impl=sdpa)
+2026-05-07 16:06:23 [INFO] Backbone trainable (full fine-tuning).
+2026-05-07 16:06:23 [INFO] Trainable parameters: 596.05M
+2026-05-07 16:06:24 [INFO] torch.compile(mode=default) …
+2026-05-07 16:06:27 [INFO] steps_per_epoch=8227  total_steps=82270  warmup=8227
+2026-05-07 17:00:00 [INFO] Epoch 1/10 | val_loss=0.3673  auroc=0.5326  auprc=0.0840  f1=0.0000
+2026-05-07 17:00:00 [INFO]   >> New best AUROC=0.5326 at epoch 1 — saved to experiments/classifier/icu_mortality/best
+2026-05-07 17:50:59 [INFO] Epoch 2/10 | val_loss=0.3454  auroc=0.4796  auprc=0.0701  f1=0.0000
+2026-05-07 17:50:59 [INFO]   No improvement. Patience: 1/5
+2026-05-07 18:41:58 [INFO] Epoch 3/10 | val_loss=0.3607  auroc=0.5219  auprc=0.0809  f1=0.0000
+2026-05-07 18:41:58 [INFO]   No improvement. Patience: 2/5
+2026-05-07 19:33:00 [INFO] Epoch 4/10 | val_loss=0.3645  auroc=0.5073  auprc=0.0730  f1=0.0000
+2026-05-07 19:33:00 [INFO]   No improvement. Patience: 3/5
+2026-05-07 20:24:01 [INFO] Epoch 5/10 | val_loss=0.3329  auroc=0.4926  auprc=0.0707  f1=0.0000
+2026-05-07 20:24:02 [INFO]   No improvement. Patience: 4/5
+2026-05-07 21:15:03 [INFO] Epoch 6/10 | val_loss=0.2591  auroc=0.5106  auprc=0.0757  f1=0.0000
+2026-05-07 21:15:03 [INFO]   No improvement. Patience: 5/5
+2026-05-07 21:15:03 [INFO] Early stopping triggered at epoch 6 (best=1, AUROC=0.5326)
+2026-05-07 21:15:03 [INFO] Loading best checkpoint (epoch=1, AUROC=0.5326)…
