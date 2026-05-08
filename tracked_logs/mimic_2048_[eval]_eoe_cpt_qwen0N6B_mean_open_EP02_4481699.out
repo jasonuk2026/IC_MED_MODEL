@@ -11,3 +11,11 @@ JOB_NAME: mimic_2048_[eval]_eoe_cpt_qwen0N6B_mean_open_EP02 | GPUs: 1
 2026-05-08 09:06:01 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3-0.6B "HTTP/1.1 200 OK"
 2026-05-08 09:06:01 [INFO] EOT token: '<|endoftext|>' (id=151643)
 2026-05-08 09:06:01 [INFO] Loading eval parquet: ordered_data/mimic_eval/icu_mortality/train.parquet
+2026-05-08 09:07:37 [INFO]   65816 samples  pos=4867 (7.4%)  neg=60949
+2026-05-08 09:07:37 [INFO] Loading eval parquet: ordered_data/mimic_eval/icu_mortality/test.parquet
+2026-05-08 09:07:48 [INFO]   7365 samples  pos=532 (7.2%)  neg=6833
+2026-05-08 09:07:48 [INFO] Loading backbone from ordered_data/experiments/mimic_2048_[CPT]_eot_qwen0N6B_E05/epoch_2  (attn_impl=sdpa)
+2026-05-08 09:07:54 [INFO] Backbone frozen. Only classification head is trainable.
+2026-05-08 09:07:54 [INFO] Trainable parameters: 0.00M
+2026-05-08 09:07:54 [INFO] torch.compile(mode=default) …
+2026-05-08 09:07:57 [INFO] steps_per_epoch=8227  total_steps=82270  warmup=8227
